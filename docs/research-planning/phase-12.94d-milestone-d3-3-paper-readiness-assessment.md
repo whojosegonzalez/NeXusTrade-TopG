@@ -6491,7 +6491,7 @@ Mutation checks for the corrections: all 11 caught.
 #### 8.38.17 CPMM Support Reassessment: Implemented Pool-State Adapter, Pure Market Parser, Isolated Swap Decoder, Transaction Source Adapter and Resolution Accounting Ledger
 
 > [!IMPORTANT]
-> **Status: PRELIMINARY REASSESSMENT (STAGES 1–3 AND TRANSACTION RESOLUTION AND RESOLUTION ACCOUNTING IMPLEMENTED & VERIFIED OFFLINE AS ISOLATED MODULES; NOTIFICATION COLLECTION IMPLEMENTED & VERIFIED OFFLINE AS AN ISOLATED PASSIVE MODULE; CONNECTION OWNER IMPLEMENTED, VERIFIED OFFLINE AND ACCEPTED IN REVIEW AS AN ISOLATED MODULE; TRANSPORT WRAPPER IMPLEMENTED, VERIFIED OFFLINE AND ACCEPTED IN REVIEW AS AN ISOLATED MODULE; EVIDENCE RECORDING, SEALING AND RE-DERIVATION CONTRACT PROPOSED, NOT IMPLEMENTED; NOT CONNECTED TO FLOW OR ADMISSION).**
+> **Status: PRELIMINARY REASSESSMENT (STAGES 1–3 AND TRANSACTION RESOLUTION AND RESOLUTION ACCOUNTING IMPLEMENTED & VERIFIED OFFLINE AS ISOLATED MODULES; NOTIFICATION COLLECTION IMPLEMENTED & VERIFIED OFFLINE AS AN ISOLATED PASSIVE MODULE; CONNECTION OWNER IMPLEMENTED, VERIFIED OFFLINE AND ACCEPTED IN REVIEW AS AN ISOLATED MODULE; TRANSPORT WRAPPER IMPLEMENTED, VERIFIED OFFLINE AND ACCEPTED IN REVIEW AS AN ISOLATED MODULE; EVIDENCE RECORDING, SEALING AND RE-DERIVATION CONTRACT PROPOSED (ONLY ITS PURE RESPONSE-ANALYSIS PREREQUISITE IMPLEMENTED); NOT CONNECTED TO FLOW OR ADMISSION).**
 >
 > - **Stage 1**: Pure pool-state adapter ([`RaydiumCpmmPoolStateAdapter.ts`](file:///u:/Projects/TopG/backend/src/candidate-scanner/RaydiumCpmmPoolStateAdapter.ts), 40/40 tests) implemented and verified offline at commit `52809e64`.
 > - **Stage 2**: Pure CPMM market parser ([`DexScreenerCpmmCandidateMarketParser.ts`](file:///u:/Projects/TopG/backend/src/candidate-scanner/DexScreenerCpmmCandidateMarketParser.ts), 43/43 tests) implemented and verified offline at commit `06b0ea6c`.
@@ -6501,7 +6501,7 @@ Mutation checks for the corrections: all 11 caught.
 > - **Notification collection**: passive, bounded, exact-pool CPMM notification collector ([`CpmmPoolNotificationCollector.ts`](file:///u:/Projects/TopG/backend/src/candidate-scanner/CpmmPoolNotificationCollector.ts), 23/23 tests; 22/22 original targeted mutants caught, and 16 of 17 review mutants caught with 1 equivalent) implemented and verified offline on 2026-11-19 (item 14), then corrected after an offline review of `b06108c` (genuine byte-view validation through internal slots, close-time chronology, `BUILT_UNOBSERVED`). It binds one owner-supplied pool and mint, one epoch and one acknowledged subscription, checks acquisition limits before copying or decoding, gives every frame an explicit disposition, forwards failed-status claims while keeping them blocking, never produces a block time, and retains metadata only (no raw replay). It owns no connection, sends no request, never calls the ledger and establishes no completeness.
 > - **Connection owner**: bounded, single-connection CPMM connection owner ([`CpmmPoolConnectionOwner.ts`](file:///u:/Projects/TopG/backend/src/candidate-scanner/CpmmPoolConnectionOwner.ts), 55/55 tests) implemented and verified offline on 2026-11-20 (item 15), then corrected the same day for three lifecycle defects found in review of `dfeee4c`: deadlines are now enforced before anything is admitted, ingested or credited, clock regression and invalid time are latched as blocking, and settlement waits for every unfinished external call (item 15 M). A finalization defect found in review of `5aaeef1` was also corrected: cancellation, session stop, ownership and the clock are rechecked after the final listener disposal and before the report is frozen (item 15 N), with read-only `getBinding()` accessors on the collector and ledger. Independent review of `446eec4` accepted the isolated owner and its finalization correction, with the 205 focused tests, the backend typecheck and independent lifecycle reproductions passing. It drives one injected dormant, detachable transport, verifies the three bindings and exclusive epoch ownership, applies one-time deadlines through authoritative checks, feeds the collector, hands every accepted envelope to the ledger or counts it as explicitly unprocessed, and reports a strict clean-run predicate. It is not wired: there is no real transport wrapper, endpoint lookup, sealing or operator command, and no transport, request or capture is authorized.
 > - **Transport wrapper**: bounded CPMM WebSocket transport wrapper ([`CpmmPoolWebSocketTransport.ts`](file:///u:/Projects/TopG/backend/src/candidate-scanner/CpmmPoolWebSocketTransport.ts), 22/22 tests including the real accepted owner over it; 34 of 36 targeted mutants caught, the 2 survivors not observable) implemented and verified offline on 2026-11-20 (item 16). It uses an injected `ws`-compatible client constructor, constructs nothing before `start()`, passes a complete bounded option set, copies messages byte-for-byte under exact bounds, reports only fixed error categories, translates a latched local payload refusal to 1009 at the actual close, and keeps `readyState` truthful. Independent review of `87b50b3` accepted the isolated wrapper, with the 227 focused tests, the backend typecheck, 81 additional checks, static compatibility with the installed `ws` constructor and the runtime pin check passing. It is not wired: no production constructor, endpoint, sealing or operator command, and no socket, request or capture is authorized.
-> - **Evidence recording, sealing and re-derivation**: contract and synthetic test plan proposed (item 17, documentation only). Recording is by composition: a transport decorator, a delegating ledger and a session exchange-observer fan-out. Item 17 lists three missing hooks for review: a resolution-fact accessor, an adapter response-check export, and pool-account acquisition. Nothing is implemented.
+> - **Evidence recording, sealing and re-derivation**: contract and synthetic test plan proposed (item 17) and corrected after review. Recording would be by composition: a transport decorator recording each event once, a delegating ledger and an inspectable session exchange-observer fan-out. Of its prerequisites, only G2 is implemented: the pure adapter export `analyzeCpmmTransactionResponse`, which shares the live adapter's response validation and decoding, returns an unbranded analysis that `ingest()` refuses, and proves response validation and decoding only (25/25 adapter tests, 15 of 15 targeted mutants caught). The recorder, sanitizer and sealer are not implemented; G1 and G5 are out of scope, and G3 (pool-account acquisition) remains open.
 >   Raydium CPMM targets remain strictly **quarantined from strategy admission** until swap flow decoding, LP evidence, and security evaluation are complete, tested, and independently reviewed. The existing market parser rejection of the `"CPMM"` label in `DexScreenerSingleCandidateMarketParser.ts` remains active and unmodified; coordinator, runner, and live admission paths remain completely unconnected and unchanged.
 
 Raydium CPMM (`CPMMoo8L3F4NbTegBCKVNunggL7H1ZpdTHKxQB5qKP1C`) represents Raydium's modern constant-product AMM architecture. Below is the documentation for the implemented Stage 1 adapter (`RaydiumCpmmPoolStateAdapter.ts`), Stage 2 pure market parser (`DexScreenerCpmmCandidateMarketParser.ts`), and proposed Stage 3 swap decoder (`RaydiumCpmmSwapDecoder.ts`) with their verified acceptance tests, contracts, and explicit behavioral invariants.
@@ -9544,11 +9544,11 @@ Corrections 4–8 are implemented as described in item B and tested as mapped in
 
 The evidence recording, sealing and re-derivation contract is proposed in item 17. These steps remain, each separately approved: wiring the production `ws` constructor and an endpoint through a reviewed factory (with the composition checks above); sealing, re-derivation and credential scanning; an endpoint and budget review; and a separate operator approval for a first unqualified diagnostic capture (item 15 K).
 
-##### 17. CPMM Pool Observation Recording, Sealing and Re-derivation (Proposed Contract; Not Implemented)
+##### 17. CPMM Pool Observation Recording, Sealing and Re-derivation (Proposed Contract; Only the G2 Prerequisite Implemented)
 
-**Status**: documentation only (2026-11-20). This item proposes how one bounded CPMM pool observation run would be recorded, sealed as evidence and re-derived offline. It is built on the accepted owner (item 15), wrapper (item 16), collector, ledger, transaction adapter and shared session.
+**Status**: a proposed contract (2026-11-20, `b623440`), corrected after review (item K). Of its prerequisites, only G2 is implemented: the pure adapter export `analyzeCpmmTransactionResponse` (item K). The recorder, sanitizer and sealer are not approved for implementation and do not exist. The item describes how one bounded CPMM pool observation run would be recorded, sealed as evidence and re-derived offline, on top of the accepted owner (item 15), wrapper (item 16), collector, ledger, transaction adapter and shared session.
 
-- **Not changed**: no source, test, pin, configuration or dependency.
+- **Changed for G2 only**: the adapter and its tests. No session, ledger, owner, pin, configuration or dependency change.
 - **Not run**: no request, socket, capture, wallet change or operator command.
 - **Not selected**: no production factory, endpoint lookup or live limit.
 - **Scope**: the capture provides observation and decoding evidence only (item H). CPMM remains excluded from admission.
@@ -9580,11 +9580,12 @@ The evidence recording, sealing and re-derivation contract is proposed in item 1
   - It refuses a response whose id differs (`ID_MISMATCH`).
   - Its evidence recorder (`createCpmmExchangeEvidenceRecorder`) is bound to the session and consumes evidence by ledger sequence (`take`).
   - Its credential scan is private, detection-only, and withholds a payload on a finding or uncertainty.
+  - Its body-retention and response-classification steps are now shared with the pure export `analyzeCpmmTransactionResponse` (item K).
 - **Shared session**:
   - The session's ledger is the single authoritative request record, with one ceiling and one budget, read through `getLedgerSince(start)`.
   - Exchange evidence goes to one constructor-time `onExchangeComplete` callback, called for every lane and owner. An exception from it is swallowed by the session.
   - Each exchange carries the completed entry, the credential-bearing URL, the request body, allow-listed headers, `bodyState`, and the retained body bytes with observed and limit counts.
-  - JSON-RPC ids come from a session-owned sequence that cannot be injected.
+  - JSON-RPC ids come from the session's own counter (`nextJsonRpcId`), shared by every owner of the session. A replay session could reproduce the recorded ids only by reproducing every other id consumer, in order. The pure export (G2) was chosen so that response analysis does not depend on session replay at all.
 - **Pool context**: `adaptRaydiumCpmmPoolState` is pure, over raw pool and vault accounts (address, data, owner program, slot). Nothing in the source acquires those accounts for CPMM yet.
 - **Existing evidence modules**:
   - **`fresh-amm-v4-watch-evidence.ts`**:
@@ -9601,7 +9602,7 @@ The evidence recording, sealing and re-derivation contract is proposed in item 1
 
 ```typescript
 export interface CpmmObservationRecorderLimits {
-  readonly maxIncomingRecords: number; // application messages delivered to the owner
+  readonly maxIncomingRecords: number; // wrapper-observed application messages
   readonly maxIncomingPayloadBytes: number; // their total retained bytes
   readonly maxOutgoingRecords: number; // send attempts and their completions
   readonly maxOutgoingPayloadBytes: number;
@@ -9610,6 +9611,7 @@ export interface CpmmObservationRecorderLimits {
   readonly maxExchangeRecords: number; // CPMM transaction exchanges
   readonly maxExchangeBodyBytes: number; // their total retained response bytes
   readonly maxLedgerCallRecords: number; // account() calls and settlements
+  readonly maxInstrumentationFailures: number; // retained failure records (counts stay exact)
 }
 
 export function createCpmmPoolObservationRecorder(options: {
@@ -9619,7 +9621,7 @@ export function createCpmmPoolObservationRecorder(options: {
 export interface CpmmPoolObservationRecorder {
   /** Once; for the owner's transportFactory. Decorates the accepted wrapper. */
   recordTransport(inner: CpmmOwnerTransport): CpmmOwnerTransport;
-  /** Once; delegating ledger for the owner (cast to the owner's option type). */
+  /** Once; delegating ledger for the owner (cast to the owner's option type; G5). */
   recordLedger(ledger: CpmmResolutionAccountingLedger): CpmmResolutionAccountingLedger;
   /** One target of the session's onExchangeComplete fan-out. */
   readonly observeExchange: (evidence: PaperRequestExchangeEvidence) => void;
@@ -9627,32 +9629,55 @@ export interface CpmmPoolObservationRecorder {
   finish(input: CpmmObservationFinishInput): CpmmObservationSnapshot;
 }
 
-/** Constructor-time fan-out for the session's single observer: fixed order, each isolated. */
-export function fanOutExchangeObservers(
-  observers: readonly ((e: PaperRequestExchangeEvidence) => void)[],
-): (e: PaperRequestExchangeEvidence) => void;
+/** Constructor-time fan-out for the session's single observer, with inspectable failures. */
+export function createExchangeObserverFanOut(options: {
+  readonly observers: readonly {
+    readonly label: string;
+    readonly observe: (e: PaperRequestExchangeEvidence) => void;
+  }[];
+  readonly maxRetainedFailures: number;
+}): {
+  /** The function given to the session: synchronous, returns undefined, never throws. */
+  readonly observe: (e: PaperRequestExchangeEvidence) => void;
+  /** Frozen, bounded: per observer, calls, synchronous throws, rejected returned promises, the first failure ordinals. */
+  diagnostics(): CpmmExchangeFanOutDiagnostics;
+};
 ```
 
-Every record carries one recorder-wide `ordinal`, the only order the recorder assigns. **The recorder reads no clock.** Every time in the evidence is copied from the component that read it, and named after it:
+**The recorder reads no clock.** Every record carries one recorder-wide `ordinal`, the only order the recorder assigns. Every time in the evidence is copied from the component that read it, and named after it:
 
 - the owner's report times;
 - the collector's `receivedAtMs`, which the owner read and injected;
 - the session ledger's `dispatchedAtMs` and `completedAtMs`.
 
-No time is copied from one reader to another, and no identical timestamp is invented from separate reads.
+No time is copied from one reader to another, no identical timestamp is invented from separate reads, and a time or digest a component did not record stays `null`.
 
-| Layer                                                               | Observes                                                                                                                                                                                                                                                                                                                                                                     | Required for                                                                                                      |
-| ------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------- |
-| **Transport decorator**, between the owner and the accepted wrapper | Every owner call: `start`, `send`, `ping`, `pong`, `close`, `terminate`, `dispose` and `readyState` reads, with their arguments, results and fixed exception codes. Every completion `done(failed)`, including duplicates. Every event the wrapper delivers (`open`, `message` with its bytes, `error`, `close` with its code, `ping` and `pong` with their bytes).          | Collector replay (incoming payloads, outgoing subscribe and unsubscribe bytes) and owner and wrapper cross-checks |
-| **Delegating ledger**                                               | Each `account(envelope, gate)` call (signature, epoch, `hostReceivedAtMs`, ordinal), whether it returned or threw synchronously, and the settled result (status, sequence, disposition, fact kind and code). It returns the real promise unchanged, and delegates `openEpoch`, `epochs`, `counters` and `getBinding` unchanged.                                              | Binding envelopes to ledger records and exchanges                                                                 |
-| **Exchange fan-out target**                                         | Each completed session exchange: the entry, method, request body, allow-listed headers, `bodyState`, body bytes, observed and limit counts. The URL is never kept; only a fixed endpoint label is. Bodies are kept only for purpose `CPMM_GET_TRANSACTION` (and the pool-context purposes in item E); other lanes and owners are counted by lane and purpose without bodies. | Transaction re-decoding and request accounting                                                                    |
-| **`finish()` inputs** (public reads after settlement)               | The owner report and `lateEvents()`; the wrapper's `diagnostics()`; the collector's `epochReport`, `frameRecords`, `notifications` and `counters`; the ledger's `records`, `epochs` and `counters`; the session ledger window `getLedgerSince(startLength)` with the start and end lengths; and the pool context (item E).                                                   | Every cross-check                                                                                                 |
+| Layer                                                               | Observes                                                                                                                                                                                                                                                                                                                                                                                                                                           | Required for                                                                                                      |
+| ------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------- |
+| **Transport decorator**, between the owner and the accepted wrapper | Every owner call: `start`, `send`, `ping`, `pong`, `close`, `terminate`, `dispose` and `readyState` reads, with their arguments, results and fixed exception codes. Every completion `done(failed)`, including duplicates. Every event the wrapper dispatches, recorded once (below), with whether it reached the owner.                                                                                                                           | Collector replay (incoming payloads, outgoing subscribe and unsubscribe bytes) and owner and wrapper cross-checks |
+| **Delegating ledger**                                               | Each `account(envelope, gate)` call (signature, epoch, `hostReceivedAtMs`, ordinal), whether it returned or threw synchronously, and the settled result (status, sequence, disposition, fact kind and code). It returns the real promise unchanged, and delegates `openEpoch`, `epochs`, `counters` and `getBinding` unchanged.                                                                                                                    | Structural binding of envelopes to ledger records and exchanges                                                   |
+| **Exchange fan-out target**                                         | Each completed session exchange: the entry, method, request body, allow-listed headers, `bodyState`, body bytes, observed and limit counts. The URL is never kept; only a fixed endpoint label is. Bodies are kept only for purpose `CPMM_GET_TRANSACTION` (and the pool-context purposes in item E); other lanes and owners are counted by lane and purpose without bodies.                                                                       | Transaction analysis and request accounting                                                                       |
+| **`finish()` inputs** (public reads after settlement)               | The owner report and `lateEvents()` (frozen at settlement); the wrapper's `diagnostics()`, read at `finish()` and so possibly later than the owner's freeze; the collector's `epochReport`, `frameRecords`, `notifications` and `counters`; the ledger's `records`, `epochs` and `counters`; the session ledger window `getLedgerSince(startLength)` with the start and end lengths; the fan-out's `diagnostics()`; and the pool context (item E). | Every cross-check                                                                                                 |
+
+**Transport events, each recorded exactly once**:
+
+- **One observation listener per event**: `recordTransport` registers exactly one observation listener for each of the six events on the inner wrapper, before the owner registers anything. It stays registered until `finish()`, and is the only place event records are created.
+- **No separate close observer**: the "extra close observer" of the first draft is this same observation listener. It simply outlives the owner's own registrations.
+- **Owner registrations** made through the decorator become inner registrations whose wrapper function invokes the owner's listener and marks the event record currently being dispatched as `deliveredToOwner`. Dispatch is synchronous and may nest, so the current record is kept on a stack.
+- **Labels**: each event record therefore says whether the wrapper dispatched it (`wrapperObserved`, always true) and how many owner listeners received it (`ownerDeliveries`). An event after the owner disposed its listeners, for example a message after intake stopped or a close after settlement, is `wrapperObserved` with zero owner deliveries, labelled by phase (item G).
 
 **Decorator rules**:
 
 - **Exact semantics**: the owner must observe exactly what it would without the decorator: synchronous delivery and completion order, wrapper exceptions rethrown unchanged (fixed codes), `readyState` passed through, and `on()` returning a disposer that disposes the inner registration.
 - **Inside the barrier**: the decorator is external code within the owner's barrier. It sends nothing, retries nothing and starts no timer.
-- **After settlement**: it keeps one observation listener for `close` on the inner wrapper until `finish()`, so a post-settlement close is recorded as a late transport event (item 16's resource limitation), then disposes it. Sealing never waits for it.
+- **Contained failures**: its own recording failures are contained and counted as instrumentation failures. They never change what the owner sees.
+
+**Instrumentation failures** (fan-out, decorator and delegating ledger):
+
+- **Fan-out isolation**: each observer runs in its own `try`, in fixed order, with the adapter's evidence recorder first.
+- **Thenables**: if an observer returns a thenable, a rejection handler is attached that only counts, so a rejection is never unhandled. The fan-out itself always returns `undefined` synchronously and never throws.
+- **Delegating ledger**: it returns the original promise object unchanged. Its observation is a separate `then(onSettled, onRejected)`, whose handlers are wrapped in `try` and never rethrow, so the derived promise never rejects unhandled. The original promise's outcome and the owner's handling of it are unaffected.
+- **Bounded diagnostics**: failure diagnostics are exact counts plus at most `maxInstrumentationFailures` retained `{ ordinal, layer, code }` entries with fixed codes, read at `finish()` and sealed in `recording.json`. Any failure makes retention incomplete.
 
 **Retention**:
 
@@ -9660,21 +9685,25 @@ No time is copied from one reader to another, and no identical timestamp is inve
 - **Over the byte allowance**: the record is kept with its length and original SHA-256, but the payload is omitted (`payloadOmitted`), and the omissions are counted.
 - **Over the record allowance**: the record is dropped and counted (`droppedRecords`). The counters themselves are exact and never saturate silently.
 - **Evidence is incomplete** whenever required material is missing:
-  - an omitted incoming application payload or outgoing application frame;
+  - an omitted payload of a message the owner handed to the collector, or of an outgoing application frame;
   - an omitted CPMM exchange body;
   - a dropped record of a required kind;
   - a collector or ledger retention drop (`metadataRetention.complete === false`, or a truncated duplicate detail that a cross-check needs);
-  - a fan-out failure;
+  - an instrumentation failure;
   - missing pool context.
 - **No new request budget**: recording never sends traffic, adds no pacing, never calls the session, and never retries anything.
 
 **Association of frames with collector receipts**:
 
-- **Two ordered lists**: the decorator's delivered `message` records, and the collector's frame records in sequence order.
-- **Contiguous mapping**: the owner either hands a message to the collector (producing the next frame record) or refuses it (`messagesBeforeStart`, or `framesAfterIntake` once intake has stopped or the run is no longer admissible). Accepted messages are therefore one contiguous run.
-- **Matching**: the k-th accepted message matches the k-th frame record by order, byte length and SHA-256. The owner's counts must account for every unmatched message.
+- **Two ordered lists**: the event records the owner received (`ownerDeliveries > 0`) for `message`, and the collector's frame records in sequence order.
+- **Contiguous mapping**: the owner either hands a received message to the collector (producing the next frame record) or refuses it (`messagesBeforeStart`, or `framesAfterIntake` once intake has stopped or the run is no longer admissible). Messages handed over are therefore one contiguous run.
+- **Matching**: the k-th handed-over message matches the k-th frame record by order and byte length, and by SHA-256 when the frame record has one.
+- **Refused frame records**: refusals (`EPOCH_NOT_OPEN`, `STALE_EPOCH`, `EPOCH_LIMIT_EXCEEDED`, `OVERSIZE_FRAME`, `RECEIPT_INVALID`) carry `receivedAtMs: null` and `sha256: null`. They are matched by order and length only, labelled `UNHASHED`, and never given a fabricated time or digest. The recorder's own digest of those bytes stays a separate field.
+- **Owner counts** must account for every received message that was not handed over. Wrapper-observed messages that the owner never received are outside the owner's counts by construction.
 - **Duplicates** with identical bytes are resolved by order alone.
-- **Receipt times** for replay come only from the collector's frame records. A dropped frame record makes that replay `MISSING_EVIDENCE`, never an invented time. A composition check of `maxRetainedFrameRecords >= maxEpochFrames` avoids this.
+- **Receipt times** for replay come only from the collector's frame records.
+  - A dropped frame record makes that replay `MISSING_EVIDENCE`.
+  - Because the frame exceeding `maxEpochFrames` gets its own refused record (and the owner then ends the run), a run can produce `maxEpochFrames + 1` frame records per epoch. The composition check is therefore `maxRetainedFrameRecords >= maxEpochFrames + 1` (G7); equality with `maxEpochFrames` is insufficient.
 
 ###### C. Binding Requests, Responses, Ledger Entries and Resolutions
 
@@ -9688,7 +9717,7 @@ No time is copied from one reader to another, and no identical timestamp is inve
     = response JSON-RPC id (parsed from the stored body)
     = delegating-ledger account() call for that signature (first occurrence)
     = ledger record (signature, factKind, factCode, disposition)
-    = re-derived resolution (item F)
+    = pure response analysis of the stored bytes (item G), where the fact kind is response-dependent
   ```
 
 - **Exchange sequence**: ledger records carry no request sequence, so binding by signature assumes one request per first occurrence. That holds today, since the adapter makes one dispatch per signature and has no retry. More than one exchange for a signature, or none for a record whose fact kind implies a request, is a `MISMATCH`.
@@ -9746,7 +9775,7 @@ export function sanitizeEvidenceBytes(
 - **What establishes the decoder context**: the raw pool and two vault accounts (address, owner program, slot and data bytes, with `originalSha256`), plus the target pool address and candidate mint.
 - **What re-derivation checks**: it re-runs `adaptRaydiumCpmmPoolState` and requires a canonical match with the adapted pool the run used, and with the bindings of the owner, collector, ledger and adapter.
 - **How the accounts are acquired** (gap G3): through the shared session with their own exchange evidence (ledger seq, request, response), so the context is evidence, not an assertion. No CPMM account acquisition exists yet.
-- **Until then**: pool context supplied without exchange evidence is sealed as `SUPPLIED_UNVERIFIED`. Re-decoding can then be internally consistent, but not evidence-backed.
+- **Until then**: pool context supplied without exchange evidence is sealed as `SUPPLIED_UNVERIFIED`. Response analysis can then be internally consistent, but not evidence-backed.
 
 ###### F. Evidence Layout, Manifest and Sealing (`cpmm-pool-observation-evidence.ts`)
 
@@ -9791,33 +9820,51 @@ A new directory `data/research/cpmm-observations/<runId>/` is created exclusivel
 
 ###### G. Offline Re-derivation Through Fresh Accepted Components
 
-| Component                      | Procedure                                                                                                                                                                                                                                                                                                                                                                                                                                                                                | Compared with                                                       |
-| ------------------------------ | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------- |
-| Pool context                   | `adaptRaydiumCpmmPoolState` on the stored raw accounts                                                                                                                                                                                                                                                                                                                                                                                                                                   | The recorded adapted pool and the four bindings                     |
-| Collector replay               | A fresh `CpmmPoolNotificationCollector` with the recorded binding, limits and commitment. `openEpoch` with the recorded epoch, start and subscribe request id: the subscribe frame bytes must equal the recorded outgoing subscribe. Then the recorded accepted messages, in order, with their collector `receivedAtMs`; `unsubscribeFrame` at its recorded ordinal position (bytes must equal the recorded outgoing unsubscribe); and `closeEpoch` with the recorded reason and instant | The frame records, notifications, epoch report and counters         |
-| Transaction re-decoding        | For each bound exchange with a complete stored body: the accepted adapter's response checks and the pure decoder on the stored bytes, with the recorded signature, id and pool context (gap G2)                                                                                                                                                                                                                                                                                          | Each ledger record's fact kind and code, and its owned event counts |
-| Ledger                         | A fresh ledger over a fresh adapter, fed the recorded envelopes in recorded order with the re-derived resolutions. Ingestion is compared only when the tracker's starting state and clock readings were recorded; otherwise it is `INGESTION_NOT_REPRODUCIBLE`, separately from resolution                                                                                                                                                                                               | Records, epochs and counters                                        |
-| Owner and wrapper cross-checks | Arithmetic over the records (no fresh owner run, since it would need a live clock)                                                                                                                                                                                                                                                                                                                                                                                                       | See below                                                           |
+| Component                      | Procedure                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                              | Compared with                                                                                                 |
+| ------------------------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ | ------------------------------------------------------------------------------------------------------------- |
+| Pool context                   | `adaptRaydiumCpmmPoolState` on the stored raw accounts                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                 | The recorded adapted pool and the four bindings; `SUPPLIED_UNVERIFIED` until acquisition evidence exists (G3) |
+| Collector replay               | A fresh `CpmmPoolNotificationCollector` with the recorded binding, limits and commitment. `openEpoch` with the recorded epoch, start and subscribe request id: the subscribe frame bytes must equal the recorded outgoing subscribe. Then the recorded handed-over messages, in order, with their recorded collector `receivedAtMs`; `unsubscribeFrame` at its recorded ordinal position (bytes must equal the recorded outgoing unsubscribe); and `closeEpoch` with the recorded reason and instant. A refused frame record with a null receipt time is not replayed (no fabricated time): it is checked structurally, by order, length and disposition, and is the last frame the owner handed over. | The frame records, notifications, epoch report and counters                                                   |
+| Transaction analysis           | For each bound exchange whose stored body is `COMPLETE`: `analyzeCpmmTransactionResponse` with the notification's signature, slot, blockTime and receipt time (from the collector notification), the request's JSON-RPC id, the pool context, the stored bytes, the request's body limit and the supplied secrets                                                                                                                                                                                                                                                                                                                                                                                      | For response-dependent fact kinds, each ledger record's `factKind` and `factCode` (below)                     |
+| Ledger                         | Structural cross-checks only: each record against its `account()` call, its exchange and its analysis, plus disposition, blocking class and counter consistency. A fresh-ledger replay is not claimed: the ledger requires a concrete adapter that produces trusted runtime facts, and the analysis is deliberately not one. Runtime accounting (lifecycle checks, ingestion into the tracker) is reported `RUNTIME_ACCOUNTING_NOT_REPRODUCED` until lifecycle and tracker replay is actually supported (G6).                                                                                                                                                                                          | Records, epochs and counters                                                                                  |
+| Owner and wrapper cross-checks | Arithmetic over the records (no fresh owner run, since it would need a live clock)                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                     | See below                                                                                                     |
 
-**Cross-checks**:
+**What the analysis establishes**: response validation and decoding only (item K). Its result is compared only where the runtime fact kind depends on the response alone:
 
-- **Message counts**: the owner's `messageEvents` equals the decorator's delivered messages, which equal the wrapper's `messages.delivered`. The owner's `passedToCollector` equals the matched collector frames. The owner's before-start and after-intake counts equal the unmatched messages.
+- **Compared**: `MALFORMED_RESPONSE` (for complete bodies), `EVIDENCE_NOT_REPLAYABLE`, `RPC_ERROR`, `TRANSACTION_NOT_FOUND`, `SIGNATURE_MISMATCH`, `METADATA_CONTRADICTION`, `RESOLVED_SWAPS`, `RESOLVED_NO_TARGET_SWAP`, `RECORDED_FAILED_TRANSACTION` and decoder `UNRESOLVED`. A difference is a `MISMATCH`, unless redaction or withholding of those bytes could cause it (`LIMITED_BY_REDACTION`).
+- **Runtime-only, not compared** (`RUNTIME_OUTCOME_NOT_COMPARED`): `LATE_RESPONSE`, `CANCELLED_IN_FLIGHT`, `SESSION_STOPPED_IN_FLIGHT`, `TRANSPORT_FAILED`, `HTTP_ERROR`, `EVIDENCE_MISSING`, `EVIDENCE_MISMATCH`, `REQUEST_REFUSED` and the notification, gate, duplicate and capacity outcomes. A body that decodes successfully under analysis is not a mismatch for a record that correctly ended `LATE_RESPONSE`, since freshness and lifecycle are outside the analysis.
+- **Not analysable** (`MISSING_EVIDENCE`): partial or unread bodies, and omitted, withheld or missing bodies.
+
+**Cross-checks** (wrapper-observed and owner-received events kept apart; phase-aware):
+
+- **Messages**:
+  - the owner's `messageEvents` equals the number of message records the owner received;
+  - the wrapper's `messages.delivered` equals the number of wrapper-observed message records;
+  - the two may differ. In a supported clean run the owner can report `messageEvents: 2` while the wrapper reports `messages.delivered: 3`, the third arriving after intake stopped and the owner disposed its message listener;
+  - the owner's `passedToCollector` equals the matched collector frames;
+  - its `messagesBeforeStart` plus `framesAfterIntake` equals the owner-received messages that were not handed over.
 - **Outgoing frames**: subscribe and unsubscribe attempts and completions, and ping and pong reservations, completions, matches and unmatched counts, equal the decorator records.
-- **Cleanup**: `closeThrew`, `terminateAttempted` and `terminateThrew`, and the close code, equal the decorator records and the wrapper's `close.deliveredCode`.
-- **Timing**:
-  - every collector `receivedAtMs` lies in `[startedAtMs, intakeEndMs)`;
-  - session `dispatchedAtMs` and `completedAtMs` lie within the run;
-  - the ordinals are consistent with collector sequence order and with ledger call order;
-  - the report's own times keep their fixed order.
-- **Requests**: CPMM exchanges in the window equal the ledger records that imply a request. No exchange belongs to the recorder.
+- **Cleanup**, phase-aware:
+  - **At the owner's freeze**: the owner's report freezes at settlement. Its `closeThrew`, `terminateAttempted`, `terminateThrew`, `closeCode` and `closeObservedAtMs` must equal the decorator's records up to settlement.
+  - **Afterwards**: the wrapper's diagnostics, read at `finish()`, may include a later actual close. After `FAILED_STILL_OPEN`, a later close can give the wrapper `close.deliveredCode: 1006` while the frozen owner `closeCode` stays `null`. Both observations are preserved, labelled by phase. Equality is required only when the owner itself observed the close.
+- **Timing**, by phase:
+  - **Context acquisition**: before `startedAtMs`. Pool-account exchanges belong here when acquisition evidence exists.
+  - **Observation**: `[startedAtMs, intake.stoppedAtMs)`. Every collector `receivedAtMs` that was recorded lies in `[startedAtMs, intakeEndMs)`, and CPMM transaction requests are dispatched no earlier than their notification's receipt.
+  - **Drain**: from the intake stop to the drain's resolution. CPMM requests may complete here.
+  - **Finalization**: cleanup start to `settledAtMs`.
+  - **Later activity**: after `settledAtMs` until `finish()`: late transport events, late completions, outstanding requests completing.
+
+  Shared-session requests by other owners, and completions of this run's requests, are not required to fall inside the owner's observation. Each is labelled with the phase it falls in. Ordinals must be consistent with collector sequence order and with ledger call order, and the report's own times keep their fixed order.
+
+- **Requests**: CPMM exchanges in the window equal the ledger records whose fact kind implies a dispatch. No exchange belongs to the recorder.
 
 **Preserved, never upgraded**: cancellation, session stop, acknowledgement and request timeouts, unresolved or outstanding resolutions, expired drains, failed or late cleanup and late events are recorded as they happened. Re-derivation checks that the evidence is consistent with them. It never turns an incomplete or abnormal run into a normal one.
 
 **Classes**:
 
 - **`MISMATCH`**: evidence that redaction did not touch contradicts a recorded result.
-- **`MISSING_EVIDENCE`**: required material was omitted, dropped, withheld or not acquired (for example, an omitted payload or a dropped frame record).
+- **`MISSING_EVIDENCE`**: required material was omitted, dropped, withheld or not acquired.
 - **`LIMITED_BY_REDACTION`**: only when a redacted or withheld payload could have caused the difference.
+- **`RUNTIME_OUTCOME_NOT_COMPARED`** and **`RUNTIME_ACCOUNTING_NOT_REPRODUCED`** are explicit non-claims, never successes.
 
 ###### H. Scope Limits (Unchanged)
 
@@ -9828,40 +9875,37 @@ This capture is observation and decoding evidence. It does not establish notific
 | Test | Covers                                                                                                                                                                                                                                                                                                                                                                                               |
 | ---- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | R1   | Decorator transparency: the real owner over the decorator, the accepted wrapper and a fake client produces a report identical to one without the decorator, including synchronous delivery and completion, exceptions, `readyState` and disposers                                                                                                                                                    |
-| R2   | Association: before-start and after-intake refusals, identical duplicate payloads, wrapper refusals (no delivery), and a dropped collector frame record (`MISSING_EVIDENCE`)                                                                                                                                                                                                                         |
+| R2   | Association: before-start and after-intake refusals, identical duplicate payloads, wrapper refusals (no delivery), refused frame records with null digest and receipt (`UNHASHED`, never fabricated), the extra `EPOCH_LIMIT_EXCEEDED` record at `maxEpochFrames + 1`, and a dropped collector frame record (`MISSING_EVIDENCE`)                                                                     |
 | R3   | Outgoing attempts and completions (subscribe, unsubscribe, ping, pong; duplicate, missing, failed and throwing), close and terminate exceptions, and a late close after settlement                                                                                                                                                                                                                   |
 | R4   | Retention pressure: the incoming and outgoing allowances exhausted separately; payloads omitted but counted; records dropped and counted; `INCOMPLETE` with reasons                                                                                                                                                                                                                                  |
-| R5   | Fan-out: the adapter recorder is still fed first; a throwing second observer is isolated and counted; foreign lanes are counted without bodies; the session ledger is unchanged in length (the recorder dispatches nothing)                                                                                                                                                                          |
+| R5   | Fan-out: the adapter recorder is still fed first; a throwing or rejecting second observer is isolated, counted in `diagnostics()` and never unhandled; the session's exchange outcome is unchanged; foreign lanes are counted without bodies; the session ledger is unchanged in length (the recorder dispatches nothing)                                                                            |
 | R6   | The delegating ledger is transparent to the owner's ownership witnesses; the envelope, record and exchange binding; a duplicate occurrence makes no request                                                                                                                                                                                                                                          |
 | R7   | Source boundary: no clock, timer, network, file, environment or console use in the recorder                                                                                                                                                                                                                                                                                                          |
-| E1   | A normal capture seals and verifies: integrity OK, retention `COMPLETE`, every component `REPRODUCED`                                                                                                                                                                                                                                                                                                |
+| R8   | Events recorded once: wrapper-observed versus owner-received messages (owner `messageEvents` 2, wrapper `delivered` 3 after intake stops, in a clean run); a close after settlement recorded once, with no owner delivery; nested dispatch                                                                                                                                                           |
+| R9   | Delegating-ledger instrumentation failures: the original promise object is returned, its outcome unchanged, no unhandled rejection, the failure counted                                                                                                                                                                                                                                              |
+| E1   | A normal capture seals and verifies: integrity OK, retention `COMPLETE`; pool context, collector replay and transaction analysis `REPRODUCED`, ledger structural checks consistent, runtime accounting `RUNTIME_ACCOUNTING_NOT_REPRODUCED` (never reported as a success)                                                                                                                             |
 | E2   | A malformed or dirty collection (fail-fast frames) is reproduced faithfully and stays unclean                                                                                                                                                                                                                                                                                                        |
 | E3   | An incomplete capture (retention pressure, a missing exchange body, missing pool context) is `INCOMPLETE` and `MISSING_EVIDENCE`, never `REPRODUCED`                                                                                                                                                                                                                                                 |
 | E4   | Redaction: credentials in a response body as literal, `\u00XX`, percent-encoded, a JSON key and value, a binary body, and a partial-overflow trailing fragment. Original and stored digests stay distinct; differences are `LIMITED_BY_REDACTION` only where redaction could cause them; an inconclusive scan withholds the payload; a residual credential gives `SEAL_REFUSED` with nothing written |
 | E5   | Tampering: a changed byte, a wrong hash, a missing, unlisted (nested), symbolic-link, traversal or duplicate entry, a wrong manifest kind or version, reordered frames, an altered ledger record or exchange id. Integrity failures stop verification; consistent alterations of unredacted evidence are `MISMATCH`                                                                                  |
 | E6   | Cancellation and session stop mid-run with outstanding resolutions: the outcome is preserved and consistent, never upgraded                                                                                                                                                                                                                                                                          |
-| E7   | Failed cleanup (`FAILED_STILL_OPEN`, close and terminate throwing, a late close) is preserved                                                                                                                                                                                                                                                                                                        |
-| E8   | Timeouts: acknowledgement timeout and session request timeout (`REQUEST_TIMED_OUT`, no body)                                                                                                                                                                                                                                                                                                         |
+| E7   | Failed cleanup (`FAILED_STILL_OPEN`, close and terminate throwing, a late close) is preserved; the owner's frozen `closeCode: null` and the wrapper's later `1006` are both kept, labelled by phase, and are not a mismatch                                                                                                                                                                          |
+| E8   | Timeouts: acknowledgement timeout and session request timeout (`REQUEST_TIMED_OUT`, no body); a request completing after settlement (later phase); another owner's requests outside the observation window                                                                                                                                                                                           |
+| E12  | Analysis classes: a `LATE_RESPONSE` record whose stored body decodes is `RUNTIME_OUTCOME_NOT_COMPARED`, not `MISMATCH`; a changed id or signature in unredacted evidence is `MISMATCH`; the ledger is never reported as replayed                                                                                                                                                                     |
 | E9   | Write failures: an existing directory; a failure after some files (no manifest, files listed, not sealed, no retry)                                                                                                                                                                                                                                                                                  |
 | E10  | Credential-bearing evidence everywhere (binary frames, exchange bodies, raw account data containing a secret's bytes): nothing persisted; URLs never stored                                                                                                                                                                                                                                          |
 | E11  | Scope: every qualification flag is `false` in every outcome; the CPMM market parser still rejects `"CPMM"`                                                                                                                                                                                                                                                                                           |
 
 ###### J. Missing Hooks, Shared-Helper Change and Unresolved Gaps (for Review)
 
-- **G1, no resolution-fact hook**: the ledger keeps the adapter fact private, and its records carry no request sequence. Binding uses the signature and session ledger (item C), relying on one request per first occurrence. A reviewed, read-only accessor exposing each record's resolution fact or request sequence would make the binding direct. That would be an accepted-module change, so it is not proposed here.
-- **G2, transaction re-derivation through accepted code**: the adapter's response checks are private, and a fresh session cannot reproduce the recorded JSON-RPC ids. The options are:
-  1. a reviewed pure export from the adapter, for example `verifyTransactionResponse(signature, id, bodyBytes, pool)`, running the existing checks (recommended; an accepted-module change for review);
-  2. a replay session whose fetch returns the stored body with the id rewritten, flagged `REPLAYED_WITH_ID_SUBSTITUTION` (it alters evidence bytes, so it is weaker);
-  3. re-implementing the checks in the evidence script, which is not acceptable (duplication).
-
-  Until one is approved, re-decoding can run only the pure decoder on the stored body, and the adapter-level checks are reported `NOT_REPRODUCED_ADAPTER_CHECKS`.
-
+- **G1, no resolution-fact hook** (out of scope): the ledger keeps the adapter fact private, and its records carry no request sequence. Binding uses the signature and session ledger (item C), relying on one request per first occurrence. A read-only accessor would make the binding direct, but it would be a ledger change, which is out of scope.
+- **G2, transaction re-derivation through accepted code**: resolved by implementing `analyzeCpmmTransactionResponse` (item K). The replay session with substituted ids and a re-implementation in the evidence script were both rejected. Fresh sessions could in principle recreate ids, since `nextJsonRpcId` is a counter, but only by reproducing every other id consumer in order; the pure export avoids coupling response analysis to session replay.
 - **G3, pool-account acquisition**: nothing acquires CPMM pool and vault accounts with exchange evidence. Until a reviewed acquisition exists, the context is `SUPPLIED_UNVERIFIED` (item E).
 - **G4, the shared sanitizer**: item D's helper is a new shared module needing its own review and pin entry. The existing modules keep their private copies until a separate migration.
-- **G5, typed composition**: the owner's option type names the concrete ledger class, so the delegating ledger needs a cast. An owner-side port type would remove the cast, but that is an owner change, not proposed.
-- **G6, ingestion re-derivation**: tracker ingestion depends on the tracker's state and clock, so it is reproducible only when both are recorded. Otherwise it is reported separately as `INGESTION_NOT_REPRODUCIBLE`.
+- **G5, typed composition** (out of scope): the owner's option type names the concrete ledger class, so the delegating ledger needs a cast. An owner-side port type would remove the cast, but owner changes are out of scope.
+- **G6, runtime accounting and ingestion**: lifecycle checks and tracker ingestion depend on session state, the clock and the tracker's state. Nothing replays them, and the pure analysis cannot (it is unbranded and never ingestible). Until a reviewed lifecycle and tracker replay exists, ledger re-derivation is structural, and runtime accounting is reported `RUNTIME_ACCOUNTING_NOT_REPRODUCED`.
 - **G7, composition checks for the future factory** (not selected here):
-  - the collector's `maxRetainedFrameRecords >= maxEpochFrames`;
+  - the collector's `maxRetainedFrameRecords >= maxEpochFrames + 1` (the extra refused record of item B), and `maxRetainedNotifications >= maxEpochFrames`;
   - the recorder's incoming byte allowance at least the collector's `maxEpochBytes`;
   - the exchange body allowance at least the session lane's response limit times `maxOutstandingResolutions` (or the ledger's record limit);
   - the wrapper and owner relations of item 16 D.
@@ -9872,6 +9916,77 @@ This capture is observation and decoding evidence. It does not establish notific
   Recording does not change these. It records a late close only if it occurs before `finish()`.
 
 - **Not selected**: the production wiring, endpoint lookup and live limits, and any operator command or capture, each separately approved.
+
+###### K. Review Corrections and the G2 Prerequisite (2026-11-20)
+
+**Corrections to `b623440`** (applied in items A, B, C, G, I and J):
+
+1. **Wrapper-observed and owner-received events are separate.** There is no blanket message-count equality: a supported clean run can give owner `messageEvents: 2` and wrapper `messages.delivered: 3` after intake stops.
+2. **Cleanup comparisons are phase-aware.** The owner's frozen `closeCode: null` and the wrapper's later `1006` after `FAILED_STILL_OPEN` are both preserved.
+3. **Collector refusals with null digests and receipt times** are matched by order and length only, never given fabricated values. The frame-record composition check is `maxEpochFrames + 1`.
+4. **Timing checks are per phase**: context acquisition, observation, drain, finalization and later activity. Shared-session activity is not required to fall inside the observation.
+5. **The exchange fan-out exposes bounded failure diagnostics.** Instrumentation failures never change the original promise, callback behavior or request outcome, and never create unhandled rejections.
+6. **Each transport event is recorded exactly once**, through one observation listener per event, which also covers the close observed after settlement.
+7. **No fresh-ledger replay is claimed.** Ledger re-derivation is structural, and runtime accounting is `RUNTIME_ACCOUNTING_NOT_REPRODUCED`.
+8. **The claim that fresh sessions cannot recreate ids is corrected**: `nextJsonRpcId` is a counter. The pure export avoids session replay altogether.
+9. **G1 and G5 stay out of scope**, and supplied pool context stays `SUPPLIED_UNVERIFIED` until acquisition evidence exists.
+
+**G2 implemented: `analyzeCpmmTransactionResponse`** (in `RaydiumCpmmTransactionSourceAdapter.ts`):
+
+- **Shared steps**: body retention (strict UTF-8, JSON parse, credential scan) and response classification (envelope, id, result and error, signature, slot and blockTime, then the accepted decoder) moved unchanged into module-level functions. `resolve()` calls them at its unchanged step 10, after evidence binding and the post-await lifecycle check. Validation order, credential checks, evidence binding, lifecycle gates, reservations and `ingest()` are unchanged; the existing 21 adapter tests pass unchanged, except T-16's import list, which now includes `node:util`.
+- **Inputs** (plain data only; unknown or missing keys refused):
+  - the full notification (signature, slot, receipt time, optional blockTime), validated by the adapter's own rule;
+  - the expected JSON-RPC id (a positive safe integer);
+  - the pool context (refused if proxied, then probed exactly as the constructor does);
+  - the response bytes: a genuine `Uint8Array`, read through captured intrinsics, bounded by `maxResponseBytes` (at most `CPMM_MAX_ANALYSIS_RESPONSE_BYTES`, 64 MiB) before any copy, and copied;
+  - the secrets (the constructor's rule, read without running getters).
+
+  Top-level proxies are refused before any trap runs. Refusals are `INPUT_INVALID` with a fixed code.
+
+- **Result**: an unbranded, deep-frozen `ANALYZED` record. It contains:
+  - the fact's kind, code, detail, RPC error code (never the message), decoder status, events and replay;
+  - the retention outcome (`STORED` or `WITHHELD`, length, SHA-256, withheld reason), with no payload text;
+  - `scope: "RESPONSE_VALIDATION_AND_DECODING_ONLY"`;
+  - `notProven`: session admission, request-evidence binding, cancellation, freshness and lifecycle, and tracker ingestion.
+
+  It has no `ingestible` flag. It is never added to the adapter's private provenance set, so `ingest()` refuses it (and any fact-shaped copy) as `FOREIGN_FACT`.
+
+- **Limits**: a body that decodes here may belong to a runtime `LATE_RESPONSE` record; that is not automatically a mismatch.
+
+**Tests** (adapter suite, 25):
+
+- **T-21**: live and pure agree on unchanged ids and bytes for 16 response outcomes:
+  - swaps, no target swap, failed transaction and decoder unresolved;
+  - RPC error and not found;
+  - id mismatch, extra envelope key, result and error together, invalid UTF-8 and unparsable JSON;
+  - different signature, slot mismatch, block time mismatch and block time unavailable;
+  - credential material.
+
+  Body digest, state and withheld reason are equal, and nothing secret is returned.
+
+- **T-22**: a changed id, signature, slot, blockTime, receipt time, pool or byte changes the analysis exactly as at runtime.
+- **T-23**: input validation covers non-plain, proxied (zero traps), accessor (no getter runs), extra and missing keys; invalid notifications, ids, pools and secrets; byte bounds at the edge; shadowed lengths; offset views; and copy independence.
+- **T-24**: an analysis of a runtime `LATE_RESPONSE` body decodes but lists freshness as not proven; it, a forged fact-shaped copy and a JSON round-trip are all refused by `ingest()` before the tracker is touched; and the analysis makes no request.
+
+**Mutation checks**: 15 targeted mutants of the new boundary, each run under an external 60-second limit with the source restored and compared byte for byte afterwards. All 15 were killed:
+
+- skipping the export's credential scan, proxy refusals (input and notification), bound before copy, intrinsic length, id bound, descriptor-only secret reads, pool probe, absolute cap or secrets rule;
+- adding an `ingestible` flag, dropping freshness from `notProven`;
+- removing the shared id comparison, or turning shared credential withholding into a malformed response;
+- skipping the live lifecycle check.
+
+**Results** (2026-11-20, each command under an external 60-second limit):
+
+| Check                                                                                                                  | Result                                               |
+| ---------------------------------------------------------------------------------------------------------------------- | ---------------------------------------------------- |
+| Adapter suite                                                                                                          | 25/25                                                |
+| Focused set: wrapper, owner, collector, ledger, decoder, adapter, tracker, `fresh-amm-v4-watch`, `paper-pilot-handoff` | 231/231 (22 + 55 + 24 + 25 + 16 + 25 + 40 + 11 + 13) |
+| Backend typecheck (`tsc --noEmit`)                                                                                     | Clean                                                |
+| ESLint and Prettier on the two changed source and test files                                                           | Clean                                                |
+| Pin (`paper-pilot-handoff`, including H-12)                                                                            | 13/13 (no pin change)                                |
+| Wallet `.tmp/virtual-wallet.json`                                                                                      | Unchanged (`7F2C2353…ED9`)                           |
+
+No recorder, sanitizer, sealer, session, ledger, owner, pin, configuration or dependency change was made, and no request, socket, capture, wallet change or operator command was run.
 
 ---
 

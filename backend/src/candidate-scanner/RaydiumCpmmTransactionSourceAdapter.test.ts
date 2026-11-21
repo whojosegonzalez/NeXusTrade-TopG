@@ -38,8 +38,11 @@ import {
   decodeRaydiumCpmmTransactionSwaps,
 } from "./RaydiumCpmmSwapDecoder.js";
 import {
+  CPMM_MAX_ANALYSIS_RESPONSE_BYTES,
+  CPMM_RESPONSE_ANALYSIS_NOT_PROVEN,
   CPMM_TX_PURPOSE,
   RaydiumCpmmTransactionSourceAdapter,
+  analyzeCpmmTransactionResponse,
   createCpmmExchangeEvidenceRecorder,
   type CpmmLifecycleGate,
   type CpmmResolutionFact,
@@ -1530,6 +1533,7 @@ describe("Raydium CPMM transaction source adapter (synthetic, offline)", () => {
     const imports = [...src.matchAll(/^import[^;]*from "([^"]+)";/gm)].map((m) => m[1]);
     expect(imports).toEqual([
       "node:crypto",
+      "node:util",
       "./ExactPoolHistoryEnumerator.js",
       "./PaperRequestSession.js",
       "./RaydiumCpmmPoolStateAdapter.js",
@@ -1736,5 +1740,346 @@ describe("Raydium CPMM transaction source adapter (synthetic, offline)", () => {
     const f = await h.resolve(notice(1), okSwap(1)());
     expect(f.kind).toBe("RESOLVED_SWAPS");
     expect(h.adapter.getBinding()).toBe(b);
+  });
+  // --- G2: pure response analysis (shared with the live adapter) -------------------------------
+
+  /** The analysis input for a response the live adapter received for notice(n) with `id`. */
+  const analysisInput = (
+    n: number,
+    id: number,
+    bytes: Uint8Array,
+    extra: Record<string, unknown> = {},
+  ) => ({
+    notification: notice(n),
+    jsonRpcId: id,
+    pool: POOL,
+    responseBytes: bytes,
+    maxResponseBytes: 6_000,
+    secrets: SECRETS,
+    ...extra,
+  });
+  const outcomeOf = (a: ReturnType<typeof analyzeCpmmTransactionResponse>) => {
+    if (a.status !== "ANALYZED") throw new Error(`not analyzed: ${a.code}`);
+    return {
+      kind: a.kind,
+      code: a.code,
+      detail: a.detail,
+      rpcErrorCode: a.rpcErrorCode,
+      decoder: a.decoder,
+      events: a.events,
+      replay: a.replay,
+    };
+  };
+  const factOutcome = (f: CpmmResolutionFact) => ({
+    kind: f.kind,
+    code: f.code,
+    detail: f.detail,
+    rpcErrorCode: f.rpcErrorCode,
+    decoder: f.decoder,
+    events: f.events,
+    replay: f.replay,
+  });
+
+  it("T-21 (G2): the pure analysis agrees with the live adapter on unchanged ids and bytes, for every response outcome", async () => {
+    const h = harness({ maxResponseBytes: 6_000, maxHttpAttempts: 40 });
+    const failedTx = (sig: string) => {
+      const t = txResult(sig, [swapIx("BUY")]);
+      t.meta.err = { InstructionError: [0, { Custom: 6005 }] };
+      return t;
+    };
+    const unsupported = (sig: string) => {
+      const t = txResult(sig, [swapIx("BUY")]);
+      t.version = `v9-${"z".repeat(40)}`;
+      return t;
+    };
+    const otherSlot = (sig: string) => ({ ...txResult(sig, [swapIx("BUY")]), slot: SLOT + 1 });
+    const otherTime = (sig: string) => ({
+      ...txResult(sig, [swapIx("BUY")]),
+      blockTime: BLOCK_TIME + 1,
+    });
+    const noTime = (sig: string) => ({ ...txResult(sig, [swapIx("BUY")]), blockTime: null });
+    const env = (id: number, v: Record<string, unknown>) =>
+      JSON.stringify({ jsonrpc: "2.0", id, ...v });
+    const cases: [string, (n: number, id: number) => string | Uint8Array, string][] = [
+      [
+        "swaps",
+        (n, id) =>
+          env(id, {
+            result: txResult(signatureOf(n), [
+              swapIx("BUY"),
+              swapIx("SELL", 2_500_000n, 900_000_000n),
+            ]),
+          }),
+        "RESOLVED_SWAPS",
+      ],
+      [
+        "no target swap",
+        (n, id) => env(id, { result: txResult(signatureOf(n), [memoIx()]) }),
+        "RESOLVED_NO_TARGET_SWAP",
+      ],
+      [
+        "failed transaction",
+        (n, id) => env(id, { result: failedTx(signatureOf(n)) }),
+        "RECORDED_FAILED_TRANSACTION",
+      ],
+      [
+        "decoder unresolved",
+        (n, id) => env(id, { result: unsupported(signatureOf(n)) }),
+        "UNRESOLVED",
+      ],
+      [
+        "rpc error (code only)",
+        (_n, id) =>
+          env(id, { error: { code: -32_004, message: `failed ${SECRET_KEY.slice(0, 3)}` } }),
+        "RPC_ERROR",
+      ],
+      ["not found", (_n, id) => env(id, { result: null }), "TRANSACTION_NOT_FOUND"],
+      [
+        "id mismatch",
+        (n, id) => env(id + 1, { result: txResult(signatureOf(n), [swapIx("BUY")]) }),
+        "MALFORMED_RESPONSE",
+      ],
+      [
+        "extra envelope key",
+        (n, id) => env(id, { result: txResult(signatureOf(n), [swapIx("BUY")]), x: 1 }),
+        "MALFORMED_RESPONSE",
+      ],
+      [
+        "result and error",
+        (_n, id) => env(id, { result: null, error: { code: 1, message: "m" } }),
+        "MALFORMED_RESPONSE",
+      ],
+      ["invalid UTF-8", () => Uint8Array.from([0x7b, 0xff, 0x7d]), "MALFORMED_RESPONSE"],
+      ["unparsable JSON", () => "{not json", "MALFORMED_RESPONSE"],
+      [
+        "different signature",
+        (n, id) => env(id, { result: txResult(signatureOf(n + 100), [swapIx("BUY")]) }),
+        "SIGNATURE_MISMATCH",
+      ],
+      [
+        "slot mismatch",
+        (n, id) => env(id, { result: otherSlot(signatureOf(n)) }),
+        "METADATA_CONTRADICTION",
+      ],
+      [
+        "block time mismatch",
+        (n, id) => env(id, { result: otherTime(signatureOf(n)) }),
+        "METADATA_CONTRADICTION",
+      ],
+      [
+        "block time unavailable",
+        (n, id) => env(id, { result: noTime(signatureOf(n)) }),
+        "METADATA_CONTRADICTION",
+      ],
+      [
+        "credential material",
+        (n, id) =>
+          env(id, {
+            result: txResult(signatureOf(n), [swapIx("BUY")], [`Program log: ${SECRET_KEY}`]),
+          }),
+        "EVIDENCE_NOT_REPLAYABLE",
+      ],
+    ];
+    let n = 0;
+    for (const [label, make, kind] of cases) {
+      n++;
+      const live = await h.resolve(notice(n), reply((id) => make(n, id))());
+      expect(live.kind, label).toBe(kind);
+      const id = live.exchange!.jsonRpcId;
+      const raw = make(n, id);
+      const bytes = typeof raw === "string" ? Buffer.from(raw, "utf8") : raw;
+      const a = analyzeCpmmTransactionResponse(analysisInput(n, id, bytes));
+      expect(outcomeOf(a), label).toEqual(factOutcome(live));
+      expect(a.status === "ANALYZED" && a.body.sha256, label).toBe(live.exchange!.body.sha256);
+      expect(a.status === "ANALYZED" && a.body.state, label).toBe(live.exchange!.body.state);
+      expect(a.status === "ANALYZED" && a.body.withheldReason, label).toBe(
+        live.exchange!.body.withheldReason,
+      );
+      expect(json(a), label).not.toContain(SECRET_KEY.slice(0, 8));
+      expectPlainFrozen(a, label);
+    }
+  });
+
+  it("T-22 (G2): mismatched ids, signatures and metadata change the analysis exactly as at runtime", async () => {
+    const h = harness();
+    const live = await h.resolve(notice(1), okSwap(1)());
+    expect(live.kind).toBe("RESOLVED_SWAPS");
+    const id = live.exchange!.jsonRpcId;
+    const bytes = Buffer.from(live.exchange!.body.payload!, "utf8");
+    const base = analyzeCpmmTransactionResponse(analysisInput(1, id, bytes));
+    expect(outcomeOf(base)).toEqual(factOutcome(live));
+    const variant = (extra: Record<string, unknown>) =>
+      analyzeCpmmTransactionResponse(analysisInput(1, id, bytes, extra));
+    const kc = (a: ReturnType<typeof analyzeCpmmTransactionResponse>) => [
+      a.status === "ANALYZED" ? a.kind : a.status,
+      a.code,
+    ];
+    expect(kc(variant({ jsonRpcId: id + 1 }))).toEqual(["MALFORMED_RESPONSE", "ID_MISMATCH"]);
+    expect(kc(variant({ notification: notice(2) }))).toEqual([
+      "SIGNATURE_MISMATCH",
+      "SIGNATURE_DIFFERENT",
+    ]);
+    expect(kc(variant({ notification: notice(1, { slot: SLOT + 1 }) }))).toEqual([
+      "METADATA_CONTRADICTION",
+      "SLOT_MISMATCH",
+    ]);
+    expect(kc(variant({ notification: notice(1, { blockTime: BLOCK_TIME + 1 }) }))).toEqual([
+      "METADATA_CONTRADICTION",
+      "BLOCK_TIME_MISMATCH",
+    ]);
+    // No notified blockTime: nothing to compare (as at runtime).
+    expect(kc(variant({ notification: notice(1, { blockTime: null }) }))).toEqual([
+      "RESOLVED_SWAPS",
+      null,
+    ]);
+    // A different receipt time changes only the receipt timestamp of the decoded events.
+    const later = variant({ notification: notice(1, { receivedAtMs: RECEIVED_AT + 7 }) });
+    expect(later.status === "ANALYZED" && later.events[0]!.receiptTimestampMs).toBe(
+      RECEIVED_AT + 7,
+    );
+    // A different pool context is a different decoder context.
+    const otherPool = { ...POOL, poolAddress: key(77) } as RaydiumCpmmPoolStateSuccess;
+    const pooled = variant({ pool: otherPool });
+    expect(pooled.status === "ANALYZED" ? pooled.kind : pooled.code).not.toBe("RESOLVED_SWAPS");
+    // Changed bytes that stay valid JSON are analysed as what they now say (here, another slot).
+    const tampered = Buffer.from(
+      bytes.toString("utf8").replace(`"slot":${SLOT}`, `"slot":${SLOT + 2}`),
+    );
+    expect(kc(variant({ responseBytes: tampered }))).toEqual([
+      "METADATA_CONTRADICTION",
+      "SLOT_MISMATCH",
+    ]);
+  });
+
+  it("T-23 (G2): public inputs are validated safely and bounded before any copy", () => {
+    const bytes = Buffer.from(JSON.stringify({ jsonrpc: "2.0", id: 5, result: null }));
+    const ok = analysisInput(1, 5, bytes);
+    expect(analyzeCpmmTransactionResponse(ok)).toMatchObject({
+      status: "ANALYZED",
+      kind: "TRANSACTION_NOT_FOUND",
+      scope: "RESPONSE_VALIDATION_AND_DECODING_ONLY",
+      notProven: CPMM_RESPONSE_ANALYSIS_NOT_PROVEN,
+    });
+    const traps = { n: 0 };
+    const counting = <T extends object>(t: T): T =>
+      new Proxy(t, {
+        get: (o, k, r) => (traps.n++, Reflect.get(o, k, r)),
+        ownKeys: (o) => (traps.n++, Reflect.ownKeys(o)),
+        getOwnPropertyDescriptor: (o, k) => (traps.n++, Reflect.getOwnPropertyDescriptor(o, k)),
+        getPrototypeOf: (o) => (traps.n++, Reflect.getPrototypeOf(o)),
+      });
+    let getterRuns = 0;
+    const withGetter = { ...ok };
+    Object.defineProperty(withGetter, "jsonRpcId", {
+      get: () => (getterRuns++, 5),
+      enumerable: true,
+    });
+    const secretsGetter = [...SECRETS];
+    Object.defineProperty(secretsGetter, 0, { get: () => (getterRuns++, RPC_URL) });
+    const { secrets: _omit, ...missingSecrets } = ok;
+    void _omit;
+    const shadowed = Buffer.from(bytes);
+    Object.defineProperty(shadowed, "byteLength", { value: 1 });
+    Object.defineProperty(shadowed, "length", { value: 1 });
+    const cases: [unknown, string][] = [
+      [null, "INPUT_NOT_PLAIN_DATA"],
+      ["x", "INPUT_NOT_PLAIN_DATA"],
+      [[ok], "INPUT_NOT_PLAIN_DATA"],
+      [counting({ ...ok }), "INPUT_NOT_PLAIN_DATA"],
+      [withGetter, "INPUT_NOT_PLAIN_DATA"],
+      [{ ...ok, extra: 1 }, "INPUT_UNKNOWN_KEY"],
+      [missingSecrets, "INPUT_MISSING_KEY"],
+      [{ ...ok, notification: counting(notice(1)) }, "NOTIFICATION_NOT_PLAIN_DATA"],
+      [{ ...ok, notification: { ...notice(1), signature: "x" } }, "SIGNATURE_INVALID"],
+      [{ ...ok, notification: { ...notice(1), receivedAtMs: 0 } }, "RECEIVED_AT_INVALID"],
+      [{ ...ok, notification: { ...notice(1), blockTime: 1.5 } }, "BLOCK_TIME_INVALID"],
+      [{ ...ok, notification: { ...notice(1), x: 1 } }, "UNKNOWN_KEY"],
+      [{ ...ok, jsonRpcId: 0 }, "JSON_RPC_ID_INVALID"],
+      [{ ...ok, jsonRpcId: 1.5 }, "JSON_RPC_ID_INVALID"],
+      [{ ...ok, jsonRpcId: "5" }, "JSON_RPC_ID_INVALID"],
+      [{ ...ok, pool: {} }, "POOL_CONTEXT_INVALID"],
+      [{ ...ok, pool: counting({ ...POOL }) }, "POOL_CONTEXT_INVALID"],
+      [{ ...ok, secrets: [] }, "SECRETS_INVALID"],
+      [{ ...ok, secrets: ["short"] }, "SECRETS_INVALID"],
+      [{ ...ok, secrets: RPC_URL }, "SECRETS_INVALID"],
+      [{ ...ok, secrets: counting([...SECRETS]) }, "SECRETS_INVALID"],
+      [{ ...ok, secrets: secretsGetter }, "SECRETS_INVALID"],
+      [{ ...ok, maxResponseBytes: 0 }, "MAX_RESPONSE_BYTES_INVALID"],
+      [
+        { ...ok, maxResponseBytes: CPMM_MAX_ANALYSIS_RESPONSE_BYTES + 1 },
+        "MAX_RESPONSE_BYTES_INVALID",
+      ],
+      [{ ...ok, maxResponseBytes: "9" }, "MAX_RESPONSE_BYTES_INVALID"],
+      [{ ...ok, responseBytes: "{}" }, "RESPONSE_BYTES_INVALID"],
+      [{ ...ok, responseBytes: bytes.buffer }, "RESPONSE_BYTES_INVALID"],
+      [{ ...ok, responseBytes: new Uint16Array(4) }, "RESPONSE_BYTES_INVALID"],
+      [{ ...ok, responseBytes: counting(Buffer.from(bytes)) }, "RESPONSE_BYTES_INVALID"],
+      [{ ...ok, maxResponseBytes: bytes.length - 1 }, "RESPONSE_EXCEEDS_LIMIT"],
+    ];
+    for (const [input, code] of cases) {
+      const r = analyzeCpmmTransactionResponse(input);
+      expect(r, code).toEqual({
+        status: "INPUT_INVALID",
+        code,
+        scope: "RESPONSE_VALIDATION_AND_DECODING_ONLY",
+      });
+      expect(Object.isFrozen(r)).toBe(true);
+    }
+    expect(traps.n).toBe(0);
+    expect(getterRuns).toBe(0);
+    // Exactly at the limit is analysed; a shadowed length is ignored (the genuine bytes are used).
+    expect(analyzeCpmmTransactionResponse({ ...ok, maxResponseBytes: bytes.length }).status).toBe(
+      "ANALYZED",
+    );
+    const sh = analyzeCpmmTransactionResponse({ ...ok, responseBytes: shadowed });
+    expect(sh.status === "ANALYZED" && sh.body.retainedBytes).toBe(bytes.length);
+    // Only the view's own bytes are read.
+    const framed = Buffer.concat([Buffer.from("XX"), bytes, Buffer.from("YY")]);
+    const view = framed.subarray(2, 2 + bytes.length);
+    const v = analyzeCpmmTransactionResponse({ ...ok, responseBytes: view });
+    expect(v.status === "ANALYZED" && v.body.sha256).toBe(sha256(bytes));
+    // The caller's buffer is copied: later mutation does not reach the result.
+    const mutable = Buffer.from(bytes);
+    const before = analyzeCpmmTransactionResponse({ ...ok, responseBytes: mutable });
+    mutable.fill(0x20);
+    expect(before.status === "ANALYZED" && before.kind).toBe("TRANSACTION_NOT_FOUND");
+  });
+
+  it("T-24 (G2): an analysis is never a trusted fact; ingest() refuses it, and a late runtime outcome is not a mismatch", async () => {
+    const h = harness();
+    // The clock passes the session deadline after completion: the runtime outcome is LATE_RESPONSE.
+    h.tap.fn = (e) => {
+      h.recorder.observe(e);
+      h.state.now = h.deadline();
+    };
+    const late = await h.resolve(notice(1), okSwap(1)());
+    expect(kindOf(late)).toEqual(["LATE_RESPONSE", "ABSOLUTE_DEADLINE", null]);
+    const bytes = Buffer.from(late.exchange!.body.payload!, "utf8");
+    const a = analyzeCpmmTransactionResponse(analysisInput(1, late.exchange!.jsonRpcId, bytes));
+    // The same bytes decode: the analysis proves validation and decoding only, not freshness.
+    expect(a.status === "ANALYZED" && a.kind).toBe("RESOLVED_SWAPS");
+    expect(a.status === "ANALYZED" && a.notProven).toContain("FRESHNESS_AND_LIFECYCLE");
+    expect(Object.keys(a)).not.toContain("ingestible");
+    // ingest() refuses the analysis and any fact-shaped copy of it, before touching the tracker.
+    const spy = {
+      getPoolId: () => POOL.poolAddress,
+      getTokenMint: () => POOL.candidateMint,
+      ingestTrade: vi.fn(),
+    } as unknown as RollingTradeFlowTracker;
+    const forged = { ...(a as object), ingestible: true, replay: "DECODER_REPLAYABLE" };
+    for (const candidate of [a, forged, JSON.parse(json(a))]) {
+      expect(h.adapter.ingest(candidate as unknown as CpmmResolutionFact, spy)).toMatchObject({
+        status: "NOT_INGESTIBLE",
+        code: "FOREIGN_FACT",
+        total: 0,
+      });
+    }
+    expect(
+      (spy as unknown as { ingestTrade: ReturnType<typeof vi.fn> }).ingestTrade,
+    ).not.toHaveBeenCalled();
+    // The analysis made no request, reservation or session use.
+    expect(h.calls).toHaveLength(1);
+    expect(h.adapter.reservedSignatureCount).toBe(1);
+    expect(h.ledger()).toHaveLength(1);
   });
 });

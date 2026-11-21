@@ -15,11 +15,16 @@
  * - Retention: only unchanged, credential-free, valid UTF-8 JSON bodies are stored; everything else
  *   is withheld with counts, a SHA-256 digest and a fixed reason. Facts keep fixed codes only.
  * - Reservations are permanent per instance: no eviction, release or retry.
+ * - `analyzeCpmmTransactionResponse` is a pure export of the same body-retention and response
+ *   classification steps, for offline re-derivation of recorded bytes. It proves response
+ *   validation and decoding only, returns an unbranded analysis (never a fact `ingest()` accepts),
+ *   and reproduces no session admission, cancellation, freshness, lifecycle or ingestion.
  *
  * Not wired anywhere: no provider, bridge, admission or failed-transaction policy uses it.
  */
 
 import { createHash } from "node:crypto";
+import { types as utilTypes } from "node:util";
 import { isValidSolanaSignature } from "./ExactPoolHistoryEnumerator.js";
 import {
   PaperRequestSession,
@@ -50,6 +55,8 @@ const MAX_SECRETS = 64;
 const MAX_SECRET_CHARS = 4096;
 /** Decoding rounds (backslash escapes, then percent-encoding) before a scan is inconclusive. */
 const MAX_DECODE_ROUNDS = 4;
+/** Upper bound for a response body given to `analyzeCpmmTransactionResponse` (64 MiB). */
+export const CPMM_MAX_ANALYSIS_RESPONSE_BYTES = 64 * 1024 * 1024;
 
 /** getTransaction parameters (fixed). */
 export const CPMM_GET_TRANSACTION_CONFIG = Object.freeze({
@@ -345,6 +352,63 @@ export interface CpmmIngestionResult {
   readonly stopCheck: CpmmLifecycleCheck | null;
 }
 
+/** Inputs of the pure response analysis (data properties only; unknown keys are refused). */
+export interface CpmmTransactionResponseAnalysisInput {
+  /** The full notification identity: signature, slot, receipt time and optional blockTime. */
+  readonly notification: CpmmTransactionNotification;
+  /** The JSON-RPC id the request carried (positive safe integer). */
+  readonly jsonRpcId: number;
+  /** The verified pool context the adapter used. */
+  readonly pool: RaydiumCpmmPoolStateSuccess;
+  /** The complete response body bytes (a genuine Uint8Array, at most maxResponseBytes). */
+  readonly responseBytes: Uint8Array;
+  /** The body limit the request ran under (1..CPMM_MAX_ANALYSIS_RESPONSE_BYTES). */
+  readonly maxResponseBytes: number;
+  /** The configured credential values (same rule as the adapter's `secrets`). */
+  readonly secrets: readonly string[];
+}
+
+/** What the analysis can never establish (fixed and always listed). */
+export const CPMM_RESPONSE_ANALYSIS_NOT_PROVEN = Object.freeze([
+  "SESSION_ADMISSION",
+  "REQUEST_EVIDENCE_BINDING",
+  "CANCELLATION",
+  "FRESHNESS_AND_LIFECYCLE",
+  "TRACKER_INGESTION",
+] as const);
+
+/**
+ * An unbranded, deep-frozen analysis: never a `CpmmResolutionFact`, never accepted by `ingest()`
+ * and with no `ingestible` flag. A body that decodes here may still have been recorded at runtime
+ * as LATE_RESPONSE (or another lifecycle outcome); that difference is not a mismatch by itself.
+ */
+export type CpmmTransactionResponseAnalysis =
+  | {
+      readonly status: "INPUT_INVALID";
+      /** Fixed code naming the refused input. */
+      readonly code: string;
+      readonly scope: "RESPONSE_VALIDATION_AND_DECODING_ONLY";
+    }
+  | {
+      readonly status: "ANALYZED";
+      readonly scope: "RESPONSE_VALIDATION_AND_DECODING_ONLY";
+      readonly notProven: typeof CPMM_RESPONSE_ANALYSIS_NOT_PROVEN;
+      readonly kind: CpmmResolutionKind;
+      readonly code: string | null;
+      readonly detail: string | null;
+      readonly rpcErrorCode: number | null;
+      readonly decoder: CpmmResolutionFact["decoder"];
+      readonly events: readonly TradeEvent[];
+      readonly replay: CpmmReplay;
+      /** The live retention outcome for these bytes (no payload text is returned). */
+      readonly body: {
+        readonly state: "STORED" | "WITHHELD";
+        readonly retainedBytes: number;
+        readonly sha256: string;
+        readonly withheldReason: CpmmWithheldReason | null;
+      };
+    };
+
 // ---------------------------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------------------------
@@ -390,6 +454,31 @@ function readDataRecord(v: unknown): Record<string, unknown> | null {
     });
   }
   return out;
+}
+
+/** The adapter's secret rule: null when valid, else its fixed message. */
+function secretsProblem(secrets: unknown): string | null {
+  if (!Array.isArray(secrets) || secrets.length < 1 || secrets.length > MAX_SECRETS) {
+    return `secrets must be an array of 1..${MAX_SECRETS} strings`;
+  }
+  for (const s of secrets as unknown[]) {
+    if (
+      typeof s !== "string" ||
+      s.length < CPMM_MIN_SECRET_CHARS ||
+      s.length > MAX_SECRET_CHARS ||
+      !/^[\x21-\x7e]+$/.test(s)
+    ) {
+      return `each secret must be printable ASCII of ${CPMM_MIN_SECRET_CHARS}+ characters`;
+    }
+  }
+  return null;
+}
+
+/** Lower-cased credential prefixes searched for in response material. */
+function credentialNeedles(secrets: readonly string[]): readonly string[] {
+  return Object.freeze([
+    ...new Set(secrets.map((s) => s.slice(0, CPMM_CREDENTIAL_PREFIX_CHARS).toLowerCase())),
+  ]);
 }
 
 function stopCode(reason: string | null): string | null {
@@ -645,19 +734,8 @@ export class RaydiumCpmmTransactionSourceAdapter {
       fail("pool must be a verified CPMM pool context");
     }
     const secrets = o.secrets;
-    if (!Array.isArray(secrets) || secrets.length < 1 || secrets.length > MAX_SECRETS) {
-      fail(`secrets must be an array of 1..${MAX_SECRETS} strings`);
-    }
-    for (const s of secrets as unknown[]) {
-      if (
-        typeof s !== "string" ||
-        s.length < CPMM_MIN_SECRET_CHARS ||
-        s.length > MAX_SECRET_CHARS ||
-        !/^[\x21-\x7e]+$/.test(s)
-      ) {
-        fail(`each secret must be printable ASCII of ${CPMM_MIN_SECRET_CHARS}+ characters`);
-      }
-    }
+    const secretProblem = secretsProblem(secrets);
+    if (secretProblem !== null) fail(secretProblem);
     const rpcUrl = o.rpcUrl;
     if (typeof rpcUrl !== "string" || !(secrets as string[]).includes(rpcUrl)) {
       fail("rpcUrl must be a string listed in secrets");
@@ -686,11 +764,7 @@ export class RaydiumCpmmTransactionSourceAdapter {
     this.session = session;
     this.recorder = rec!;
     this.rpcUrl = rpcUrl as string;
-    this.needles = Object.freeze([
-      ...new Set(
-        (secrets as string[]).map((s) => s.slice(0, CPMM_CREDENTIAL_PREFIX_CHARS).toLowerCase()),
-      ),
-    ]);
+    this.needles = credentialNeedles(secrets as string[]);
     this.maxTrackedSignatures = maxTracked as number;
     this.maxResponseBytes = maxBytes as number;
     this.binding = Object.freeze({
@@ -837,120 +911,12 @@ export class RaydiumCpmmTransactionSourceAdapter {
         postAwaitCheck: check,
       });
     }
-    const withCheck = { ...base, postAwaitCheck: check };
-    // 10. Body, envelope, binding and cross-checks, then the decoder.
-    const body = ex.body;
-    if (body.state !== "STORED" || retained.parsed === undefined) {
-      if (
-        body.withheldReason === "CREDENTIAL_MATERIAL" ||
-        body.withheldReason === "CREDENTIAL_SCAN_INCONCLUSIVE"
-      ) {
-        return this.fact({
-          ...withCheck,
-          kind: "EVIDENCE_NOT_REPLAYABLE",
-          code: body.withheldReason,
-          replay: "NOT_REPLAYABLE",
-        });
-      }
-      return this.fact({
-        ...withCheck,
-        kind: "MALFORMED_RESPONSE",
-        code: body.withheldReason ?? "BODY_NOT_STORED",
-      });
-    }
-    return this.classifyResponse(retained.parsed, n, id, withCheck);
-  }
-
-  private classifyResponse(
-    parsed: unknown,
-    n: ValidNotification,
-    id: number,
-    base: {
-      notification: ValidNotification;
-      exchange: CpmmRetainedExchange;
-      postAwaitCheck: CpmmLifecycleCheck;
-    },
-  ): CpmmResolutionFact {
-    const malformed = (code: string) => this.fact({ ...base, kind: "MALFORMED_RESPONSE", code });
-    if (!isPlainRecord(parsed)) return malformed("ENVELOPE_NOT_OBJECT");
-    for (const k of Object.keys(parsed)) {
-      if (k !== "jsonrpc" && k !== "id" && k !== "result" && k !== "error") {
-        return malformed("ENVELOPE_EXTRA_KEY");
-      }
-    }
-    if (parsed.jsonrpc !== "2.0") return malformed("JSONRPC_VERSION");
-    if (!hasOwn(parsed, "id")) return malformed("ID_MISSING");
-    if (parsed.id !== id) return malformed("ID_MISMATCH");
-    const hasResult = hasOwn(parsed, "result");
-    const hasError = hasOwn(parsed, "error");
-    if (hasResult && hasError) return malformed("RESULT_AND_ERROR");
-    if (!hasResult && !hasError) return malformed("NO_RESULT_OR_ERROR");
-    if (hasError) {
-      const e = parsed.error;
-      if (
-        !isPlainRecord(e) ||
-        Object.keys(e).some((k) => k !== "code" && k !== "message" && k !== "data") ||
-        typeof e.code !== "number" ||
-        !Number.isSafeInteger(e.code) ||
-        typeof e.message !== "string"
-      ) {
-        return malformed("ERROR_OBJECT_INVALID");
-      }
-      return this.fact({
-        ...base,
-        kind: "RPC_ERROR",
-        code: "JSON_RPC_ERROR",
-        rpcErrorCode: e.code,
-      });
-    }
-    const result = parsed.result;
-    if (result === null) {
-      return this.fact({ ...base, kind: "TRANSACTION_NOT_FOUND", code: "RESULT_NULL" });
-    }
-    if (!isPlainRecord(result)) return malformed("RESULT_NOT_OBJECT");
-    const tx = result.transaction;
-    const sig0 =
-      isPlainRecord(tx) && Array.isArray(tx.signatures) ? (tx.signatures[0] as unknown) : undefined;
-    if (typeof sig0 !== "string") {
-      return this.fact({ ...base, kind: "SIGNATURE_MISMATCH", code: "SIGNATURE_MISSING" });
-    }
-    if (sig0 !== n.signature) {
-      return this.fact({ ...base, kind: "SIGNATURE_MISMATCH", code: "SIGNATURE_DIFFERENT" });
-    }
-    const contradiction = (code: string) =>
-      this.fact({ ...base, kind: "METADATA_CONTRADICTION", code });
-    if (!isSafeNonNegative(result.slot)) return contradiction("SLOT_INVALID");
-    if (result.slot !== n.slot) return contradiction("SLOT_MISMATCH");
-    if (typeof n.blockTime === "number") {
-      const bt = result.blockTime;
-      if (typeof bt !== "number" || !Number.isSafeInteger(bt)) {
-        return contradiction("BLOCK_TIME_UNAVAILABLE");
-      }
-      if (bt !== n.blockTime) return contradiction("BLOCK_TIME_MISMATCH");
-    }
-    const d = decodeRaydiumCpmmTransactionSwaps(result, this.pool, {
-      receiptTimestampMs: n.receivedAtMs,
+    // 10. Body, envelope, binding and cross-checks, then the decoder (shared with the export).
+    return this.fact({
+      ...base,
+      postAwaitCheck: check,
+      ...classifyRetainedResponse(ex.body, retained.parsed, n, id, this.pool),
     });
-    const decoder =
-      d.status === "UNRESOLVED_EVIDENCE"
-        ? { status: d.status, reason: d.reason, detail: decoderDetail(d.detail) }
-        : { status: d.status, reason: null, detail: null };
-    const decoded = { ...base, decoder, replay: "DECODER_REPLAYABLE" as const };
-    switch (d.status) {
-      case "SWAP_DECODED":
-        return this.fact({ ...decoded, kind: "RESOLVED_SWAPS", events: d.events });
-      case "NO_MATCHING_SWAPS":
-        return this.fact({ ...decoded, kind: "RESOLVED_NO_TARGET_SWAP" });
-      case "TRANSACTION_FAILED":
-        return this.fact({ ...decoded, kind: "RECORDED_FAILED_TRANSACTION" });
-      default:
-        return this.fact({
-          ...decoded,
-          kind: "UNRESOLVED",
-          code: FIXED_CODE.test(d.reason) ? d.reason : "UNRECOGNIZED_DECODER_REASON",
-          detail: decoder.detail,
-        });
-    }
   }
 
   // --- evidence binding and retention ---------------------------------------------------------
@@ -1083,56 +1049,7 @@ export class RaydiumCpmmTransactionSourceAdapter {
     copy: Buffer | null,
     observed: number | null,
   ): BodyOutcome {
-    if (state === "NOT_READ" || copy === null) {
-      return {
-        body: Object.freeze({
-          state: "NONE",
-          payload: null,
-          observedBytes: null,
-          retainedBytes: null,
-          sha256: null,
-          withheldReason: null,
-        }),
-      };
-    }
-    const withheld = (reason: CpmmWithheldReason): BodyOutcome => ({
-      body: Object.freeze({
-        state: "WITHHELD",
-        payload: null,
-        observedBytes: observed,
-        retainedBytes: copy.length,
-        sha256: sha256Hex(copy),
-        withheldReason: reason,
-      }),
-    });
-    if (state !== "COMPLETE") return withheld("PARTIAL_BODY");
-    let text: string;
-    try {
-      text = new TextDecoder("utf-8", { fatal: true, ignoreBOM: true }).decode(copy);
-    } catch {
-      return withheld("INVALID_UTF8");
-    }
-    if (!Buffer.from(text, "utf8").equals(copy)) return withheld("INVALID_UTF8");
-    let parsed: unknown;
-    try {
-      parsed = JSON.parse(text);
-    } catch {
-      return withheld("UNPARSABLE_JSON");
-    }
-    const scan = scanCredentialMaterial(copy, parsed, this.needles);
-    if (scan === "FOUND") return withheld("CREDENTIAL_MATERIAL");
-    if (scan === "INCONCLUSIVE") return withheld("CREDENTIAL_SCAN_INCONCLUSIVE");
-    return {
-      body: Object.freeze({
-        state: "STORED",
-        payload: text,
-        observedBytes: observed,
-        retainedBytes: copy.length,
-        sha256: sha256Hex(copy),
-        withheldReason: null,
-      }),
-      parsed,
-    };
+    return retainResponseBody(state, copy, observed, this.needles);
   }
 
   // --- lifecycle --------------------------------------------------------------------------------
@@ -1295,6 +1212,320 @@ export class RaydiumCpmmTransactionSourceAdapter {
     this.produced.add(out);
     return out;
   }
+}
+
+// ---------------------------------------------------------------------------------------------
+// Shared response steps (live adapter and pure export)
+// ---------------------------------------------------------------------------------------------
+
+/** The fact fields a response classification decides (the caller adds the rest). */
+interface ResponseClassification {
+  readonly kind: CpmmResolutionKind;
+  readonly code?: string | null;
+  readonly detail?: string | null;
+  readonly rpcErrorCode?: number | null;
+  readonly decoder?: CpmmResolutionFact["decoder"];
+  readonly events?: readonly TradeEvent[];
+  readonly replay?: CpmmReplay;
+}
+
+/** Stores only unchanged, credential-free, valid UTF-8 JSON; withholds everything else. */
+function retainResponseBody(
+  state: PaperRequestExchangeEvidence["bodyState"],
+  copy: Buffer | null,
+  observed: number | null,
+  needles: readonly string[],
+): BodyOutcome {
+  if (state === "NOT_READ" || copy === null) {
+    return {
+      body: Object.freeze({
+        state: "NONE",
+        payload: null,
+        observedBytes: null,
+        retainedBytes: null,
+        sha256: null,
+        withheldReason: null,
+      }),
+    };
+  }
+  const withheld = (reason: CpmmWithheldReason): BodyOutcome => ({
+    body: Object.freeze({
+      state: "WITHHELD",
+      payload: null,
+      observedBytes: observed,
+      retainedBytes: copy.length,
+      sha256: sha256Hex(copy),
+      withheldReason: reason,
+    }),
+  });
+  if (state !== "COMPLETE") return withheld("PARTIAL_BODY");
+  let decoded: string;
+  try {
+    decoded = new TextDecoder("utf-8", { fatal: true, ignoreBOM: true }).decode(copy);
+  } catch {
+    return withheld("INVALID_UTF8");
+  }
+  if (!Buffer.from(decoded, "utf8").equals(copy)) return withheld("INVALID_UTF8");
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(decoded);
+  } catch {
+    return withheld("UNPARSABLE_JSON");
+  }
+  const scan = scanCredentialMaterial(copy, parsed, needles);
+  if (scan === "FOUND") return withheld("CREDENTIAL_MATERIAL");
+  if (scan === "INCONCLUSIVE") return withheld("CREDENTIAL_SCAN_INCONCLUSIVE");
+  return {
+    body: Object.freeze({
+      state: "STORED",
+      payload: decoded,
+      observedBytes: observed,
+      retainedBytes: copy.length,
+      sha256: sha256Hex(copy),
+      withheldReason: null,
+    }),
+    parsed,
+  };
+}
+
+/** Step 10 of `resolve()`: the retained body, then the envelope, binding, metadata and decoder. */
+function classifyRetainedResponse(
+  body: CpmmRetainedBody,
+  parsed: unknown,
+  n: ValidNotification,
+  id: number,
+  pool: RaydiumCpmmPoolStateSuccess,
+): ResponseClassification {
+  if (body.state !== "STORED" || parsed === undefined) {
+    if (
+      body.withheldReason === "CREDENTIAL_MATERIAL" ||
+      body.withheldReason === "CREDENTIAL_SCAN_INCONCLUSIVE"
+    ) {
+      return {
+        kind: "EVIDENCE_NOT_REPLAYABLE",
+        code: body.withheldReason,
+        replay: "NOT_REPLAYABLE",
+      };
+    }
+    return { kind: "MALFORMED_RESPONSE", code: body.withheldReason ?? "BODY_NOT_STORED" };
+  }
+  return classifyParsedResponse(parsed, n, id, pool);
+}
+
+function classifyParsedResponse(
+  parsed: unknown,
+  n: ValidNotification,
+  id: number,
+  pool: RaydiumCpmmPoolStateSuccess,
+): ResponseClassification {
+  const malformed = (code: string): ResponseClassification => ({
+    kind: "MALFORMED_RESPONSE",
+    code,
+  });
+  if (!isPlainRecord(parsed)) return malformed("ENVELOPE_NOT_OBJECT");
+  for (const k of Object.keys(parsed)) {
+    if (k !== "jsonrpc" && k !== "id" && k !== "result" && k !== "error") {
+      return malformed("ENVELOPE_EXTRA_KEY");
+    }
+  }
+  if (parsed.jsonrpc !== "2.0") return malformed("JSONRPC_VERSION");
+  if (!hasOwn(parsed, "id")) return malformed("ID_MISSING");
+  if (parsed.id !== id) return malformed("ID_MISMATCH");
+  const hasResult = hasOwn(parsed, "result");
+  const hasError = hasOwn(parsed, "error");
+  if (hasResult && hasError) return malformed("RESULT_AND_ERROR");
+  if (!hasResult && !hasError) return malformed("NO_RESULT_OR_ERROR");
+  if (hasError) {
+    const e = parsed.error;
+    if (
+      !isPlainRecord(e) ||
+      Object.keys(e).some((k) => k !== "code" && k !== "message" && k !== "data") ||
+      typeof e.code !== "number" ||
+      !Number.isSafeInteger(e.code) ||
+      typeof e.message !== "string"
+    ) {
+      return malformed("ERROR_OBJECT_INVALID");
+    }
+    return { kind: "RPC_ERROR", code: "JSON_RPC_ERROR", rpcErrorCode: e.code };
+  }
+  const result = parsed.result;
+  if (result === null) return { kind: "TRANSACTION_NOT_FOUND", code: "RESULT_NULL" };
+  if (!isPlainRecord(result)) return malformed("RESULT_NOT_OBJECT");
+  const tx = result.transaction;
+  const sig0 =
+    isPlainRecord(tx) && Array.isArray(tx.signatures) ? (tx.signatures[0] as unknown) : undefined;
+  if (typeof sig0 !== "string") return { kind: "SIGNATURE_MISMATCH", code: "SIGNATURE_MISSING" };
+  if (sig0 !== n.signature) return { kind: "SIGNATURE_MISMATCH", code: "SIGNATURE_DIFFERENT" };
+  const contradiction = (code: string): ResponseClassification => ({
+    kind: "METADATA_CONTRADICTION",
+    code,
+  });
+  if (!isSafeNonNegative(result.slot)) return contradiction("SLOT_INVALID");
+  if (result.slot !== n.slot) return contradiction("SLOT_MISMATCH");
+  if (typeof n.blockTime === "number") {
+    const bt = result.blockTime;
+    if (typeof bt !== "number" || !Number.isSafeInteger(bt)) {
+      return contradiction("BLOCK_TIME_UNAVAILABLE");
+    }
+    if (bt !== n.blockTime) return contradiction("BLOCK_TIME_MISMATCH");
+  }
+  const d = decodeRaydiumCpmmTransactionSwaps(result, pool, {
+    receiptTimestampMs: n.receivedAtMs,
+  });
+  const decoder =
+    d.status === "UNRESOLVED_EVIDENCE"
+      ? { status: d.status, reason: d.reason, detail: decoderDetail(d.detail) }
+      : { status: d.status, reason: null, detail: null };
+  const decoded = { decoder, replay: "DECODER_REPLAYABLE" as const };
+  switch (d.status) {
+    case "SWAP_DECODED":
+      return { ...decoded, kind: "RESOLVED_SWAPS", events: d.events };
+    case "NO_MATCHING_SWAPS":
+      return { ...decoded, kind: "RESOLVED_NO_TARGET_SWAP" };
+    case "TRANSACTION_FAILED":
+      return { ...decoded, kind: "RECORDED_FAILED_TRANSACTION" };
+    default:
+      return {
+        ...decoded,
+        kind: "UNRESOLVED",
+        code: FIXED_CODE.test(d.reason) ? d.reason : "UNRECOGNIZED_DECODER_REASON",
+        detail: decoder.detail,
+      };
+  }
+}
+
+// --- pure export -------------------------------------------------------------------------------
+
+const ANALYSIS_KEYS: ReadonlySet<string> = new Set([
+  "notification",
+  "jsonRpcId",
+  "pool",
+  "responseBytes",
+  "maxResponseBytes",
+  "secrets",
+]);
+const ANALYSIS_SCOPE = "RESPONSE_VALIDATION_AND_DECODING_ONLY" as const;
+
+const isProxy = utilTypes.isProxy;
+const TYPED_ARRAY_PROTOTYPE = Object.getPrototypeOf(Uint8Array.prototype) as object;
+function intrinsicGetter(key: PropertyKey): (this: unknown) => unknown {
+  const get = Object.getOwnPropertyDescriptor(TYPED_ARRAY_PROTOTYPE, key)?.get;
+  if (typeof get !== "function") throw new Error("[CPMM_TX_SOURCE_INIT] missing intrinsic");
+  return get;
+}
+const typedArrayName = intrinsicGetter(Symbol.toStringTag);
+const typedArrayBuffer = intrinsicGetter("buffer");
+const typedArrayByteOffset = intrinsicGetter("byteOffset");
+const typedArrayByteLength = intrinsicGetter("byteLength");
+
+/** A copy of a genuine Uint8Array's own bytes, bounded before any copy; a code otherwise. */
+function boundedBytesCopy(v: unknown, max: number): Buffer | string {
+  if (typeof v !== "object" || v === null || isProxy(v)) return "RESPONSE_BYTES_INVALID";
+  try {
+    if (Reflect.apply(typedArrayName, v, []) !== "Uint8Array") return "RESPONSE_BYTES_INVALID";
+    const length = Reflect.apply(typedArrayByteLength, v, []);
+    const offset = Reflect.apply(typedArrayByteOffset, v, []);
+    if (!isSafeNonNegative(length) || !isSafeNonNegative(offset)) return "RESPONSE_BYTES_INVALID";
+    if (length > max) return "RESPONSE_EXCEEDS_LIMIT";
+    const buffer = Reflect.apply(typedArrayBuffer, v, []) as ArrayBuffer;
+    return Buffer.from(new Uint8Array(buffer, offset, length));
+  } catch {
+    return "RESPONSE_BYTES_INVALID";
+  }
+}
+
+/** A genuine, non-proxy array of own data-property strings; null otherwise (no getter runs). */
+function readStringArray(v: unknown): string[] | null {
+  if (!Array.isArray(v) || isProxy(v) || Object.getPrototypeOf(v) !== Array.prototype) return null;
+  const ld = Object.getOwnPropertyDescriptor(v, "length");
+  if (!ld || !("value" in ld) || !isSafeNonNegative(ld.value) || ld.value > MAX_SECRETS) {
+    return null;
+  }
+  const out: string[] = [];
+  for (let i = 0; i < ld.value; i++) {
+    const d = Object.getOwnPropertyDescriptor(v, String(i));
+    if (!d || !("value" in d) || typeof d.value !== "string") return null;
+    out.push(d.value);
+  }
+  return out;
+}
+
+/**
+ * Pure analysis of one recorded `getTransaction` response with the live adapter's own retention
+ * (UTF-8, JSON, credential scan) and classification (envelope, id, signature, metadata, decoder)
+ * steps, in the same order. It proves response validation and decoding only: no session
+ * admission, evidence binding, cancellation, freshness or lifecycle, and no tracker ingestion.
+ * The result is unbranded: `ingest()` refuses it, and it never creates a trusted runtime fact.
+ */
+export function analyzeCpmmTransactionResponse(input: unknown): CpmmTransactionResponseAnalysis {
+  const invalid = (code: string): CpmmTransactionResponseAnalysis =>
+    Object.freeze({ status: "INPUT_INVALID", code, scope: ANALYSIS_SCOPE });
+  if (typeof input !== "object" || input === null || isProxy(input)) {
+    return invalid("INPUT_NOT_PLAIN_DATA");
+  }
+  let r: Record<string, unknown> | null;
+  try {
+    r = readDataRecord(input);
+  } catch {
+    r = null;
+  }
+  if (!r) return invalid("INPUT_NOT_PLAIN_DATA");
+  for (const k of Object.keys(r)) if (!ANALYSIS_KEYS.has(k)) return invalid("INPUT_UNKNOWN_KEY");
+  for (const k of ANALYSIS_KEYS) if (!hasOwn(r, k)) return invalid("INPUT_MISSING_KEY");
+  if (isProxy(r.notification)) return invalid("NOTIFICATION_NOT_PLAIN_DATA");
+  const n = validateNotification(r.notification);
+  if (typeof n === "string") return invalid(n);
+  const id = r.jsonRpcId;
+  if (typeof id !== "number" || !Number.isSafeInteger(id) || id < 1) {
+    return invalid("JSON_RPC_ID_INVALID");
+  }
+  if (typeof r.pool !== "object" || r.pool === null || isProxy(r.pool)) {
+    return invalid("POOL_CONTEXT_INVALID");
+  }
+  const pool = r.pool as RaydiumCpmmPoolStateSuccess;
+  let probeOk = false;
+  try {
+    const probe = decodeRaydiumCpmmTransactionSwaps(null, pool, { receiptTimestampMs: 1 });
+    probeOk = probe.status === "UNRESOLVED_EVIDENCE" && probe.reason === "INVALID_PAYLOAD";
+  } catch {
+    probeOk = false;
+  }
+  if (!probeOk) return invalid("POOL_CONTEXT_INVALID");
+  const secrets = readStringArray(r.secrets);
+  if (secrets === null || secretsProblem(secrets) !== null) return invalid("SECRETS_INVALID");
+  const max = r.maxResponseBytes;
+  if (
+    typeof max !== "number" ||
+    !Number.isSafeInteger(max) ||
+    max < 1 ||
+    max > CPMM_MAX_ANALYSIS_RESPONSE_BYTES
+  ) {
+    return invalid("MAX_RESPONSE_BYTES_INVALID");
+  }
+  const copy = boundedBytesCopy(r.responseBytes, max);
+  if (typeof copy === "string") return invalid(copy);
+  // The same retention and classification as `resolve()` step 10, on a COMPLETE body.
+  const outcome = retainResponseBody("COMPLETE", copy, copy.length, credentialNeedles(secrets));
+  const c = classifyRetainedResponse(outcome.body, outcome.parsed, n, id, pool);
+  const events = c.kind === "RESOLVED_SWAPS" ? [...(c.events ?? [])] : [];
+  return deepFreeze({
+    status: "ANALYZED" as const,
+    scope: ANALYSIS_SCOPE,
+    notProven: CPMM_RESPONSE_ANALYSIS_NOT_PROVEN,
+    kind: c.kind,
+    code: c.code ?? null,
+    detail: c.detail ?? null,
+    rpcErrorCode: c.rpcErrorCode ?? null,
+    decoder: c.decoder ?? null,
+    events,
+    replay: c.replay ?? "NOT_DECODED",
+    body: {
+      state: outcome.body.state as "STORED" | "WITHHELD",
+      retainedBytes: copy.length,
+      sha256: outcome.body.sha256 as string,
+      withheldReason: outcome.body.withheldReason,
+    },
+  });
 }
 
 // ---------------------------------------------------------------------------------------------
