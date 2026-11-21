@@ -1461,30 +1461,36 @@ function safeDataRecord(v: unknown): Record<string, unknown> | null {
   }
 }
 
-/** The pool fields the accepted decoder reads (`validatePool`), and its verification flags. */
-const POOL_CONSUMED_KEYS = [
-  "ok",
-  "poolAddress",
-  "candidateMint",
-  "wsolMint",
-  "orientation",
-  "baseDecimals",
-  "quoteDecimals",
-  "baseVaultAddress",
-  "quoteVaultAddress",
+/**
+ * The pool fields the accepted decoder reads (`validatePool`) and its verification flags, each
+ * with the primitive type it must hold. Values are checked with `typeof` only (no code runs).
+ */
+const POOL_CONSUMED_FIELDS = [
+  ["ok", "boolean"],
+  ["poolAddress", "string"],
+  ["candidateMint", "string"],
+  ["wsolMint", "string"],
+  ["orientation", "string"],
+  ["baseDecimals", "number"],
+  ["quoteDecimals", "number"],
+  ["baseVaultAddress", "string"],
+  ["quoteVaultAddress", "string"],
 ] as const;
-const VERIFICATION_CONSUMED_KEYS = [
-  "ownerVerified",
-  "vaultAuthoritiesVerified",
-  "tokenProgramsVerified",
-  "authBumpVerified",
+const VERIFICATION_CONSUMED_FIELDS = [
+  ["ownerVerified", "boolean"],
+  ["vaultAuthoritiesVerified", "boolean"],
+  ["tokenProgramsVerified", "boolean"],
+  ["authBumpVerified", "boolean"],
 ] as const;
 
 /**
  * A stable snapshot of the pool context for the decoder: the pool and its `verification` object
- * must be plain, non-proxy records of own data properties (any accessor or symbol key refuses);
- * only the fields the decoder consumes are copied. The caller's objects are neither read through
- * getters nor mutated or frozen.
+ * must be plain, non-proxy records of own data properties (any accessor or symbol key refuses),
+ * and every consumed field must already hold its primitive type, checked with `typeof` before
+ * anything is copied or frozen. Objects, arrays, functions and proxies (revoked or not) at those
+ * fields are refused without running their code. Only the two newly allocated containers, holding
+ * validated primitives, are frozen; the caller's objects are never read through getters, mutated
+ * or frozen.
  */
 function snapshotPoolContext(v: unknown): RaydiumCpmmPoolStateSuccess | null {
   const pool = safeDataRecord(v);
@@ -1492,11 +1498,19 @@ function snapshotPoolContext(v: unknown): RaydiumCpmmPoolStateSuccess | null {
   const verification = safeDataRecord(pool.verification);
   if (verification === null) return null;
   const snapshot: Record<string, unknown> = {};
-  for (const k of POOL_CONSUMED_KEYS) snapshot[k] = pool[k];
+  for (const [k, type] of POOL_CONSUMED_FIELDS) {
+    const value = pool[k];
+    if (typeof value !== type) return null;
+    snapshot[k] = value;
+  }
   const flags: Record<string, unknown> = {};
-  for (const k of VERIFICATION_CONSUMED_KEYS) flags[k] = verification[k];
-  snapshot.verification = flags;
-  return deepFreeze(snapshot) as unknown as RaydiumCpmmPoolStateSuccess;
+  for (const [k, type] of VERIFICATION_CONSUMED_FIELDS) {
+    const value = verification[k];
+    if (typeof value !== type) return null;
+    flags[k] = value;
+  }
+  snapshot.verification = Object.freeze(flags);
+  return Object.freeze(snapshot) as unknown as RaydiumCpmmPoolStateSuccess;
 }
 
 /**

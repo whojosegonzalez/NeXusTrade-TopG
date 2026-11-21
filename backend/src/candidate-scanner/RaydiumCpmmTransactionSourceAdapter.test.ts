@@ -2197,6 +2197,118 @@ describe("Raydium CPMM transaction source adapter (synthetic, offline)", () => {
     const ok = analyzeCpmmTransactionResponse(base);
     expect(ok.status === "ANALYZED" && ok.kind).toBe("RESOLVED_SWAPS");
   });
+
+  it("T-27 (G2 review 2): every consumed pool field must hold its primitive type before anything is frozen", () => {
+    let runs = 0;
+    let traps = 0;
+    const MARKER = "SYNTHETIC_MARKER_ERROR";
+    const withGetter = () => {
+      const o: Record<string, unknown> = { a: 1 };
+      Object.defineProperty(o, "g", { get: () => (runs++, true), enumerable: true });
+      return o;
+    };
+    const withThrowingGetter = () => {
+      const o: Record<string, unknown> = {};
+      Object.defineProperty(o, "boom", {
+        get: () => {
+          runs++;
+          throw new Error(MARKER);
+        },
+        enumerable: true,
+      });
+      return o;
+    };
+    const countingProxy = () =>
+      new Proxy(
+        { a: 1 },
+        {
+          get: (o, k, r) => (traps++, Reflect.get(o, k, r)),
+          ownKeys: (o) => (traps++, Reflect.ownKeys(o)),
+          getOwnPropertyDescriptor: (o, k) => (traps++, Reflect.getOwnPropertyDescriptor(o, k)),
+          getPrototypeOf: (o) => (traps++, Reflect.getPrototypeOf(o)),
+          isExtensible: (o) => (traps++, Reflect.isExtensible(o)),
+          preventExtensions: (o) => (traps++, Reflect.preventExtensions(o)),
+          defineProperty: (o, k, d) => (traps++, Reflect.defineProperty(o, k, d)),
+        },
+      );
+    const revoked = () => {
+      const r = Proxy.revocable({ a: 1 }, {});
+      r.revoke();
+      return r.proxy;
+    };
+    /** Wrong-type values for one field; `primitive` is a wrong primitive for that field. */
+    const wrongValues = (primitive: unknown): [string, () => unknown, boolean][] => [
+      ["object", () => ({ nested: 1 }), true],
+      ["object with getter", withGetter, true],
+      ["object with throwing getter", withThrowingGetter, true],
+      ["array", () => [1, 2], true],
+      ["function", () => () => 1, true],
+      ["counting proxy", countingProxy, false],
+      ["revoked proxy", revoked, false],
+      ["wrong primitive", () => primitive, false],
+      ["null", () => null, false],
+      ["undefined", () => undefined, false],
+    ];
+    const poolFields: [string, unknown][] = [
+      ["ok", "true"],
+      ["poolAddress", 1],
+      ["candidateMint", 1],
+      ["wsolMint", 1],
+      ["orientation", 1],
+      ["baseDecimals", "6"],
+      ["quoteDecimals", 9n],
+      ["baseVaultAddress", 1],
+      ["quoteVaultAddress", 1],
+    ];
+    const flagFields: [string, unknown][] = [
+      ["ownerVerified", 1],
+      ["vaultAuthoritiesVerified", "true"],
+      ["tokenProgramsVerified", 1],
+      ["authBumpVerified", 1],
+    ];
+    let checked = 0;
+    for (const [where, fields] of [
+      ["pool", poolFields],
+      ["verification", flagFields],
+    ] as const) {
+      for (const [field, primitive] of fields) {
+        for (const [label, make, checkFrozen] of wrongValues(primitive)) {
+          const value = make();
+          const pool = structuredCloneable(POOL) as unknown as Record<string, unknown>;
+          const target = where === "pool" ? pool : (pool.verification as Record<string, unknown>);
+          target[field] = value;
+          let r: unknown;
+          let thrown: unknown = null;
+          try {
+            r = analyzeCpmmTransactionResponse({ ...swapCase(), pool });
+          } catch (e) {
+            thrown = e;
+          }
+          const name = `${where}.${field} = ${label}`;
+          expect(thrown, name).toBeNull();
+          expect(r, name).toEqual({
+            status: "INPUT_INVALID",
+            code: "POOL_CONTEXT_INVALID",
+            scope: "RESPONSE_VALIDATION_AND_DECODING_ONLY",
+          });
+          if (checkFrozen) expect(Object.isFrozen(value), name).toBe(false);
+          expect(Object.isFrozen(pool), name).toBe(false);
+          expect(Object.isFrozen(pool.verification), name).toBe(false);
+          checked++;
+        }
+      }
+    }
+    expect(checked).toBe((poolFields.length + flagFields.length) * 10);
+    expect(runs).toBe(0);
+    expect(traps).toBe(0);
+    // The ordinary context still analyses, and nothing of the caller's is frozen.
+    const callerPool = structuredCloneable(POOL);
+    const ordinary = analyzeCpmmTransactionResponse({ ...swapCase(), pool: callerPool });
+    expect(ordinary.status === "ANALYZED" && ordinary.kind).toBe("RESOLVED_SWAPS");
+    expect(Object.isFrozen(callerPool)).toBe(false);
+    expect(Object.isFrozen(callerPool.verification)).toBe(false);
+    expect(Object.isFrozen(callerPool.verification.slotProvenance)).toBe(false);
+  });
 });
 
 /** A structural copy of a pool context (bigints kept) whose nested objects are fresh. */
