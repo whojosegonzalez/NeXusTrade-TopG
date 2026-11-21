@@ -26,6 +26,8 @@ import {
   CPMM_EXCHANGE_ENDPOINT_LABEL,
   type CpmmObservationSnapshot,
 } from "../candidate-scanner/CpmmPoolObservationRecorder.js";
+import { CpmmPoolNotificationCollector } from "../candidate-scanner/CpmmPoolNotificationCollector.js";
+import { adaptRaydiumCpmmPoolState } from "../candidate-scanner/RaydiumCpmmPoolStateAdapter.js";
 import { CPMM_TX_PURPOSE } from "../candidate-scanner/RaydiumCpmmTransactionSourceAdapter.js";
 import {
   EVIDENCE_SANITIZER_LIMITS,
@@ -1128,11 +1130,61 @@ export interface CpmmEvidenceVerification {
     readonly status: "COMPLETE" | "INCOMPLETE" | "NOT_EVALUATED";
     readonly reasons: readonly string[];
   };
-  /** Item G is not implemented: never a success. */
-  readonly rederivation: { readonly status: "NOT_IMPLEMENTED" | "NOT_ATTEMPTED" };
+  /**
+   * Item G, computed now by verification (never read from the sealed report): only pool context
+   * and collector replay are implemented; the rest is reported as not implemented. Not attempted
+   * when integrity failed.
+   */
+  readonly rederivation: CpmmRederivation;
+  /** What the sealed report itself claims, kept apart from the results computed above. */
+  readonly sealedClaims: {
+    readonly rederivation: unknown;
+    readonly poolContextProvenance: unknown;
+    readonly acquisitionProvenance: unknown;
+    readonly runOutcome: unknown;
+  } | null;
+  /** Always supplied, even when re-derivation matches (gap G3). */
   readonly poolContextProvenance: "SUPPLIED_UNVERIFIED" | null;
   readonly acquisitionProvenance: "OPEN_G3";
   readonly flags: typeof CPMM_EVIDENCE_FALSE_FLAGS;
+}
+
+export type CpmmRederivationStatus =
+  | "REPRODUCED"
+  | "MISMATCH"
+  | "MISSING_EVIDENCE"
+  | "LIMITED_BY_REDACTION";
+
+export interface CpmmComponentRederivation {
+  readonly status: CpmmRederivationStatus;
+  /** `<STATUS>:<CODE>` findings, fixed codes only. */
+  readonly findings: readonly string[];
+}
+
+export interface CpmmCollectorRederivation extends CpmmComponentRederivation {
+  /** Owner-received messages the collector saw (by the collector's own frame count). */
+  readonly handedOverMessages: number;
+  /** Frames fed to a fresh collector with their recorded bytes and receipt times. */
+  readonly replayedFrames: number;
+  /** Frames associated by order, length and digest only (not replayed). */
+  readonly structurallyCheckedFrames: number;
+  /** False whenever replay stopped early: those reports were then not compared. */
+  readonly epochReportCompared: boolean;
+  readonly countersCompared: boolean;
+}
+
+export interface CpmmRederivation {
+  readonly status: "PARTIAL" | "NOT_ATTEMPTED";
+  /** The worst result among the implemented components only; never a whole-run claim. */
+  readonly implementedComponents: CpmmRederivationStatus | null;
+  readonly components: {
+    readonly poolContext: CpmmComponentRederivation;
+    readonly collector: CpmmCollectorRederivation;
+    readonly transactionAnalysis: { readonly status: "NOT_IMPLEMENTED" };
+    readonly ledger: { readonly status: "NOT_IMPLEMENTED" };
+    readonly ownerWrapperCrossChecks: { readonly status: "NOT_IMPLEMENTED" };
+    readonly runtimeAccounting: { readonly status: "RUNTIME_ACCOUNTING_NOT_REPRODUCED" };
+  } | null;
 }
 
 const VL = CPMM_EVIDENCE_VERIFIER_LIMITS;
@@ -1700,21 +1752,16 @@ export function verifyCpmmObservationEvidence(outDir: string): CpmmEvidenceVerif
   const result = (
     retention: CpmmEvidenceVerification["retention"],
     poolContextProvenance: "SUPPLIED_UNVERIFIED" | null,
+    rederivation: CpmmRederivation = NOT_ATTEMPTED,
+    sealedClaims: CpmmEvidenceVerification["sealedClaims"] = null,
   ): CpmmEvidenceVerification =>
-    Object.freeze({
+    deepFreezeOwn({
       outDir,
       manifestSha256,
-      integrity: Object.freeze({
-        ok: problems.length === 0,
-        problems: Object.freeze([...problems]),
-      }),
-      retention: Object.freeze({
-        status: retention.status,
-        reasons: Object.freeze([...retention.reasons]),
-      }),
-      rederivation: Object.freeze({
-        status: problems.length === 0 ? ("NOT_IMPLEMENTED" as const) : ("NOT_ATTEMPTED" as const),
-      }),
+      integrity: { ok: problems.length === 0, problems: [...problems] },
+      retention: { status: retention.status, reasons: [...retention.reasons] },
+      rederivation,
+      sealedClaims,
       poolContextProvenance,
       acquisitionProvenance: "OPEN_G3" as const,
       flags: CPMM_EVIDENCE_FALSE_FLAGS,
@@ -1855,9 +1902,19 @@ export function verifyCpmmObservationEvidence(outDir: string): CpmmEvidenceVerif
   } catch {
     reasons = ["RETENTION_UNDETERMINABLE"];
   }
+  // 6. Re-derivation (item G, partial), only now that integrity holds, over the same parsed and
+  //    bounded documents; nothing is read again.
+  const report = docs.get(CPMM_EVIDENCE_FILES.report)!;
   return result(
     { status: reasons.length === 0 ? "COMPLETE" : "INCOMPLETE", reasons },
     "SUPPLIED_UNVERIFIED",
+    rederive(docs),
+    {
+      rederivation: copyJson(report.rederivation),
+      poolContextProvenance: report.poolContextProvenance,
+      acquisitionProvenance: report.acquisitionProvenance,
+      runOutcome: copyJson(report.runOutcome),
+    },
   );
 }
 
@@ -2163,4 +2220,427 @@ function deriveRetention(docs: Map<string, Record<string, unknown>>): string[] {
     }
   }
   return [...reasons].sort();
+}
+
+// ---------------------------------------------------------------------------------------------
+// Re-derivation (item G, partial): pool context and collector replay
+// ---------------------------------------------------------------------------------------------
+
+const NOT_ATTEMPTED: CpmmRederivation = Object.freeze({
+  status: "NOT_ATTEMPTED" as const,
+  implementedComponents: null,
+  components: null,
+});
+
+/** Best to worst; a component's result is its worst finding. */
+const STATUS_RANK: Readonly<Record<CpmmRederivationStatus, number>> = {
+  REPRODUCED: 0,
+  LIMITED_BY_REDACTION: 1,
+  MISSING_EVIDENCE: 2,
+  MISMATCH: 3,
+};
+const worstOf = (a: CpmmRederivationStatus, b: CpmmRederivationStatus): CpmmRederivationStatus =>
+  STATUS_RANK[a] >= STATUS_RANK[b] ? a : b;
+
+class Findings {
+  public status: CpmmRederivationStatus = "REPRODUCED";
+  public readonly list: string[] = [];
+  public add(status: Exclude<CpmmRederivationStatus, "REPRODUCED">, code: string): void {
+    const finding = `${status}:${code}`;
+    if (!this.list.includes(finding)) this.list.push(finding);
+    this.status = worstOf(this.status, status);
+  }
+}
+
+function deepFreezeOwn<T>(v: T): T {
+  if (typeof v === "object" && v !== null && !Object.isFrozen(v)) {
+    Object.freeze(v);
+    for (const k of Object.keys(v)) deepFreezeOwn((v as Record<string, unknown>)[k]);
+  }
+  return v;
+}
+
+/** A JSON copy (what the sealed files hold): `undefined` properties disappear. */
+const copyJson = (v: unknown): unknown => (v === undefined ? null : JSON.parse(JSON.stringify(v)));
+
+/** Canonical JSON with sorted keys, for comparisons. */
+function canonical(v: unknown): string {
+  if (Array.isArray(v)) return `[${v.map(canonical).join(",")}]`;
+  if (isRec(v)) {
+    return `{${Object.keys(v)
+      .filter((k) => v[k] !== undefined)
+      .sort()
+      .map((k) => `${JSON.stringify(k)}:${canonical(v[k])}`)
+      .join(",")}}`;
+  }
+  return JSON.stringify(v) ?? "null";
+}
+
+/**
+ * The exact original bytes of a sealed payload. A redacted payload's stored bytes are not the
+ * original (`REDACTED`); a withheld or omitted payload has none (`UNAVAILABLE`).
+ */
+function exactBytes(p: unknown): { bytes: Buffer } | { missing: "REDACTED" | "UNAVAILABLE" } {
+  if (!isRec(p) || p.payloadOmitted !== null || p.withheldReason !== null) {
+    return { missing: "UNAVAILABLE" };
+  }
+  if (p.payloadRedacted !== false) return { missing: "REDACTED" };
+  if (typeof p.stored !== "string") return { missing: "UNAVAILABLE" };
+  const b = p.storedEncoding === "base64" ? strictBase64(p.stored) : Buffer.from(p.stored, "utf8");
+  return b === null ? { missing: "UNAVAILABLE" } : { bytes: b };
+}
+
+const sameBinding = (a: unknown, b: unknown): boolean =>
+  typeof get(a, "poolAddress") === "string" &&
+  get(a, "poolAddress") === get(b, "poolAddress") &&
+  get(a, "candidateMint") === get(b, "candidateMint");
+
+/**
+ * Pool context: the accepted adapter over the stored raw accounts and their recorded identities,
+ * owners and slots, compared canonically (bigints tagged as sealed) with the recorded adapted pool
+ * and with every recorded binding. Provenance stays SUPPLIED_UNVERIFIED whatever the result.
+ */
+function rederivePoolContext(
+  docs: Map<string, Record<string, unknown>>,
+): CpmmComponentRederivation {
+  const f = new Findings();
+  const ctx = docs.get(CPMM_EVIDENCE_FILES.poolContext)!;
+  const binding = get(docs.get(CPMM_EVIDENCE_FILES.plan), "plan", "binding");
+  const target = get(ctx, "target");
+  const recorded = get(ctx, "adaptedPool");
+  if (!sameBinding(target, binding)) f.add("MISMATCH", "TARGET_BINDING");
+  if (!sameBinding(recorded, binding)) f.add("MISMATCH", "ADAPTED_POOL_BINDING");
+  const collector = docs.get(CPMM_EVIDENCE_FILES.collector);
+  if (get(collector, "epochReport", "status") === "READ") {
+    const epochBinding = get(collector, "epochReport", "value", "binding");
+    if (
+      epochBinding !== null &&
+      epochBinding !== undefined &&
+      !sameBinding(epochBinding, binding)
+    ) {
+      f.add("MISMATCH", "COLLECTOR_BINDING");
+    }
+  }
+  const accounts: Record<string, unknown> = {};
+  for (const [name, key] of [
+    ["pool", "poolAccount"],
+    ["vault0", "vault0Account"],
+    ["vault1", "vault1Account"],
+  ] as const) {
+    const a = get(ctx, "accounts", name);
+    const b = exactBytes(get(a, "data"));
+    if ("missing" in b) {
+      // Only these bytes can limit the adapter's result, so the limitation is attributed here.
+      f.add(
+        b.missing === "REDACTED" ? "LIMITED_BY_REDACTION" : "MISSING_EVIDENCE",
+        `ACCOUNT_DATA_${b.missing}:${name}`,
+      );
+      continue;
+    }
+    accounts[key] = {
+      address: get(a, "address"),
+      data: b.bytes,
+      ownerProgramId: get(a, "ownerProgramId"),
+      slot: get(a, "slot"),
+    };
+  }
+  if (Object.keys(accounts).length === 3) {
+    const r = adaptRaydiumCpmmPoolState({
+      target: {
+        poolAddress: get(target, "poolAddress"),
+        candidateMint: get(target, "candidateMint"),
+      },
+      ...accounts,
+    } as never) as unknown;
+    if (!isRec(r) || r.ok !== true) f.add("MISMATCH", "ADAPTER_REFUSED");
+    else {
+      const derived = copyPlain(r, { nodes: SEAL_LIMITS.maxInputNodes }, 0);
+      if (canonical(derived) !== canonical(recorded)) f.add("MISMATCH", "ADAPTED_POOL");
+    }
+  }
+  return { status: f.status, findings: f.list };
+}
+
+/** Collector refusals decided before the receipt is read or the bytes hashed (item G). */
+const UNHASHED_REFUSALS: ReadonlySet<unknown> = new Set([
+  "FRAME_INVALID",
+  "EPOCH_NOT_OPEN",
+  "STALE_EPOCH",
+  "EPOCH_LIMIT_EXCEEDED",
+  "OVERSIZE_FRAME",
+  "RECEIPT_INVALID",
+]);
+
+/**
+ * Collector replay through a fresh accepted collector, in the run's recorded order:
+ * - owner-received messages (owner deliveries > 0) before the start call are before-start; the
+ *   next `counters.frames` were handed over and match the frame records by order, with length and
+ *   (where both exist) digest checked on original bytes; the rest came after intake or settlement.
+ *   The owner's own counts cross-check this split. Wrapper-only messages are never considered.
+ * - the epoch opens with its recorded start and request id, and its subscribe bytes must equal the
+ *   first send's original digest; the unsubscribe frame is built where the owner built it (just
+ *   before the second send, so before any later handed-over message) and must equal that send's
+ *   original digest; the recorded close applies after the last handed-over frame.
+ * - a frame is replayed only with its exact original bytes and the collector's own recorded
+ *   receipt time. Replay stops at the first frame it cannot reproduce: an unhashed refusal (no
+ *   receipt time; it must be the run's last handed-over frame and is checked structurally),
+ *   redacted bytes, missing bytes or a dropped frame record. Later frames are associated
+ *   structurally only, and the epoch report and counters are then not compared.
+ */
+function replayCollector(docs: Map<string, Record<string, unknown>>): CpmmCollectorRederivation {
+  const f = new Findings();
+  const out = {
+    handedOverMessages: 0,
+    replayedFrames: 0,
+    structurallyCheckedFrames: 0,
+    epochReportCompared: false,
+    countersCompared: false,
+  };
+  const done = (): CpmmCollectorRederivation => ({ status: f.status, findings: f.list, ...out });
+  const col = docs.get(CPMM_EVIDENCE_FILES.collector)!;
+  const plan = get(docs.get(CPMM_EVIDENCE_FILES.plan), "plan");
+  const readSection = (k: string) =>
+    get(col, k, "status") === "READ" ? get(col, k, "value") : undefined;
+  const epochReport = readSection("epochReport");
+  const frames = readSection("frameRecords");
+  const notes = readSection("notifications");
+  const counters = readSection("counters");
+  if (!isRec(epochReport) || !Array.isArray(frames) || !Array.isArray(notes) || !isRec(counters)) {
+    f.add("MISSING_EVIDENCE", "COLLECTOR_COMPONENT_UNAVAILABLE");
+    return done();
+  }
+  const recording = docs.get(CPMM_EVIDENCE_FILES.recording)!;
+  if (recording.transportRecorded !== true) {
+    f.add("MISSING_EVIDENCE", "TRANSPORT_NOT_RECORDED");
+    return done();
+  }
+  for (const c of ["incoming", "outgoing", "lifecycle"]) {
+    if (get(recording, "retention", c, "dropped") !== 0) {
+      f.add("MISSING_EVIDENCE", `TRANSPORT_RECORDS_DROPPED:${c}`);
+    }
+  }
+  if (f.list.length > 0) return done();
+
+  // The owner-received messages, split as the owner split them.
+  const records = get(docs.get(CPMM_EVIDENCE_FILES.transportRecords), "records") as Record<
+    string,
+    unknown
+  >[];
+  const start = records.find((r) => r.kind === "CALL" && r.method === "start");
+  const owned = records.filter(
+    (r) =>
+      r.kind === "EVENT" &&
+      r.event === "message" &&
+      isInt(r.ownerDeliveries) &&
+      r.ownerDeliveries > 0,
+  );
+  const beforeStart = owned.filter(
+    (r) => start === undefined || (r.ordinal as number) < (start.ordinal as number),
+  ).length;
+  const afterStart = owned.slice(beforeStart);
+  const handed = counters.frames as number;
+  out.handedOverMessages = handed;
+  const ownerDoc = docs.get(CPMM_EVIDENCE_FILES.ownerReport);
+  const report =
+    get(ownerDoc, "report", "status") === "READ" ? get(ownerDoc, "report", "value") : undefined;
+  const late =
+    get(ownerDoc, "lateEvents", "status") === "READ"
+      ? get(ownerDoc, "lateEvents", "value", "message")
+      : undefined;
+  if (report === undefined || !isInt(late)) {
+    f.add("MISSING_EVIDENCE", "OWNER_COUNTS_UNAVAILABLE");
+  } else {
+    if (get(report, "incoming", "messagesBeforeStart") !== beforeStart) {
+      f.add("MISMATCH", "BEFORE_START_COUNT");
+    }
+    if (get(report, "incoming", "passedToCollector") !== handed)
+      f.add("MISMATCH", "HANDED_OVER_COUNT");
+    if (get(report, "intake", "framesAfterIntake") !== afterStart.length - handed - late) {
+      f.add("MISMATCH", "AFTER_INTAKE_COUNT");
+    }
+    if (get(report, "incoming", "messageEvents") !== owned.length - late) {
+      f.add("MISMATCH", "OWNER_MESSAGE_COUNT");
+    }
+  }
+  if (afterStart.length < handed) {
+    f.add("MISMATCH", "FEWER_MESSAGES_THAN_FRAMES");
+    return done();
+  }
+  const handedOver = afterStart.slice(0, handed);
+
+  // A fresh accepted collector with the recorded configuration and epoch.
+  const epoch = get(plan, "epoch") as number;
+  let c: CpmmPoolNotificationCollector;
+  try {
+    c = new CpmmPoolNotificationCollector({
+      binding: copyJson(get(plan, "binding")) as never,
+      limits: copyJson(get(plan, "limits", "collector")) as never,
+      commitment: "confirmed",
+    });
+  } catch {
+    f.add("MISMATCH", "COLLECTOR_REFUSED_RECORDED_CONFIGURATION");
+    return done();
+  }
+  if (canonical(epochReport.binding) !== canonical(get(plan, "binding"))) {
+    f.add("MISMATCH", "EPOCH_BINDING");
+  }
+  if (
+    epochReport.epoch !== epoch ||
+    epochReport.subscribeRequestId !== get(plan, "subscribeRequestId")
+  ) {
+    f.add("MISMATCH", "EPOCH_IDENTITY");
+  }
+  const opened = c.openEpoch({
+    epoch,
+    observationStartMs: epochReport.observationStartMs as number,
+    subscribeRequestId: get(plan, "subscribeRequestId") as number,
+  });
+  if (opened.status !== "OPENED") {
+    f.add("MISMATCH", "EPOCH_OPEN_REFUSED");
+    return done();
+  }
+  const sends = records.filter((r) => r.kind === "CALL" && r.method === "send");
+  /** Generated bytes against what was sent, by the original digest (redaction-independent). */
+  const sameAsSent = (bytes: Uint8Array, sent: unknown, code: string): void => {
+    const p = get(sent, "payload");
+    const digest = get(p, "originalSha256");
+    if (typeof digest !== "string") f.add("MISSING_EVIDENCE", `${code}_UNVERIFIABLE`);
+    else if (get(p, "originalBytes") !== bytes.length || sha256(bytes) !== digest) {
+      f.add("MISMATCH", code);
+    }
+  };
+  if (sends[0] !== undefined) sameAsSent(opened.subscribeFrame, sends[0], "SUBSCRIBE_FRAME");
+  const unsubscribeSend = sends[1];
+  let unsubscribeBuilt = false;
+  const buildUnsubscribe = (): void => {
+    unsubscribeBuilt = true;
+    const b = c.unsubscribeFrame(epoch, get(plan, "unsubscribeRequestId") as number);
+    if (b === null) f.add("MISMATCH", "UNSUBSCRIBE_NOT_BUILDABLE");
+    else sameAsSent(b, unsubscribeSend, "UNSUBSCRIBE_FRAME");
+  };
+
+  let stopped = false;
+  handedOver.forEach((msg, i) => {
+    if (
+      !stopped &&
+      !unsubscribeBuilt &&
+      unsubscribeSend !== undefined &&
+      (unsubscribeSend.ordinal as number) < (msg.ordinal as number)
+    ) {
+      buildUnsubscribe();
+    }
+    const fr = frames[i] as unknown;
+    if (!isRec(fr)) {
+      if (!stopped) f.add("MISSING_EVIDENCE", "FRAME_RECORDS_DROPPED");
+      stopped = true;
+      return;
+    }
+    // Association by order, original length and (where both exist) original digest.
+    const p = msg.payload;
+    if (fr.sequence !== i + 1 || fr.epoch !== epoch) f.add("MISMATCH", "FRAME_ORDER");
+    if (isInt(get(p, "originalBytes")) && fr.byteLength !== get(p, "originalBytes")) {
+      f.add("MISMATCH", "FRAME_ASSOCIATION");
+    }
+    const digest = get(p, "originalSha256");
+    if (fr.sha256 !== null && typeof digest === "string" && fr.sha256 !== digest) {
+      f.add("MISMATCH", "FRAME_ASSOCIATION");
+    }
+    if (stopped) {
+      out.structurallyCheckedFrames++;
+      return;
+    }
+    if (fr.receivedAtMs === null) {
+      // No receipt time was recorded, so the frame is never replayed (none is invented).
+      out.structurallyCheckedFrames++;
+      stopped = true;
+      if (fr.sha256 !== null || !UNHASHED_REFUSALS.has(fr.disposition)) {
+        f.add("MISMATCH", "UNHASHED_REFUSAL_SHAPE");
+      }
+      if (i !== handedOver.length - 1) f.add("MISMATCH", "UNHASHED_REFUSAL_NOT_TERMINAL");
+      f.add("MISSING_EVIDENCE", "UNHASHED_TERMINAL_REFUSAL_NOT_REPLAYED");
+      return;
+    }
+    const b = exactBytes(p);
+    if ("missing" in b) {
+      out.structurallyCheckedFrames++;
+      stopped = true;
+      f.add(
+        b.missing === "REDACTED" ? "LIMITED_BY_REDACTION" : "MISSING_EVIDENCE",
+        `FRAME_PAYLOAD_${b.missing}`,
+      );
+      return;
+    }
+    c.acceptFrame({ epoch, bytes: b.bytes, receivedAtMs: fr.receivedAtMs as number });
+    out.replayedFrames++;
+  });
+
+  const compare = (replayed: unknown, recorded: unknown, code: string): void => {
+    if (canonical(copyJson(replayed)) !== canonical(recorded)) f.add("MISMATCH", code);
+  };
+  if (stopped) {
+    // Only what was replayed is compared: the frame and notification prefixes it produced.
+    const rf = c.frameRecords();
+    const rn = c.notifications();
+    compare(rf, frames.slice(0, rf.length), "FRAME_RECORDS");
+    compare(rn, notes.slice(0, rn.length), "NOTIFICATIONS");
+    return done();
+  }
+  if (unsubscribeSend !== undefined && !unsubscribeBuilt) buildUnsubscribe();
+  if (epochReport.state === "CLOSED") {
+    if (typeof epochReport.closeReason !== "string" || !isInt(epochReport.closedAtMs)) {
+      f.add("MISSING_EVIDENCE", "CLOSE_UNRECORDED");
+    } else if (!c.closeEpoch(epoch, epochReport.closeReason as never, epochReport.closedAtMs)) {
+      f.add("MISMATCH", "CLOSE_REFUSED");
+    }
+  }
+  compare(c.frameRecords(), frames, "FRAME_RECORDS");
+  compare(c.notifications(), notes, "NOTIFICATIONS");
+  compare(c.epochReport(epoch), epochReport, "EPOCH_REPORT");
+  compare(c.counters(), counters, "COUNTERS");
+  out.epochReportCompared = true;
+  out.countersCompared = true;
+  return done();
+}
+
+/** Each implemented component in its own guard: an internal failure is never a success. */
+function rederive(docs: Map<string, Record<string, unknown>>): CpmmRederivation {
+  const failed = (): Findings => {
+    const f = new Findings();
+    f.add("MISMATCH", "REDERIVATION_FAILED");
+    return f;
+  };
+  let poolContext: CpmmComponentRederivation;
+  try {
+    poolContext = rederivePoolContext(docs);
+  } catch {
+    const f = failed();
+    poolContext = { status: f.status, findings: f.list };
+  }
+  let collector: CpmmCollectorRederivation;
+  try {
+    collector = replayCollector(docs);
+  } catch {
+    const f = failed();
+    collector = {
+      status: f.status,
+      findings: f.list,
+      handedOverMessages: 0,
+      replayedFrames: 0,
+      structurallyCheckedFrames: 0,
+      epochReportCompared: false,
+      countersCompared: false,
+    };
+  }
+  return {
+    status: "PARTIAL",
+    implementedComponents: worstOf(poolContext.status, collector.status),
+    components: {
+      poolContext,
+      collector,
+      transactionAnalysis: { status: "NOT_IMPLEMENTED" },
+      ledger: { status: "NOT_IMPLEMENTED" },
+      ownerWrapperCrossChecks: { status: "NOT_IMPLEMENTED" },
+      runtimeAccounting: { status: "RUNTIME_ACCOUNTING_NOT_REPRODUCED" },
+    },
+  };
 }

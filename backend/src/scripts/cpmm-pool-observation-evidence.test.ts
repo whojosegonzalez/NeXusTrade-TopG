@@ -190,6 +190,8 @@ const freshRoot = () => {
 type Cb = (err?: unknown) => void;
 interface Script {
   autoPong?: boolean;
+  /** none: close() never closes (the socket stays open until terminated). */
+  closeMode?: "sync" | "none";
 }
 class FakeClient implements CpmmWsClientLike {
   public readonly listeners = new Map<string, ((...a: unknown[]) => void)[]>();
@@ -240,6 +242,7 @@ class FakeClient implements CpmmWsClientLike {
     queueMicrotask(() => cb());
   }
   close(): void {
+    if (this.s.closeMode === "none") return;
     this.#rs = 3;
     this.emit("close", 1000, Buffer.from("bye"));
   }
@@ -469,7 +472,7 @@ const UNSUB_REQ = 8;
 const enc = (v: unknown) => Buffer.from(JSON.stringify(v));
 const ackFrame = () => enc({ jsonrpc: "2.0", id: SUB_REQ, result: SUB });
 const unsubAck = () => enc({ jsonrpc: "2.0", id: UNSUB_REQ, result: true });
-const notif = (n: number) =>
+const notif = (n: number, logs: string[] = ["Program log: swap"]) =>
   enc({
     jsonrpc: "2.0",
     method: "logsNotification",
@@ -477,7 +480,7 @@ const notif = (n: number) =>
       subscription: SUB,
       result: {
         context: { slot: SLOT },
-        value: { signature: signatureOf(n), err: null, logs: ["Program log: swap"] },
+        value: { signature: signatureOf(n), err: null, logs },
       },
     },
   });
@@ -494,6 +497,10 @@ const okTx =
 function env(
   limits: Partial<CpmmObservationRecorderLimits> = {},
   collectorLimits: Partial<CpmmCollectorLimits> = {},
+  transport: {
+    closeMode?: "sync" | "none" | undefined;
+    wrapTransport?: ((t: CpmmOwnerTransport) => CpmmOwnerTransport) | undefined;
+  } = {},
 ) {
   const state = { now: OBS_START };
   let nextTimer = 0;
@@ -559,7 +566,7 @@ function env(
     limits: { ...COLLECTOR_LIMITS, ...collectorLimits },
     commitment: "confirmed",
   });
-  const f = fakeCtor({ autoPong: true });
+  const f = fakeCtor({ autoPong: true, closeMode: transport.closeMode ?? "sync" });
   const wrappers: CpmmPoolWebSocketTransport[] = [];
   const owner = new CpmmPoolConnectionOwner({
     session,
@@ -573,7 +580,7 @@ function env(
         limits: WS_LIMITS,
       });
       wrappers.push(w);
-      return recorder.recordTransport(w);
+      return recorder.recordTransport(transport.wrapTransport ? transport.wrapTransport(w) : w);
     },
     timers,
     epoch: 1,
@@ -628,9 +635,21 @@ async function genuineRun(
     limits?: Partial<CpmmObservationRecorderLimits>;
     collectorLimits?: Partial<CpmmCollectorLimits>;
     responder?: Responder;
+    /** Logs of both notifications (for credential-bearing frames). */
+    logs?: string[];
+    pingPayload?: Buffer;
+    closeMode?: "sync" | "none";
+    /** Delivered right after the unsubscribe acknowledgement (after intake, before cleanup). */
+    afterIntake?: Buffer;
+    wrapTransport?: (t: CpmmOwnerTransport) => CpmmOwnerTransport;
+    /** The unsubscribe acknowledgement never arrives (intake ends at its deadline). */
+    noUnsubscribeAck?: boolean;
   } = {},
 ) {
-  const e = env(o.limits, o.collectorLimits);
+  const e = env(o.limits, o.collectorLimits, {
+    closeMode: o.closeMode,
+    wrapTransport: o.wrapTransport,
+  });
   const p = e.owner.run();
   e.c.open();
   await e.to(OBS_START + 10);
@@ -638,20 +657,37 @@ async function genuineRun(
   await flush();
   await e.to(RECEIVED_AT);
   e.script.push(o.responder ?? okTx(1));
-  e.c.message(notif(1));
+  e.c.message(notif(1, o.logs));
   await flush();
   await e.to(RECEIVED_AT + 3_000);
-  e.c.message(notif(1));
-  e.c.emit("ping", Buffer.from([9, 9]));
+  e.c.message(notif(1, o.logs));
+  e.c.emit("ping", o.pingPayload ?? Buffer.from([9, 9]));
   await flush();
   await e.to(NOMINAL_END);
-  e.c.message(unsubAck());
-  await e.to(NOMINAL_END + 10);
+  if (!o.noUnsubscribeAck) e.c.message(unsubAck());
+  await flush();
+  if (o.afterIntake) e.c.message(o.afterIntake);
+  await e.to(
+    NOMINAL_END +
+      (o.closeMode === "none" ? OWNER_LIMITS.cleanupTimeoutMs : 0) +
+      (o.noUnsubscribeAck ? OWNER_LIMITS.unsubscribeAckTimeoutMs : 0) +
+      10,
+  );
   const report = await p;
-  return { snapshot: e.finish(report), recorder: e.recorder, e, report };
+  return {
+    snapshot: e.finish(report),
+    recorder: e.recorder,
+    e,
+    report,
+    recorderLimits: e.recorderLimits,
+    collectorLimits: { ...COLLECTOR_LIMITS, ...o.collectorLimits },
+  };
 }
 
-function plan(recorderLimits: CpmmObservationRecorderLimits = RLIMITS) {
+function plan(
+  recorderLimits: CpmmObservationRecorderLimits = RLIMITS,
+  collectorLimits: CpmmCollectorLimits = COLLECTOR_LIMITS,
+) {
   return {
     kinds: {
       owner: "CPMM_POOL_CONNECTION_OWNER",
@@ -661,7 +697,7 @@ function plan(recorderLimits: CpmmObservationRecorderLimits = RLIMITS) {
     limits: {
       owner: { ...OWNER_LIMITS },
       wrapper: { ...WS_LIMITS },
-      collector: { ...COLLECTOR_LIMITS },
+      collector: { ...collectorLimits },
       ledger: { ...LEDGER_LIMITS },
       adapter: { ...ADAPTER_LIMITS },
       sessionLanes: JSON.parse(JSON.stringify(LANES)) as unknown,
@@ -691,18 +727,46 @@ function sealInput(
   recorder: CpmmPoolObservationRecorder | null,
   over: Partial<SealCpmmObservationInput> = {},
   recorderLimits: CpmmObservationRecorderLimits = RLIMITS,
+  collectorLimits: CpmmCollectorLimits = COLLECTOR_LIMITS,
 ): SealCpmmObservationInput {
   return {
     projectRoot: freshRoot(),
     runId: "run-1",
     snapshot,
-    plan: plan(recorderLimits),
+    plan: plan(recorderLimits, collectorLimits),
     componentVersions: { ...VERSIONS },
     poolContext: poolContext(),
     credentials: { urls: [...CREDENTIALS.urls], additional: [...CREDENTIALS.additional] },
     lateActivity: recorder === null ? null : { ...recorder.lateActivity() },
     ...over,
   };
+}
+
+const NOT_ATTEMPTED = { status: "NOT_ATTEMPTED", implementedComponents: null, components: null };
+
+/** Pool context and collector reproduced; everything else explicitly not implemented. */
+function expectReproduced(v: ReturnType<typeof verifyCpmmObservationEvidence>): void {
+  expect(v.rederivation).toMatchObject({
+    status: "PARTIAL",
+    implementedComponents: "REPRODUCED",
+    components: {
+      poolContext: { status: "REPRODUCED", findings: [] },
+      collector: {
+        status: "REPRODUCED",
+        findings: [],
+        structurallyCheckedFrames: 0,
+        epochReportCompared: true,
+        countersCompared: true,
+      },
+      transactionAnalysis: { status: "NOT_IMPLEMENTED" },
+      ledger: { status: "NOT_IMPLEMENTED" },
+      ownerWrapperCrossChecks: { status: "NOT_IMPLEMENTED" },
+      runtimeAccounting: { status: "RUNTIME_ACCOUNTING_NOT_REPRODUCED" },
+    },
+  });
+  expect(v.poolContextProvenance).toBe("SUPPLIED_UNVERIFIED");
+  expect(v.acquisitionProvenance).toBe("OPEN_G3");
+  expect(v.flags).toEqual(CPMM_EVIDENCE_FALSE_FLAGS);
 }
 
 const outDirOf = (root: string, runId = "run-1") =>
@@ -835,7 +899,8 @@ describe("CPMM observation evidence: sealing", () => {
     const v = verifyCpmmObservationEvidence(result.outDir);
     expect(v.integrity).toEqual({ ok: true, problems: [] });
     expect(v.retention).toEqual({ status: "COMPLETE", reasons: [] });
-    expect(v.rederivation).toEqual({ status: "NOT_IMPLEMENTED" });
+    expectReproduced(v);
+    expect(v.sealedClaims).toMatchObject({ rederivation: { status: "NOT_IMPLEMENTED" } });
     expect(v.poolContextProvenance).toBe("SUPPLIED_UNVERIFIED");
     expect(v.acquisitionProvenance).toBe("OPEN_G3");
     expect(v.flags).toEqual(CPMM_EVIDENCE_FALSE_FLAGS);
@@ -1141,7 +1206,7 @@ describe("CPMM observation evidence: verification", () => {
     const va = verifyCpmmObservationEvidence(a);
     expect(va.integrity.problems).toEqual(["HASH_MISMATCH:collector.json"]);
     expect(va.retention).toEqual({ status: "NOT_EVALUATED", reasons: [] });
-    expect(va.rederivation).toEqual({ status: "NOT_ATTEMPTED" });
+    expect(va.rederivation).toEqual(NOT_ATTEMPTED);
     expect(va.flags).toEqual(CPMM_EVIDENCE_FALSE_FLAGS);
 
     const b = copyOf(dir);
@@ -1488,6 +1553,8 @@ describe("CPMM observation evidence: verification", () => {
       "node:path",
       "node:util",
       "../candidate-scanner/CpmmPoolObservationRecorder.js",
+      "../candidate-scanner/CpmmPoolNotificationCollector.js",
+      "../candidate-scanner/RaydiumCpmmPoolStateAdapter.js",
       "../candidate-scanner/RaydiumCpmmTransactionSourceAdapter.js",
       "./evidence-credential-sanitizer.js",
     ]);
@@ -1535,7 +1602,7 @@ describe("Structural and retention boundaries (review of 84546f3)", () => {
     expect(v.integrity.ok, expected).toBe(false);
     expect(v.integrity.problems, expected).toContain(expected);
     expect(v.retention, expected).toEqual({ status: "NOT_EVALUATED", reasons: [] });
-    expect(v.rederivation, expected).toEqual({ status: "NOT_ATTEMPTED" });
+    expect(v.rederivation, expected).toEqual(NOT_ATTEMPTED);
   };
 
   it("N1: faithfully recorded partial and unread response bodies pass integrity, and retention says what is missing", async () => {
@@ -1571,7 +1638,7 @@ describe("Structural and retention boundaries (review of 84546f3)", () => {
       expect(v.integrity).toEqual({ ok: true, problems: [] });
       expect(v.retention.status).toBe("INCOMPLETE");
       expect(v.retention.reasons).toContain(reason);
-      expect(v.rederivation).toEqual({ status: "NOT_IMPLEMENTED" });
+      expectReproduced(v);
       expect(v.flags).toEqual(CPMM_EVIDENCE_FALSE_FLAGS);
     }
   });
@@ -2075,7 +2142,7 @@ describe("Response-limit relationships (review of 55daf13)", () => {
         status: reasons.length === 0 ? "COMPLETE" : "INCOMPLETE",
         reasons,
       });
-      expect(v.rederivation).toEqual({ status: "NOT_IMPLEMENTED" });
+      expectReproduced(v);
       expect(v.flags).toEqual(CPMM_EVIDENCE_FALSE_FLAGS);
     }
     // Redaction changes the stored length; the rules compare original byte counts.
@@ -2093,5 +2160,573 @@ describe("Response-limit relationships (review of 55daf13)", () => {
     expect(get(ex, "body", "storedBytes")).not.toBe(get(ex, "body", "originalBytes"));
     expect(ex.observedBodyBytes).toBe(get(ex, "body", "originalBytes"));
     expect(verifyCpmmObservationEvidence(r.outDir).integrity).toEqual({ ok: true, problems: [] });
+  });
+});
+
+describe("Re-derivation, partial (item G): pool context and collector replay", () => {
+  type Run = Awaited<ReturnType<typeof genuineRun>>;
+  const sealRun = (run: Run) => {
+    const r = sealCpmmObservationEvidence(
+      sealInput(run.snapshot, run.recorder, {}, run.recorderLimits, run.collectorLimits),
+    );
+    if (!r.ok) throw new Error(`seal failed: ${r.code}`);
+    return r.outDir;
+  };
+  const components = (dir: string) => {
+    const v = verifyCpmmObservationEvidence(dir);
+    expect(v.integrity, "integrity").toEqual({ ok: true, problems: [] });
+    expect(v.flags).toEqual(CPMM_EVIDENCE_FALSE_FLAGS);
+    expect(v.poolContextProvenance).toBe("SUPPLIED_UNVERIFIED");
+    expect(v.acquisitionProvenance).toBe("OPEN_G3");
+    return { v, ...v.rederivation.components! };
+  };
+  const TR = CPMM_EVIDENCE_FILES.transportRecords;
+  const records = (doc: Record<string, unknown>) => doc.records as Record<string, unknown>[];
+  const messages = (doc: Record<string, unknown>) =>
+    records(doc).filter((r) => r.kind === "EVENT" && r.event === "message");
+  const isUtf8 = (b: Buffer) => {
+    try {
+      new TextDecoder("utf-8", { fatal: true, ignoreBOM: true }).decode(b);
+      return true;
+    } catch {
+      return false;
+    }
+  };
+  const bytesOf = (p: Record<string, unknown>) =>
+    p.storedEncoding === "base64"
+      ? Buffer.from(p.stored as string, "base64")
+      : Buffer.from(p.stored as string, "utf8");
+  /** A consistent payload rewrite (digests and sizes kept true; redaction flags honest). */
+  const setBytes = (p: Record<string, unknown>, bytes: Buffer, redacted: boolean) => {
+    const utf8 = isUtf8(bytes);
+    Object.assign(p, {
+      storedEncoding: utf8 ? "utf8" : "base64",
+      stored: utf8 ? bytes.toString("utf8") : bytes.toString("base64"),
+      storedBytes: bytes.length,
+      storedSha256: sha(bytes),
+    });
+    if (redacted) Object.assign(p, { payloadRedacted: true, redactions: 1 });
+    else Object.assign(p, { originalBytes: bytes.length, originalSha256: sha(bytes) });
+  };
+  const accountData = (doc: Record<string, unknown>, name: string) =>
+    get(doc, "accounts", name, "data") as Record<string, unknown>;
+
+  it("G1: a genuine clean run reproduces its pool context and its whole collection; the sealed report's claims stay separate", async () => {
+    const { dir } = await shared;
+    const { v, poolContext, collector } = components(dir);
+    expect(poolContext).toEqual({ status: "REPRODUCED", findings: [] });
+    expect(collector).toEqual({
+      status: "REPRODUCED",
+      findings: [],
+      handedOverMessages: 4,
+      replayedFrames: 4,
+      structurallyCheckedFrames: 0,
+      epochReportCompared: true,
+      countersCompared: true,
+    });
+    expect(v.rederivation.status).toBe("PARTIAL");
+    expect(v.rederivation.implementedComponents).toBe("REPRODUCED");
+    // The sealed report still says what the sealer could say; verification computed the rest.
+    expect(v.sealedClaims).toMatchObject({
+      rederivation: { status: "NOT_IMPLEMENTED" },
+      poolContextProvenance: "SUPPLIED_UNVERIFIED",
+      acquisitionProvenance: "OPEN_G3",
+      runOutcome: { connectionRunClean: true },
+    });
+    // The two identical notifications are resolved by order alone: swapping them changes nothing.
+    const d = copyOf(dir);
+    reseal(d, TR, (t) => {
+      const [, first, second] = messages(t);
+      [first!.payload, second!.payload] = [second!.payload, first!.payload];
+    });
+    expect(components(d).collector.status).toBe("REPRODUCED");
+  });
+
+  it("G2: altered raw accounts, identities, slots, bindings or adapted pool are mismatches; redaction and withholding are reported as such", async () => {
+    const { dir } = await shared;
+    const PC = CPMM_EVIDENCE_FILES.poolContext;
+    const cases: [string, (d: Record<string, unknown>) => void, string][] = [
+      [
+        PC,
+        (c) => {
+          const p = accountData(c, "vault0");
+          const b = bytesOf(p);
+          b[64] = b[64]! ^ 0x01; // the SPL token amount
+          setBytes(p, b, false);
+        },
+        "MISMATCH:ADAPTED_POOL",
+      ],
+      [
+        PC,
+        (c) =>
+          ((get(c, "accounts", "pool") as Record<string, unknown>).ownerProgramId =
+            SPL_TOKEN_PROGRAM_ID),
+        "MISMATCH:ADAPTER_REFUSED",
+      ],
+      [
+        PC,
+        (c) => ((get(c, "accounts", "vault1") as Record<string, unknown>).slot = 300_000_001),
+        "MISMATCH:ADAPTER_REFUSED" /* SLOT_DISCREPANCY */,
+      ],
+      [
+        PC,
+        (c) => ((get(c, "adaptedPool", "baseVaultRaw") as Record<string, unknown>).$bigint = "1"),
+        "MISMATCH:ADAPTED_POOL",
+      ],
+      [
+        CPMM_EVIDENCE_FILES.plan,
+        (p) => ((get(p, "plan", "binding") as Record<string, unknown>).candidateMint = WSOL_MINT),
+        "MISMATCH:TARGET_BINDING",
+      ],
+      [
+        CPMM_EVIDENCE_FILES.collector,
+        (c) =>
+          ((get(c, "epochReport", "value", "binding") as Record<string, unknown>).candidateMint =
+            WSOL_MINT),
+        "MISMATCH:COLLECTOR_BINDING",
+      ],
+      [
+        PC,
+        (c) => {
+          const p = accountData(c, "vault0");
+          const b = bytesOf(p);
+          b[100] = b[100]! ^ 0xff;
+          setBytes(p, b, true);
+        },
+        "LIMITED_BY_REDACTION:ACCOUNT_DATA_REDACTED:vault0",
+      ],
+      [
+        PC,
+        (c) =>
+          Object.assign(accountData(c, "pool"), {
+            storedEncoding: null,
+            stored: null,
+            storedBytes: null,
+            storedSha256: null,
+            withheldReason: "CREDENTIAL_SCAN_INCONCLUSIVE",
+            jsonInspection: null,
+          }),
+        "MISSING_EVIDENCE:ACCOUNT_DATA_UNAVAILABLE:pool",
+      ],
+    ];
+    for (const [file, mutate, finding] of cases) {
+      const d = copyOf(dir);
+      reseal(d, file, mutate);
+      const { poolContext, v } = components(d);
+      expect(poolContext.findings, finding).toContain(finding);
+      expect(poolContext.status, finding).toBe(finding.split(":")[0]);
+      expect(v.poolContextProvenance).toBe("SUPPLIED_UNVERIFIED");
+    }
+    // An unrelated redaction never hides a contradiction.
+    const d = copyOf(dir);
+    reseal(d, PC, (c) => {
+      const p = accountData(c, "vault0");
+      const b = bytesOf(p);
+      b[100] = b[100]! ^ 0xff;
+      setBytes(p, b, true);
+      (c.target as Record<string, unknown>).candidateMint = WSOL_MINT;
+    });
+    const { poolContext } = components(d);
+    expect(poolContext.status).toBe("MISMATCH");
+    expect(poolContext.findings).toEqual(
+      expect.arrayContaining([
+        "MISMATCH:TARGET_BINDING",
+        "LIMITED_BY_REDACTION:ACCOUNT_DATA_REDACTED:vault0",
+      ]),
+    );
+  });
+
+  it("G3: reordered messages, altered receipt times, transitions, reports and counts are mismatches", async () => {
+    const { dir } = await shared;
+    const COL = CPMM_EVIDENCE_FILES.collector;
+    const cases: [string, (d: Record<string, unknown>) => void, string][] = [
+      [
+        TR,
+        (t) => {
+          const [ack, note] = messages(t);
+          [ack!.payload, note!.payload] = [note!.payload, ack!.payload];
+        },
+        "MISMATCH:FRAME_ASSOCIATION",
+      ],
+      [
+        COL,
+        (c) => {
+          const fr = (get(c, "frameRecords", "value") as Record<string, number>[])[1]!;
+          fr.receivedAtMs = fr.receivedAtMs! + 1;
+        },
+        "MISMATCH:NOTIFICATIONS",
+      ],
+      [
+        TR,
+        (t) => {
+          const send = records(t).find((r) => r.kind === "CALL" && r.method === "send")!;
+          const p = send.payload as Record<string, unknown>;
+          setBytes(
+            p,
+            Buffer.from(bytesOf(p).toString("utf8").replace(`"id":${SUB_REQ}`, '"id":99')),
+            false,
+          );
+        },
+        "MISMATCH:SUBSCRIBE_FRAME",
+      ],
+      [
+        TR,
+        (t) => {
+          const send = records(t).filter((r) => r.kind === "CALL" && r.method === "send")[1]!;
+          const p = send.payload as Record<string, unknown>;
+          setBytes(p, Buffer.from(bytesOf(p).toString("utf8").replace("4242", "4243")), false);
+        },
+        "MISMATCH:UNSUBSCRIBE_FRAME",
+      ],
+      [
+        COL,
+        (c) =>
+          ((get(c, "epochReport", "value") as Record<string, unknown>).closeReason =
+            "TRANSPORT_CLOSED"),
+        "MISMATCH:EPOCH_REPORT",
+      ],
+      [
+        COL,
+        (c) => {
+          const counters = get(c, "counters", "value") as Record<string, number>;
+          counters.bytes = counters.bytes! + 1;
+        },
+        "MISMATCH:COUNTERS",
+      ],
+      [
+        COL,
+        (c) => ((get(c, "frameRecords", "value") as Record<string, unknown>[])[0]!.code = "OTHER"),
+        "MISMATCH:FRAME_RECORDS",
+      ],
+      [
+        COL,
+        (c) => ((get(c, "frameRecords", "value") as Record<string, unknown>[])[2]!.sequence = 9),
+        "MISMATCH:FRAME_ORDER",
+      ],
+      [
+        CPMM_EVIDENCE_FILES.ownerReport,
+        (o) =>
+          ((get(o, "report", "value", "incoming") as Record<string, number>).messagesBeforeStart =
+            1),
+        "MISMATCH:BEFORE_START_COUNT",
+      ],
+      [
+        CPMM_EVIDENCE_FILES.ownerReport,
+        (o) =>
+          ((get(o, "report", "value", "incoming") as Record<string, number>).passedToCollector = 3),
+        "MISMATCH:HANDED_OVER_COUNT",
+      ],
+      [
+        CPMM_EVIDENCE_FILES.ownerReport,
+        (o) =>
+          ((get(o, "report", "value", "intake") as Record<string, number>).framesAfterIntake = 1),
+        "MISMATCH:AFTER_INTAKE_COUNT",
+      ],
+    ];
+    for (const [file, mutate, finding] of cases) {
+      const d = copyOf(dir);
+      reseal(d, file, mutate);
+      const { collector } = components(d);
+      expect(collector.findings, finding).toContain(finding);
+      expect(collector.status, finding).toBe("MISMATCH");
+    }
+  });
+
+  it("G4: before-start and after-intake messages are excluded by the owner's own split, and the rest reproduces", async () => {
+    // A message delivered after the owner registered its listeners but before start().
+    const early = Buffer.from('{"jsonrpc":"2.0","method":"early"}');
+    const beforeStart = (inner: CpmmOwnerTransport): CpmmOwnerTransport => {
+      const listeners: ((d: unknown) => void)[] = [];
+      let fired = false;
+      const on = (event: string, l: (...a: unknown[]) => void) => {
+        const d = (
+          inner as unknown as { on: (e: string, l: (...a: unknown[]) => void) => () => void }
+        ).on(event, l);
+        if (event === "message") listeners.push(l);
+        if (event === "open" && listeners.length === 2 && !fired) {
+          fired = true;
+          for (const m of [...listeners]) m(early);
+        }
+        return d;
+      };
+      return {
+        get readyState() {
+          return inner.readyState;
+        },
+        start: () => inner.start(),
+        send: (d, done) => inner.send(d, done),
+        ping: (p, done) => inner.ping(p, done),
+        pong: (p, done) => inner.pong(p, done),
+        close: (c) => inner.close(c),
+        terminate: () => inner.terminate(),
+        dispose: () => inner.dispose(),
+        on: on as CpmmOwnerTransport["on"],
+      };
+    };
+    // The accepted owner ends such a run (EVENT_BEFORE_START) without starting the transport.
+    const ea = env({}, {}, { wrapTransport: beforeStart });
+    const pa = ea.owner.run();
+    await ea.to(OBS_START + 10);
+    const ra = await pa;
+    expect(ra.terminal).toMatchObject({ cause: "TRANSPORT_ERROR", code: "EVENT_BEFORE_START" });
+    expect(ra.incoming.messagesBeforeStart).toBe(1);
+    const sa = sealCpmmObservationEvidence(sealInput(ea.finish(ra), ea.recorder));
+    expect(sa.ok).toBe(true);
+    if (!sa.ok) return;
+    const { collector: ca, v: va } = components(sa.outDir);
+    expect(ca).toEqual({
+      status: "REPRODUCED",
+      findings: [],
+      handedOverMessages: 0,
+      replayedFrames: 0,
+      structurallyCheckedFrames: 0,
+      epochReportCompared: true,
+      countersCompared: true,
+    });
+    expect(va.sealedClaims).toMatchObject({
+      runOutcome: { terminal: { code: "EVENT_BEFORE_START" } },
+    });
+    // Claimed as handed over instead, the same message contradicts the owner's own split.
+    const da = copyOf(sa.outDir);
+    reseal(da, CPMM_EVIDENCE_FILES.ownerReport, (o) => {
+      (get(o, "report", "value", "incoming") as Record<string, number>).messagesBeforeStart = 0;
+    });
+    expect(components(da).collector.findings).toContain("MISMATCH:BEFORE_START_COUNT");
+    // A message after the unsubscribe acknowledgement, while the socket is still open: the owner
+    // had already disposed its message listener, so it is wrapper-only and never counted.
+    const b = await genuineRun({ closeMode: "none", afterIntake: Buffer.from('{"late":true}') });
+    expect(b.report.intake.framesAfterIntake).toBe(0);
+    const late = b.snapshot.incoming.filter((r) => r.kind === "EVENT" && r.event === "message");
+    expect(late.at(-1)).toMatchObject({
+      ownerDeliveries: 0,
+      delivery: "WRAPPER_ONLY_AFTER_OWNER_DISPOSAL",
+    });
+    const dirB = sealRun(b);
+    expect(components(dirB).collector).toMatchObject({
+      status: "REPRODUCED",
+      handedOverMessages: 4,
+      replayedFrames: 4,
+    });
+    // The owner-received after-intake split (a message the owner counted but did not hand over),
+    // constructed consistently from that run: accepted with the owner's counts, refused without.
+    const relabel = (dir: string, withCounts: boolean) => {
+      reseal(dir, TR, (t) => {
+        const last = messages(t).at(-1)!;
+        last.ownerDeliveries = 1;
+        last.ownerRegistrationsAtDispatch = 1;
+        last.delivery = "OWNER_LISTENERS_REGISTERED";
+      });
+      if (withCounts) {
+        reseal(dir, CPMM_EVIDENCE_FILES.ownerReport, (o) => {
+          (get(o, "report", "value", "intake") as Record<string, number>).framesAfterIntake = 1;
+          const incoming = get(o, "report", "value", "incoming") as Record<string, number>;
+          incoming.messageEvents = incoming.messageEvents! + 1;
+        });
+      }
+    };
+    const ok = copyOf(dirB);
+    relabel(ok, true);
+    expect(components(ok).collector).toMatchObject({ status: "REPRODUCED", handedOverMessages: 4 });
+    const bad = copyOf(dirB);
+    relabel(bad, false);
+    expect(components(bad).collector.findings).toEqual(
+      expect.arrayContaining(["MISMATCH:AFTER_INTAKE_COUNT", "MISMATCH:OWNER_MESSAGE_COUNT"]),
+    );
+  });
+
+  it("G5: an unhashed terminal refusal is checked structurally, never replayed or given a time", async () => {
+    const run = await genuineRun({ collectorLimits: { maxEpochFrames: 2 } });
+    expect(run.report.terminal).toMatchObject({ cause: "ACQUISITION_LIMIT" });
+    const dir = sealRun(run);
+    const { collector, poolContext, v } = components(dir);
+    expect(poolContext.status).toBe("REPRODUCED");
+    expect(collector).toEqual({
+      status: "MISSING_EVIDENCE",
+      findings: ["MISSING_EVIDENCE:UNHASHED_TERMINAL_REFUSAL_NOT_REPLAYED"],
+      handedOverMessages: 3,
+      replayedFrames: 2,
+      structurallyCheckedFrames: 1,
+      epochReportCompared: false,
+      countersCompared: false,
+    });
+    expect(v.rederivation.implementedComponents).toBe("MISSING_EVIDENCE");
+    // The abnormal outcome stays as recorded.
+    expect(v.sealedClaims).toMatchObject({
+      runOutcome: { terminal: { cause: "ACQUISITION_LIMIT" } },
+    });
+    const COL = CPMM_EVIDENCE_FILES.collector;
+    const tampered: [(c: Record<string, unknown>) => void, string][] = [
+      [
+        (c) =>
+          ((get(c, "frameRecords", "value") as Record<string, unknown>[])[2]!.disposition =
+            "NOT_JSON"),
+        "MISMATCH:UNHASHED_REFUSAL_SHAPE",
+      ],
+      [
+        // An earlier accepted frame stripped of its receipt and digest: not the last one handed over.
+        (c) =>
+          Object.assign((get(c, "frameRecords", "value") as Record<string, unknown>[])[1]!, {
+            receivedAtMs: null,
+            sha256: null,
+          }),
+        "MISMATCH:UNHASHED_REFUSAL_NOT_TERMINAL",
+      ],
+      [
+        // The notification replayed before the refusal is compared with the recorded one.
+        (c) => {
+          const n = (get(c, "notifications", "value") as Record<string, number>[])[0]!;
+          n.slot = n.slot! + 1;
+        },
+        "MISMATCH:NOTIFICATIONS",
+      ],
+      [
+        (c) => {
+          const fr = (get(c, "frameRecords", "value") as Record<string, number>[])[2]!;
+          fr.byteLength = fr.byteLength! + 1;
+        },
+        "MISMATCH:FRAME_ASSOCIATION",
+      ],
+    ];
+    for (const [mutate, finding] of tampered) {
+      const d = copyOf(dir);
+      reseal(d, COL, mutate);
+      const c = components(d).collector;
+      expect(c.findings, finding).toContain(finding);
+      expect(c.status, finding).toBe("MISMATCH");
+    }
+  });
+
+  it("G6: missing or redacted frame material stops replay explicitly; an unrelated redaction neither limits nor hides", async () => {
+    // A credential in both notifications: the second frame cannot be replayed exactly.
+    const red = await genuineRun({ logs: [`Program log: ${SECRET}`] });
+    const redDir = sealRun(red);
+    const rc = components(redDir).collector;
+    expect(rc).toEqual({
+      status: "LIMITED_BY_REDACTION",
+      findings: ["LIMITED_BY_REDACTION:FRAME_PAYLOAD_REDACTED"],
+      handedOverMessages: 4,
+      replayedFrames: 1,
+      structurallyCheckedFrames: 3,
+      epochReportCompared: false,
+      countersCompared: false,
+    });
+    // A contradiction beyond the redacted frame is still a mismatch.
+    const d = copyOf(redDir);
+    reseal(d, CPMM_EVIDENCE_FILES.collector, (c) => {
+      (get(c, "frameRecords", "value") as Record<string, unknown>[])[3]!.sha256 = "0".repeat(64);
+    });
+    const dc = components(d).collector;
+    expect(dc.status).toBe("MISMATCH");
+    expect(dc.findings).toEqual(
+      expect.arrayContaining([
+        "MISMATCH:FRAME_ASSOCIATION",
+        "LIMITED_BY_REDACTION:FRAME_PAYLOAD_REDACTED",
+      ]),
+    );
+    // What was replayed before the stop is still compared.
+    const prefix = copyOf(redDir);
+    reseal(prefix, CPMM_EVIDENCE_FILES.collector, (c) => {
+      (get(c, "frameRecords", "value") as Record<string, unknown>[])[0]!.code = "OTHER";
+    });
+    expect(components(prefix).collector.findings).toContain("MISMATCH:FRAME_RECORDS");
+    // A credential in a control payload is redacted but irrelevant to the collector.
+    const ping = await genuineRun({ pingPayload: Buffer.from(`p:${SECRET}`) });
+    const pingDir = sealRun(ping);
+    const pc = components(pingDir).collector;
+    expect(pc).toMatchObject({ status: "REPRODUCED", findings: [], replayedFrames: 4 });
+    // An omitted payload, dropped frame records and dropped recorder records are missing evidence.
+    const missing: [Parameters<typeof genuineRun>[0], string, number][] = [
+      [{ limits: { maxIncomingPayloadBytes: 8 } }, "MISSING_EVIDENCE:FRAME_PAYLOAD_UNAVAILABLE", 0],
+      [
+        { collectorLimits: { maxRetainedFrameRecords: 1 } },
+        "MISSING_EVIDENCE:FRAME_RECORDS_DROPPED",
+        1,
+      ],
+      [
+        { limits: { maxIncomingRecords: 2 } },
+        "MISSING_EVIDENCE:TRANSPORT_RECORDS_DROPPED:incoming",
+        0,
+      ],
+    ];
+    for (const [o, finding, replayed] of missing) {
+      const run = await genuineRun(o);
+      const c = components(sealRun(run)).collector;
+      expect(c.findings, finding).toEqual([finding]);
+      expect(c.status, finding).toBe("MISSING_EVIDENCE");
+      expect(c.replayedFrames, finding).toBe(replayed);
+      expect(c.epochReportCompared, finding).toBe(false);
+    }
+  });
+
+  it("G7: missing components are missing evidence, never a reproduction", async () => {
+    // The recorder over the wrapper alone: no collector, owner or session reads at all.
+    const m = wrapperOnly();
+    m.c.message(Buffer.from('{"x":1}'));
+    const r = sealCpmmObservationEvidence(
+      sealInput(m.r.finish(NO_COMPONENTS), m.r, {}, m.recorderLimits),
+    );
+    expect(r.ok).toBe(true);
+    if (!r.ok) return;
+    const { collector, poolContext } = components(r.outDir);
+    expect(collector).toMatchObject({
+      status: "MISSING_EVIDENCE",
+      findings: ["MISSING_EVIDENCE:COLLECTOR_COMPONENT_UNAVAILABLE"],
+      replayedFrames: 0,
+    });
+    expect(poolContext.status).toBe("REPRODUCED");
+    // Without the owner's counts, replay still runs but cannot be called a reproduction.
+    const { dir } = await shared;
+    const d = copyOf(dir);
+    reseal(
+      d,
+      CPMM_EVIDENCE_FILES.ownerReport,
+      (o) => (o.lateEvents = { status: "READ_FAILED", code: "THREW" }),
+    );
+    const c = components(d).collector;
+    expect(c).toMatchObject({
+      status: "MISSING_EVIDENCE",
+      findings: ["MISSING_EVIDENCE:OWNER_COUNTS_UNAVAILABLE"],
+      replayedFrames: 4,
+      epochReportCompared: true,
+    });
+    const e = copyOf(dir);
+    reseal(e, CPMM_EVIDENCE_FILES.collector, (o) => (o.counters = { status: "NOT_SUPPLIED" }));
+    expect(components(e).collector.findings).toEqual([
+      "MISSING_EVIDENCE:COLLECTOR_COMPONENT_UNAVAILABLE",
+    ]);
+  });
+
+  it("G8: faithful incomplete runs reproduce what they recorded, without upgrading their outcome", async () => {
+    // The unsubscribe is built and sent, but no acknowledgement arrives: built after the last frame.
+    const unacked = await genuineRun({ noUnsubscribeAck: true });
+    expect(unacked.report.intake.trigger).toBe("INTAKE_DEADLINE");
+    const ud = sealRun(unacked);
+    const uc = components(ud);
+    expect(uc.collector).toMatchObject({
+      status: "REPRODUCED",
+      replayedFrames: 3,
+      epochReportCompared: true,
+    });
+    expect(
+      get(readJson(ud, CPMM_EVIDENCE_FILES.collector), "epochReport", "value", "unsubscribe"),
+    ).toMatchObject({
+      status: "BUILT_UNOBSERVED",
+    });
+    for (const responder of [
+      async () => new Response("x".repeat(200_001), { status: 200 }),
+      async () => {
+        throw new Error("transport failure");
+      },
+    ] as Responder[]) {
+      const dir = sealRun(await genuineRun({ responder }));
+      const { v, poolContext, collector } = components(dir);
+      expect(v.retention.status).toBe("INCOMPLETE");
+      expect(poolContext.status).toBe("REPRODUCED");
+      expect(collector.status).toBe("REPRODUCED");
+      expect(v.rederivation.components!.transactionAnalysis).toEqual({ status: "NOT_IMPLEMENTED" });
+      expect(v.rederivation.components!.runtimeAccounting).toEqual({
+        status: "RUNTIME_ACCOUNTING_NOT_REPRODUCED",
+      });
+    }
   });
 });
