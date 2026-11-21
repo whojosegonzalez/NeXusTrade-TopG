@@ -133,6 +133,9 @@ export const ALLOWED_ADDITIONS_SINCE_REVIEWED_RUNNER = Object.freeze([
   // The offline evidence credential sanitizer and its synthetic tests (section 8.38.17 item 17 D).
   "backend/src/scripts/evidence-credential-sanitizer.ts",
   "backend/src/scripts/evidence-credential-sanitizer.test.ts",
+  // The in-memory CPMM pool observation recorder and its synthetic tests (section 8.38.17 item 17).
+  "backend/src/candidate-scanner/CpmmPoolObservationRecorder.ts",
+  "backend/src/candidate-scanner/CpmmPoolObservationRecorder.test.ts",
 ]);
 
 export interface ReviewedTreeEntry {

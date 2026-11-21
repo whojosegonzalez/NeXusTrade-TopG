@@ -6491,7 +6491,7 @@ Mutation checks for the corrections: all 11 caught.
 #### 8.38.17 CPMM Support Reassessment: Implemented Pool-State Adapter, Pure Market Parser, Isolated Swap Decoder, Transaction Source Adapter and Resolution Accounting Ledger
 
 > [!IMPORTANT]
-> **Status: PRELIMINARY REASSESSMENT (STAGES 1–3 AND TRANSACTION RESOLUTION AND RESOLUTION ACCOUNTING IMPLEMENTED & VERIFIED OFFLINE AS ISOLATED MODULES; NOTIFICATION COLLECTION IMPLEMENTED & VERIFIED OFFLINE AS AN ISOLATED PASSIVE MODULE; CONNECTION OWNER IMPLEMENTED, VERIFIED OFFLINE AND ACCEPTED IN REVIEW AS AN ISOLATED MODULE; TRANSPORT WRAPPER IMPLEMENTED, VERIFIED OFFLINE AND ACCEPTED IN REVIEW AS AN ISOLATED MODULE; EVIDENCE RECORDING, SEALING AND RE-DERIVATION CONTRACT PROPOSED (ONLY ITS PURE RESPONSE-ANALYSIS AND CREDENTIAL-SANITIZER PREREQUISITES IMPLEMENTED); NOT CONNECTED TO FLOW OR ADMISSION).**
+> **Status: PRELIMINARY REASSESSMENT (STAGES 1–3 AND TRANSACTION RESOLUTION AND RESOLUTION ACCOUNTING IMPLEMENTED & VERIFIED OFFLINE AS ISOLATED MODULES; NOTIFICATION COLLECTION IMPLEMENTED & VERIFIED OFFLINE AS AN ISOLATED PASSIVE MODULE; CONNECTION OWNER IMPLEMENTED, VERIFIED OFFLINE AND ACCEPTED IN REVIEW AS AN ISOLATED MODULE; TRANSPORT WRAPPER IMPLEMENTED, VERIFIED OFFLINE AND ACCEPTED IN REVIEW AS AN ISOLATED MODULE; EVIDENCE RECORDING, SEALING AND RE-DERIVATION CONTRACT PROPOSED (ITS PURE RESPONSE-ANALYSIS AND CREDENTIAL-SANITIZER PREREQUISITES AND THE IN-MEMORY RECORDER IMPLEMENTED; NO SEALER); NOT CONNECTED TO FLOW OR ADMISSION).**
 >
 > - **Stage 1**: Pure pool-state adapter ([`RaydiumCpmmPoolStateAdapter.ts`](file:///u:/Projects/TopG/backend/src/candidate-scanner/RaydiumCpmmPoolStateAdapter.ts), 40/40 tests) implemented and verified offline at commit `52809e64`.
 > - **Stage 2**: Pure CPMM market parser ([`DexScreenerCpmmCandidateMarketParser.ts`](file:///u:/Projects/TopG/backend/src/candidate-scanner/DexScreenerCpmmCandidateMarketParser.ts), 43/43 tests) implemented and verified offline at commit `06b0ea6c`.
@@ -6501,7 +6501,7 @@ Mutation checks for the corrections: all 11 caught.
 > - **Notification collection**: passive, bounded, exact-pool CPMM notification collector ([`CpmmPoolNotificationCollector.ts`](file:///u:/Projects/TopG/backend/src/candidate-scanner/CpmmPoolNotificationCollector.ts), 23/23 tests; 22/22 original targeted mutants caught, and 16 of 17 review mutants caught with 1 equivalent) implemented and verified offline on 2026-11-19 (item 14), then corrected after an offline review of `b06108c` (genuine byte-view validation through internal slots, close-time chronology, `BUILT_UNOBSERVED`). It binds one owner-supplied pool and mint, one epoch and one acknowledged subscription, checks acquisition limits before copying or decoding, gives every frame an explicit disposition, forwards failed-status claims while keeping them blocking, never produces a block time, and retains metadata only (no raw replay). It owns no connection, sends no request, never calls the ledger and establishes no completeness.
 > - **Connection owner**: bounded, single-connection CPMM connection owner ([`CpmmPoolConnectionOwner.ts`](file:///u:/Projects/TopG/backend/src/candidate-scanner/CpmmPoolConnectionOwner.ts), 55/55 tests) implemented and verified offline on 2026-11-20 (item 15), then corrected the same day for three lifecycle defects found in review of `dfeee4c`: deadlines are now enforced before anything is admitted, ingested or credited, clock regression and invalid time are latched as blocking, and settlement waits for every unfinished external call (item 15 M). A finalization defect found in review of `5aaeef1` was also corrected: cancellation, session stop, ownership and the clock are rechecked after the final listener disposal and before the report is frozen (item 15 N), with read-only `getBinding()` accessors on the collector and ledger. Independent review of `446eec4` accepted the isolated owner and its finalization correction, with the 205 focused tests, the backend typecheck and independent lifecycle reproductions passing. It drives one injected dormant, detachable transport, verifies the three bindings and exclusive epoch ownership, applies one-time deadlines through authoritative checks, feeds the collector, hands every accepted envelope to the ledger or counts it as explicitly unprocessed, and reports a strict clean-run predicate. It is not wired: there is no real transport wrapper, endpoint lookup, sealing or operator command, and no transport, request or capture is authorized.
 > - **Transport wrapper**: bounded CPMM WebSocket transport wrapper ([`CpmmPoolWebSocketTransport.ts`](file:///u:/Projects/TopG/backend/src/candidate-scanner/CpmmPoolWebSocketTransport.ts), 22/22 tests including the real accepted owner over it; 34 of 36 targeted mutants caught, the 2 survivors not observable) implemented and verified offline on 2026-11-20 (item 16). It uses an injected `ws`-compatible client constructor, constructs nothing before `start()`, passes a complete bounded option set, copies messages byte-for-byte under exact bounds, reports only fixed error categories, translates a latched local payload refusal to 1009 at the actual close, and keeps `readyState` truthful. Independent review of `87b50b3` accepted the isolated wrapper, with the 227 focused tests, the backend typecheck, 81 additional checks, static compatibility with the installed `ws` constructor and the runtime pin check passing. It is not wired: no production constructor, endpoint, sealing or operator command, and no socket, request or capture is authorized.
-> - **Evidence recording, sealing and re-derivation**: contract and synthetic test plan proposed (item 17) and corrected after review. Recording would be by composition: a transport decorator recording each event once, a delegating ledger and an inspectable session exchange-observer fan-out. Of its prerequisites, only G2 is implemented: the pure adapter export `analyzeCpmmTransactionResponse`, which shares the live adapter's response validation and decoding, returns an unbranded analysis that `ingest()` refuses, and proves response validation and decoding only. Its pool context is validated and snapshotted without running caller code, and revoked proxies are refused in every input position (review of `9f50e24`). A second review (of `e612042`) made every consumed pool field's primitive type a condition before anything is frozen. Results: 28/28 adapter tests; 21 of 24 targeted mutants caught across the export and its review corrections, with the 3 survivors redundant with, or equivalent under, the accepted decoder's strict checks. Independent review accepted the export and its corrections. The item D credential-sanitizer prerequisite is also implemented offline (`evidence-credential-sanitizer.ts`; 21/21 tests. A review of `bafc6ec` closed two credential-leak paths: Unicode credentials recovered through escape decoding, and encoded URL components. A review of `c3bdae7` closed a third: context-sensitive lower-casing of the Greek capital sigma. Mutants: 18 of 21 original, 13 of 13 for the first corrections and 7 of 9 for the second caught; the survivors are not observable or redundant by design), with no consumer and no migration. The recorder and sealer are not implemented; G1 and G5 are out of scope, and G3 (pool-account acquisition) remains open.
+> - **Evidence recording, sealing and re-derivation**: contract and synthetic test plan proposed (item 17) and corrected after review. Recording would be by composition: a transport decorator recording each event once, a delegating ledger and an inspectable session exchange-observer fan-out. Of its prerequisites, only G2 is implemented: the pure adapter export `analyzeCpmmTransactionResponse`, which shares the live adapter's response validation and decoding, returns an unbranded analysis that `ingest()` refuses, and proves response validation and decoding only. Its pool context is validated and snapshotted without running caller code, and revoked proxies are refused in every input position (review of `9f50e24`). A second review (of `e612042`) made every consumed pool field's primitive type a condition before anything is frozen. Results: 28/28 adapter tests; 21 of 24 targeted mutants caught across the export and its review corrections, with the 3 survivors redundant with, or equivalent under, the accepted decoder's strict checks. Independent review accepted the export and its corrections. The item D credential-sanitizer prerequisite is also implemented offline (`evidence-credential-sanitizer.ts`; 21/21 tests. A review of `bafc6ec` closed two credential-leak paths: Unicode credentials recovered through escape decoding, and encoded URL components. A review of `c3bdae7` closed a third: context-sensitive lower-casing of the Greek capital sigma. Mutants: 18 of 21 original, 13 of 13 for the first corrections and 7 of 9 for the second caught; the survivors are not observable or redundant by design), with no consumer and no migration. Independent review accepted the sanitizer for its documented coverage and limits. The in-memory observation recorder and the exchange-observer fan-out are now implemented offline (`CpmmPoolObservationRecorder.ts`; 17/17 tests, including the real owner, wrapper, collector, ledger, adapter and session; 26 of 26 targeted mutants caught; item M), with no production factory and no consumer. It records each wrapper event once with explicit owner-delivery correlation, returns the ledger's original promise, and makes no replay or qualification claim. The sealer is not implemented; G1 and G5 are out of scope, and G3 (pool-account acquisition) remains open.
 >   Raydium CPMM targets remain strictly **quarantined from strategy admission** until swap flow decoding, LP evidence, and security evaluation are complete, tested, and independently reviewed. The existing market parser rejection of the `"CPMM"` label in `DexScreenerSingleCandidateMarketParser.ts` remains active and unmodified; coordinator, runner, and live admission paths remain completely unconnected and unchanged.
 
 Raydium CPMM (`CPMMoo8L3F4NbTegBCKVNunggL7H1ZpdTHKxQB5qKP1C`) represents Raydium's modern constant-product AMM architecture. Below is the documentation for the implemented Stage 1 adapter (`RaydiumCpmmPoolStateAdapter.ts`), Stage 2 pure market parser (`DexScreenerCpmmCandidateMarketParser.ts`), and proposed Stage 3 swap decoder (`RaydiumCpmmSwapDecoder.ts`) with their verified acceptance tests, contracts, and explicit behavioral invariants.
@@ -9544,11 +9544,11 @@ Corrections 4–8 are implemented as described in item B and tested as mapped in
 
 The evidence recording, sealing and re-derivation contract is proposed in item 17. These steps remain, each separately approved: wiring the production `ws` constructor and an endpoint through a reviewed factory (with the composition checks above); sealing, re-derivation and credential scanning; an endpoint and budget review; and a separate operator approval for a first unqualified diagnostic capture (item 15 K).
 
-##### 17. CPMM Pool Observation Recording, Sealing and Re-derivation (Proposed Contract; G2 and Item D Prerequisites Implemented)
+##### 17. CPMM Pool Observation Recording, Sealing and Re-derivation (Proposed Contract; G2, Item D and the Recorder Implemented)
 
-**Status**: a proposed contract (2026-11-20, `b623440`), corrected after review (item K). Of its prerequisites, two are implemented: G2, the pure adapter export `analyzeCpmmTransactionResponse` (item K, accepted in review), and item D's credential sanitizer, `evidence-credential-sanitizer.ts` (item L). The recorder and sealer are not approved for implementation and do not exist. The item describes how one bounded CPMM pool observation run would be recorded, sealed as evidence and re-derived offline, on top of the accepted owner (item 15), wrapper (item 16), collector, ledger, transaction adapter and shared session.
+**Status**: a proposed contract (2026-11-20, `b623440`), corrected after review (item K). Of its prerequisites, two are implemented: G2, the pure adapter export `analyzeCpmmTransactionResponse` (item K, accepted in review), and item D's credential sanitizer, `evidence-credential-sanitizer.ts` (item L, accepted in review for its documented coverage and limits). The in-memory recorder and exchange-observer fan-out of item B are implemented offline (item M). The sealer is not approved for implementation and does not exist. The item describes how one bounded CPMM pool observation run would be recorded, sealed as evidence and re-derived offline, on top of the accepted owner (item 15), wrapper (item 16), collector, ledger, transaction adapter and shared session.
 
-- **Changed for the prerequisites only**: the adapter and its tests (G2); the new sanitizer, its tests and the pin entry for exactly those two files (item D). No session, ledger, owner, wrapper, decoder, configuration or dependency change, and no consumer migrated.
+- **Changed so far**: the adapter and its tests (G2); the new sanitizer, its tests and the pin entry for exactly those two files (item D); the new recorder, its tests and the pin entry for exactly those two files (item M). No session, ledger, owner, wrapper, collector, decoder, configuration or dependency change, and no consumer migrated.
 - **Not run**: no request, socket, capture, wallet change or operator command.
 - **Not selected**: no production factory, endpoint lookup or live limit.
 - **Scope**: the capture provides observation and decoding evidence only (item H). CPMM remains excluded from admission.
@@ -9599,6 +9599,8 @@ The evidence recording, sealing and re-derivation contract is proposed in item 1
   No single existing helper covers bytes, partial prefixes, escapes, parsed keys and values, and inconclusive refusal together (item D).
 
 ###### B. Recording Layers (`CpmmPoolObservationRecorder`)
+
+Implemented offline (item M). Where the implementation refines this proposal (three further limits, an explicit delivery correlation in place of a stack, the finish inputs and the late-activity counts), item M is authoritative.
 
 ```typescript
 export interface CpmmObservationRecorderLimits {
@@ -9663,7 +9665,7 @@ No time is copied from one reader to another, no identical timestamp is invented
 
 - **One observation listener per event**: `recordTransport` registers exactly one observation listener for each of the six events on the inner wrapper, before the owner registers anything. It stays registered until `finish()`, and is the only place event records are created.
 - **No separate close observer**: the "extra close observer" of the first draft is this same observation listener. It simply outlives the owner's own registrations.
-- **Owner registrations** made through the decorator become inner registrations whose wrapper function invokes the owner's listener and marks the event record currently being dispatched as `deliveredToOwner`. Dispatch is synchronous and may nest, so the current record is kept on a stack.
+- **Owner registrations** made through the decorator become inner registrations whose shim invokes the owner's listener and credits the delivery to its event record. A stack cannot see where a dispatch ends, so the correlation is explicit (item M): each record keeps the set of owner registrations live when the wrapper dispatched it, and a delivery is credited to the newest record still waiting on that registration.
 - **Labels**: each event record therefore says whether the wrapper dispatched it (`wrapperObserved`, always true) and how many owner listeners received it (`ownerDeliveries`). An event after the owner disposed its listeners, for example a message after intake stopped or a close after settlement, is `wrapperObserved` with zero owner deliveries, labelled by phase (item G).
 
 **Decorator rules**:
@@ -10041,6 +10043,8 @@ No recorder, sanitizer, sealer, session, ledger, owner, decoder, pin, configurat
 
 ###### L. Item D Prerequisite: Evidence Credential Sanitizer (Implemented Offline 2026-11-20)
 
+**Review**: independent review accepted the sanitizer at `573738f` for its documented coverage and limits (below). The acceptance covers this module only; it has no consumer yet.
+
 **Files**:
 
 | File                                                                                                                          | Change                                                                                                                                                                                                                                                                                                                                                                     |
@@ -10222,9 +10226,166 @@ Three survived, none observable here:
   - Credentials that are only canonically equivalent to the configured characters (for example, a precomposed versus a decomposed accent). No Unicode normalization is applied, so only the exact configured code points and their context-free case fold are matched. Characters whose fold expands (for example, a dotted capital I) are matched in folded form and can only widen what is withheld.
 - **Coverage depends on `parseJson`**: parsed keys and values are inspected only for complete, valid UTF-8 JSON with `parseJson` set. Otherwise `jsonInspection` says why, truthfully.
 - **Worst-case cost**: the bounds above allow seconds of CPU per call. Detection scans two raw views, each with an exact and a folded pass, all within the same character budget. The byte-level trailing-fragment matching recurses at most once per secret character (at most 4,096 levels), while the decoded-tail checks (exact and folded) are linear.
-- **No consumer**: the recorder and sealer are not implemented or approved, and no existing module is migrated.
+- **No consumer**: the sealer is not implemented or approved, the recorder (item M) deliberately does not sanitize, and no existing module is migrated.
 
 No adapter, decoder, session, ledger, owner, wrapper, recorder, sealer, configuration or dependency change was made, and no request, socket, capture, wallet change or operator command was run.
+
+###### M. Item 17 Recorder: In-Memory Observation Recorder and Exchange-Observer Fan-Out (Implemented Offline 2026-11-20)
+
+**Scope**: item B's recording layers only. There is no sealer, production factory, endpoint lookup, migration, or change to an accepted module, configuration or dependency. The recorder makes no association, cross-check, runtime-accounting replay or qualification claim; those belong to the sealer and to the re-derivation of items F and G. Its snapshot is raw: `material: "UNSANITIZED_MEMORY_ONLY"`.
+
+**Files**:
+
+| File                                                                                                                                | Change                                                                                                                                                                                                                                                                                                                                                                                                                                                                                            |
+| ----------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| [`CpmmPoolObservationRecorder.ts`](file:///u:/Projects/TopG/backend/src/candidate-scanner/CpmmPoolObservationRecorder.ts)           | New. Imports `node:crypto` (SHA-256), `node:util` (`types.isProxy`, `isUint8Array`, `isPromise`), the adapter's `CPMM_TX_PURPOSE` constant, and types only. It does no file, environment, network, socket, clock, timer, logging, request or redaction work                                                                                                                                                                                                                                       |
+| [`CpmmPoolObservationRecorder.test.ts`](file:///u:/Projects/TopG/backend/src/candidate-scanner/CpmmPoolObservationRecorder.test.ts) | New. 17 synthetic tests: 13 unit tests over the real wrapper (or stubs), and 4 integration regressions with the real owner, wrapper, collector, ledger, adapter, evidence recorder and session                                                                                                                                                                                                                                                                                                    |
+| `paper-pilot-handoff.ts` / `.test.ts`                                                                                               | Exactly the two new paths are allowlisted and added to H-12, and the recorder path leaves H-12's refused list. New refused lookalikes: `CpmmPoolObservationRecorder.test-support.ts`, `.fixtures.ts`, `CpmmPoolObservationRecorderExtra.ts`, `CpmmPoolObservationRecorderFactory.ts`, `CpmmObservationRecorder.ts` and `scripts/CpmmPoolObservationRecorder.ts`. The sealer paths `cpmm-pool-observation-evidence.ts` and `.test.ts` stay refused. Baseline and endpoint exceptions are unchanged |
+
+**API (as implemented)**:
+
+- `createCpmmPoolObservationRecorder({ limits })` takes 13 limits:
+  - the ten of item B;
+  - `maxControlPayloadBytes`;
+  - `maxPayloadBytesPerRecord` (at least 1): larger payloads and bodies are neither copied nor hashed (`OVERSIZE_NOT_HASHED`);
+  - `maxFinishCopyNodes` (at least 1).
+
+  Keys must be exact, own data properties, holding non-negative safe integers; anything else fails with `[CPMM_RECORDER_INIT]`.
+
+- `recordTransport(inner)` and `recordLedger(ledger)` are single-use and never throw. A second call, an unrecordable argument or a call after `finish()` returns the argument unchanged and counts an instrumentation failure, so the owner sees exactly what it would without the recorder.
+- `observeExchange(evidence)` returns `undefined` and never throws.
+- `finish(input)` is idempotent. `lateActivity()` returns exact counts of activity after `finish()`.
+- `createExchangeObserverFanOut({ observers, maxRetainedFailures })` returns `{ observe, diagnostics }`.
+- **G5**: the only concrete-ledger cast is `asOwnerLedger`, which is explicit and isolated. No accepted interface changed.
+
+**Transport decorator**:
+
+- **Observation**: `recordTransport` registers one observation listener per event on the wrapper, before the owner registers anything. It is the only place event records are created, and it never throws, so the wrapper's `ownerListenerThrew` is unchanged.
+- **Delivery stays the wrapper's**: owner registrations remain real wrapper registrations. The wrapper's snapshot dispatch, skipping of listeners removed during a dispatch, release at close and throw containment all apply unchanged. Each owner listener is wrapped in a shim that credits the delivery and then calls the listener with the same `this` and arguments, rethrowing anything it throws unchanged.
+- **Correlation (explicit, nesting-safe)**:
+  - Each event record keeps the set of owner registrations live when the wrapper dispatched it (`ownerRegistrationsAtDispatch`). A delivery is credited to the newest record still waiting on that registration.
+  - The wrapper calls each registration at most once per dispatch. So after a nested dispatch of the same event, the outer record is the newest one still waiting.
+  - A disposer stops delivery at once (the wrapper's own disposer) and removes the registration from every waiting record. Observation continues until `finish()`.
+  - Open correlations are bounded at 256 dispatches; an eviction is counted as an instrumentation failure.
+- **Labels**:
+  - `wrapperObserved: true`, `ownerDeliveries` and `ownerListenerThrew`.
+  - `delivery`: `OWNER_LISTENERS_REGISTERED`, `WRAPPER_ONLY_AFTER_OWNER_DISPOSAL` or `WRAPPER_ONLY_NO_OWNER_LISTENER`.
+  - `eventIndex`: an exact per-event count, comparable with the wrapper's `messages.delivered`.
+  - `closeCode` as the wrapper delivered it (`null` stays `null`).
+- **Calls**:
+  - `start`, `send`, `ping`, `pong`, `close`, `terminate`, `dispose` and `readyState` reads are delegated with the original arguments, reading the method at call time as a direct call would.
+  - `done` is replaced by a shim only when it is a function. Each completion is recorded with its invocation number (duplicates), failure argument, whether the call had already ended (a synchronous completion is not), and whether `done` threw.
+  - Exceptions are rethrown as the same object. Only a code from the accepted wrapper's fixed set is kept; anything else is `UNRECOGNIZED_EXCEPTION` or `NON_ERROR_THROWN`, never its text.
+  - `readyState` returns the inner value unchanged.
+- **Payloads**: bytes are copied through captured `%TypedArray%` getters (proxies refused), then hashed and encoded when observed, before the owner's listener runs.
+
+**Delegating ledger**:
+
+- **The original promise**: `account()` returns the ledger's promise object unchanged and rethrows a synchronous throw as the same object.
+- **Observing settlement**: the captured `Promise.prototype.then` is attached to native promises only, and its handlers never throw.
+  - A non-promise return counts `ACCOUNT_RESULT_NOT_PROMISE`.
+  - A rejection counts `ACCOUNT_REJECTED`; the original promise still rejects for its caller.
+  - A settlement after `finish()` is counted in `lateActivity()`.
+- **Records**:
+  - Calls: signature, epoch, `hostReceivedAtMs` as copied from the envelope, and outcome.
+  - Settlements: status, occurrence, record sequence, signature, disposition, fact kind and code, first sequence and code, as fixed codes only.
+- **Other methods** are delegated unchanged and counted (`delegatedLedgerCalls`).
+
+**Exchange observer and fan-out**:
+
+- **CPMM transaction exchanges only** (`CPMM_GET_TRANSACTION`). Each record keeps:
+  - the entry: sequence, lane, owner, purpose, requested identity and JSON-RPC id; the session's own `dispatchedAtMs` and `completedAtMs`; HTTP status, `bodyComplete`, and the error as a fixed code or `UNRECOGNIZED`;
+  - the method and the request body (bounded per record, outside the body allowance);
+  - up to 32 allow-listed headers;
+  - the body state, a copy and hash of the body, and the observed and limit sizes.
+
+  The URL is never kept; the fixed label `SESSION_RPC_ENDPOINT_NOT_RETAINED` stands in for it.
+
+- **Other exchanges** are counted by lane, owner and purpose (64 keys, with overflow counted), and their bodies are never kept. A value that is not an evidence object is counted under `UNRECOGNIZED` labels.
+- **Fan-out**:
+  - Observers run in fixed order, each in its own `try`.
+  - Any return other than `undefined` counts `UNEXPECTED_RETURN` at once, so instrumentation is incomplete immediately.
+  - An object return is adopted with the captured `Promise.resolve`, and only a counting rejection handler is attached; nothing waits. A throwing `then` or a revoked proxy counts as a rejection.
+  - Diagnostics are frozen copies: exact counts per observer, plus at most `maxRetainedFailures` retained `{ invocation, observer, code }` entries.
+
+**Retention and failures**:
+
+- **Six categories**, each with its own record and byte allowance.
+  - **Over the byte allowance**: the record keeps its length and SHA-256, and the payload is omitted (`BYTE_ALLOWANCE`).
+  - **Over the record allowance**: the record is dropped and counted.
+- **Ordinals**: every occurrence gets one, dropped or not.
+- **`recorderRetentionComplete`**: false on any drop, omission or dropped failure record.
+- **Instrumentation failures**: an exact count, up to `maxInstrumentationFailures` retained with a fixed layer and code. `instrumentation.complete` is false on any failure.
+
+**`finish()`**:
+
+- **Same object**: later calls return the first snapshot. A re-entrant call throws `[CPMM_RECORDER] FINISH_REENTERED`.
+- **Detaches observation only**: it closes, terminates and stops nothing.
+- **Component reads**: the owner report, `lateEvents()`, the wrapper's `diagnostics()`, the collector's `epochReport`, `frameRecords`, `notifications` and `counters`, the ledger's `records`, `epochs` and `counters`, the session window `getLedgerSince(start)` with `getLedgerLength()`, and the fan-out's `diagnostics()`.
+  - Each is read in its own `try` and copied as plain data only: own data properties, with proxies, accessors and non-plain objects refused, depth at most 32, strings at most 4,096 characters, and at most `maxFinishCopyNodes` nodes in all.
+  - Each section is `READ`, `NOT_SUPPLIED` or `READ_FAILED` with a fixed code.
+- **Pending work is explicit**: live owner registrations, dispatches awaiting owner delivery, transport calls in progress, completions awaiting their first call (per method), account calls in progress and pending settlements.
+- **After `finish()`**: completions, owner deliveries, transport calls, ledger calls and settlements, and exchanges keep their original behaviour and are only counted in `lateActivity()`.
+- **Ownership**: the snapshot is deep-frozen recorder-owned copies. No caller object is frozen or mutated.
+
+**Tests** (2026-11-20; synthetic and offline):
+
+| Test   | Covers                                                                                                                                                                                                                                                                                                                                                                                                                   |
+| ------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| R0     | Exact option and limit validation (extra, missing, negative, fractional, zero where positive, proxy, accessor); zero allowances valid                                                                                                                                                                                                                                                                                    |
+| R1a    | Transparency over the real wrapper: a fixed exception before start; synchronous and re-entrant completion order; a non-function `done` passed through unchanged; the genuine `readyState` 2 after terminate                                                                                                                                                                                                              |
+| R1b    | Inner exceptions rethrown as the identical object (credential-bearing, wrapper-coded, an unknown code, a non-Error); only fixed codes kept; misuse returns the argument unchanged                                                                                                                                                                                                                                        |
+| R8a    | Nested dispatch of the same event, with a throw attributed to the inner record; removal mid-dispatch; an event with no owner listener; events after disposal. Records match the wrapper's `messages.delivered`                                                                                                                                                                                                           |
+| R8b    | A close nested in a message dispatch skips the remaining owner listeners; the unfinished delivery stays explicit                                                                                                                                                                                                                                                                                                         |
+| R4     | Separate allowances; omitted (still hashed) versus dropped; oversize never hashed (UTF-16 and UTF-8 bounds); bytes recorded before the owner mutates them                                                                                                                                                                                                                                                                |
+| R3     | Ping and pong duplicates; caller mutation after the call; a failed completion; missing completions, including a thrown call's; `PING_THREW` and `CLOSE_THREW`                                                                                                                                                                                                                                                            |
+| R8c    | `finish()` is idempotent and deep-frozen and closes nothing; a late owner delivery, completion and call keep their behaviour and are counted; the snapshot is unchanged; a re-entrant `finish()` is refused                                                                                                                                                                                                              |
+| R8d    | Bounded copying at `finish()`; caller objects neither frozen nor mutated; accessors and proxies refused; the copy budget; an invalid input                                                                                                                                                                                                                                                                               |
+| R9     | Delegating ledger: the identical promise (a stub and the real accepted ledger); a throw rethrown identically; a non-promise, rejected or never-settling result; a settlement after `finish()`; no unhandled rejection                                                                                                                                                                                                    |
+| R5a    | Fan-out order and isolation: a throw, a non-thenable return, rejected and never-settling promises, a throwing `then` getter, a revoked proxy; incomplete immediately; bounded failures; validation; no unhandled rejection                                                                                                                                                                                               |
+| R5b    | Exchanges: the body copied before a later mutation; the fixed endpoint label; free error text becomes `UNRECOGNIZED`; body and record allowances; other traffic counted only; no URL                                                                                                                                                                                                                                     |
+| R7     | Source boundary: imports, and no clock, timer, network, file, environment, console, URL or redaction use                                                                                                                                                                                                                                                                                                                 |
+| R1c+R6 | Integration: identical owner report, wrapper diagnostics, client calls, session ledger, ledger records and late events with and without the recorder; the adapter's evidence recorder fed first; the binding chain (entry, request body id and signature, response id, `account()` calls, `RECORDED` and `DUPLICATE` settlements, ledger record); one request despite a duplicate; component times copied, none invented |
+| R8e    | Integration: owner `messageEvents` 2 versus wrapper `messages.delivered` 3; an actual close after a `FAILED_STILL_OPEN` settlement, recorded once with no owner delivery; the frozen owner `closeCode: null` and the later wrapper `deliveredCode: 1006` both kept                                                                                                                                                       |
+| R2     | Integration: the collector's `EPOCH_LIMIT_EXCEEDED` refusal keeps `sha256` and `receivedAtMs` null, while the recorder's own digest of the same bytes stays separate                                                                                                                                                                                                                                                     |
+| R5c    | Integration: throwing, rejecting and never-settling observers after the recorder leave the owner report, ledger records and session ledger identical; each is counted; no unhandled rejection                                                                                                                                                                                                                            |
+
+**Mutation checks**: 26 targeted mutants, 26 caught.
+
+- **Correlation**: oldest-first crediting (caught only by the nested-throw attribution in R8a), a shared pending set, no after-disposal label, a skipped inner disposer, a skipped unregistration, pending sets kept after disposal, no owner-throw attribution, no observation registration.
+- **Retention**: no byte allowance, an off-by-one record allowance, no UTF-16 oversize check, payloads not copied.
+- **Calls**: any wrapper-shaped code accepted, `done` not wrapped, late completions uncounted.
+- **Ledger**: settlement not observed, the pending count not decremented.
+- **Exchanges**: no purpose filter, free error text kept.
+- **`finish()`**: not idempotent, observation not detached, the snapshot not frozen, proxies copied, accessors copied.
+- **Fan-out**: returns ignored, no rejection handler.
+- **Not mutated, as unobservable**: hashing the caller's view in place of the copy (both are read once, at observation, before any caller code runs), and the post-`finish()` guard on ending a call (the snapshot is already a separate copy).
+
+**Results** (2026-11-20, each command under an external 60-second limit):
+
+| Check                                                                                                                                                     | Result                                                         |
+| --------------------------------------------------------------------------------------------------------------------------------------------------------- | -------------------------------------------------------------- |
+| Recorder suite                                                                                                                                            | 17/17                                                          |
+| Focused set plus recorder: recorder, sanitizer, wrapper, owner, collector, ledger, decoder, adapter, tracker, `fresh-amm-v4-watch`, `paper-pilot-handoff` | 272/272 (17 + 21 + 22 + 55 + 24 + 25 + 16 + 28 + 40 + 11 + 13) |
+| Backend typecheck (`tsc --noEmit`, actual exit code)                                                                                                      | Clean                                                          |
+| ESLint and Prettier on the changed files                                                                                                                  | Clean                                                          |
+| Pin (`paper-pilot-handoff`, including H-12)                                                                                                               | 13/13                                                          |
+| Wallet `.tmp/virtual-wallet.json`                                                                                                                         | Unchanged (`7F2C2353…ED9`)                                     |
+
+**Remaining limitations**:
+
+- **Registration mirror**: the recorder mirrors owner registrations. If the wrapper releases its listeners (at close or dispose) while the owner still holds a registration, records dispatched earlier wait until the owner disposes it. `pending.dispatchesAwaitingOwnerDelivery` shows this rather than hiding it.
+- **Observation state after close**: an observation listener registered on an already-closed wrapper is reported `ATTACHED`, although the wrapper would deliver nothing.
+- **Adoption reads `then`**: adopting a returned thenable with `Promise.resolve` may read its `then`. That is caller code, run inside the observer's own failure path and contained.
+- **Order is the caller's**: the fan-out cannot verify that the adapter's evidence recorder is first. The future factory must order it; the tests show the order.
+- **Composition checks for the future factory (G7)**:
+  - the incoming byte allowance at least the collector's `maxEpochBytes`;
+  - the exchange body allowance as in item J;
+  - `maxPayloadBytesPerRecord` at least the wrapper's `maxFrameBytes` and the session lane's response limit, otherwise payloads and bodies stay unhashed.
+- **Costs**: hashing and copying are bounded per record by `maxPayloadBytesPerRecord` and in total by the record allowances.
+- **No persistence and no consumer**: the snapshot holds unsanitized bytes in memory only. Nothing persists it, and no production factory, sealer or migration uses it.
+
+No session, ledger, owner, wrapper, collector, adapter, decoder, sanitizer, sealer, configuration or dependency change was made, and no request, socket, capture, wallet change or operator command was run.
 
 ---
 
