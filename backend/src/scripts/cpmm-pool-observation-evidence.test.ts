@@ -2673,7 +2673,14 @@ describe("Re-derivation, partial (item G): pool context and collector replay", (
       findings: ["MISSING_EVIDENCE:COLLECTOR_COMPONENT_UNAVAILABLE"],
       replayedFrames: 0,
     });
-    expect(poolContext.status).toBe("REPRODUCED");
+    // The accounts re-adapt, but no component binding was read to confirm them against.
+    expect(poolContext).toEqual({
+      status: "MISSING_EVIDENCE",
+      findings: [
+        "MISSING_EVIDENCE:COLLECTOR_BINDING_UNAVAILABLE",
+        "MISSING_EVIDENCE:OWNER_BINDING_UNAVAILABLE",
+      ],
+    });
     // Without the owner's counts, replay still runs but cannot be called a reproduction.
     const { dir } = await shared;
     const d = copyOf(dir);
@@ -2728,5 +2735,223 @@ describe("Re-derivation, partial (item G): pool context and collector replay", (
         status: "RUNTIME_ACCOUNTING_NOT_REPRODUCED",
       });
     }
+  });
+});
+
+describe("Re-derivation corrections (review of b5308e4)", () => {
+  const COL = CPMM_EVIDENCE_FILES.collector;
+  const integrityFailsWith = (dir: string, problem: string) => {
+    let v: ReturnType<typeof verifyCpmmObservationEvidence> | null = null;
+    expect(() => (v = verifyCpmmObservationEvidence(dir)), problem).not.toThrow();
+    const r = v as unknown as ReturnType<typeof verifyCpmmObservationEvidence>;
+    expect(r.integrity.ok, problem).toBe(false);
+    expect(r.integrity.problems, problem).toContain(problem);
+    expect(r.rederivation, problem).toEqual(NOT_ATTEMPTED);
+    expect(r.sealedClaims, problem).toBeNull();
+    expect(r.flags).toEqual(CPMM_EVIDENCE_FALSE_FLAGS);
+  };
+  /** Replaces one file's text directly and re-digests the manifest (the report is not touched). */
+  const rewriteText = (dir: string, rel: string, text: string) => {
+    writeFileSync(path.join(dir, ...rel.split("/")), text);
+    reseal(dir, CPMM_EVIDENCE_FILES.manifest, (m) => {
+      m.files = (m.files as { path: string }[]).map((f) =>
+        f.path === rel ? { path: rel, bytes: Buffer.byteLength(text), sha256: sha(text) } : f,
+      );
+    });
+  };
+  const frameRecords = (c: Record<string, unknown>) =>
+    get(c, "frameRecords", "value") as Record<string, unknown>[];
+  const collectorOf = (dir: string) => {
+    const v = verifyCpmmObservationEvidence(dir);
+    expect(v.integrity).toEqual({ ok: true, problems: [] });
+    return v.rederivation.components!.collector;
+  };
+
+  it("O1: deep or malformed sealed claims are a fixed integrity failure; nothing escapes as an exception", async () => {
+    const { dir } = await shared;
+    // The review's reproduction: 10,000 nested arrays as report.json's run outcome, as JSON text.
+    const deep = copyOf(dir);
+    const reportPath = path.join(deep, CPMM_EVIDENCE_FILES.report);
+    const original = readFileSync(reportPath, "utf8");
+    const nested = "[".repeat(10_000) + "]".repeat(10_000);
+    const text = original.replace(
+      /"runOutcome": \{[\s\S]*?\n {2}\},\n/,
+      `"runOutcome": ${nested},\n`,
+    );
+    expect(text).not.toBe(original);
+    expect(Buffer.byteLength(text)).toBeGreaterThan(20_000);
+    rewriteText(deep, CPMM_EVIDENCE_FILES.report, text);
+    integrityFailsWith(deep, "FILE_TOO_DEEP:report.json");
+    // Depth is bounded for every document, not only the report.
+    const deepCollector = copyOf(dir);
+    const collectorText = readFileSync(path.join(deepCollector, COL), "utf8").replace(
+      '"code": null',
+      `"code": ${"[".repeat(200)}${"]".repeat(200)}`,
+    );
+    rewriteText(deepCollector, COL, collectorText);
+    reseal(deepCollector, CPMM_EVIDENCE_FILES.report, (r) => {
+      r.files = (r.files as { path: string }[]).map((f) =>
+        f.path === COL
+          ? { path: COL, bytes: Buffer.byteLength(collectorText), sha256: sha(collectorText) }
+          : f,
+      );
+    });
+    integrityFailsWith(deepCollector, "FILE_TOO_DEEP:collector.json");
+    // Shallow but malformed claims.
+    const claims: [(r: Record<string, unknown>) => void, string][] = [
+      [(r) => (r.runOutcome = [[["x"]]]), "REPORT_RUN_OUTCOME_MALFORMED"],
+      [
+        (r) => ((r.runOutcome as Record<string, unknown>).terminal = { cause: { nested: true } }),
+        "REPORT_RUN_OUTCOME_MALFORMED",
+      ],
+      [
+        (r) => ((r.runOutcome as Record<string, unknown>).extra = 1),
+        "REPORT_RUN_OUTCOME_MALFORMED",
+      ],
+      [
+        (r) =>
+          ((r.runOutcome as Record<string, unknown>).terminal = Object.fromEntries(
+            Array.from({ length: 20 }, (_, i) => [`k${i}`, i]),
+          )),
+        "REPORT_RUN_OUTCOME_MALFORMED",
+      ],
+      [
+        (r) => (r.rederivation = { status: "NOT_IMPLEMENTED", detail: [[1]] }),
+        "REPORT_REDERIVATION_CLAIM_INVALID",
+      ],
+      [(r) => (r.acquisitionProvenance = "ACQUIRED"), "REPORT_ACQUISITION_PROVENANCE_INVALID"],
+    ];
+    for (const [mutate, problem] of claims) {
+      const d = copyOf(dir);
+      reseal(d, CPMM_EVIDENCE_FILES.report, mutate);
+      integrityFailsWith(d, problem);
+    }
+    // Control: valid claims are copied, kept separate and immutable.
+    const v = verifyCpmmObservationEvidence(dir);
+    expect(v.sealedClaims).toMatchObject({ runOutcome: { cleanupStatus: "SETTLED" } });
+    expect(Object.isFrozen(v.sealedClaims!.runOutcome)).toBe(true);
+    expect(Object.isFrozen(v.rederivation.components!.collector.findings)).toBe(true);
+  });
+
+  it("O2: after replay stops, the collector's receipt and refusal rules are still checked on every frame", async () => {
+    const red = await genuineRun({ logs: [`Program log: ${SECRET}`] });
+    const r = sealCpmmObservationEvidence(sealInput(red.snapshot, red.recorder));
+    expect(r.ok).toBe(true);
+    if (!r.ok) return;
+    // Control: untouched, the redaction is the only limitation.
+    expect(collectorOf(r.outDir)).toMatchObject({
+      status: "LIMITED_BY_REDACTION",
+      findings: ["LIMITED_BY_REDACTION:FRAME_PAYLOAD_REDACTED"],
+    });
+    const cases: [(frames: Record<string, unknown>[]) => void, string][] = [
+      // The review's three reproductions, on frame 3 (beyond the stop at frame 2).
+      [(f) => (f[2]!.receivedAtMs = null), "FRAME_RECEIPT_DIGEST_INCONSISTENT"],
+      [
+        (f) =>
+          Object.assign(f[2]!, { receivedAtMs: null, sha256: null, disposition: "OVERSIZE_FRAME" }),
+        "UNHASHED_REFUSAL_NOT_TERMINAL",
+      ],
+      [(f) => (f[2]!.receivedAtMs = -5), "FRAME_RECEIPT_INVALID"],
+      // The rest of the accepted collector's rules.
+      [
+        (f) =>
+          Object.assign(f[2]!, { receivedAtMs: null, sha256: null, disposition: "OVERSIZE_FRAME" }),
+        "FRAME_LENGTH_INCONSISTENT",
+      ],
+      [(f) => (f[2]!.receivedAtMs = (f[1]!.receivedAtMs as number) - 1), "FRAME_RECEIPT_INVALID"],
+      // Before the epoch's start, on the first frame (no earlier receipt to compare with).
+      [(f) => (f[0]!.receivedAtMs = OBS_START - 1), "FRAME_RECEIPT_INVALID"],
+      [(f) => (f[2]!.sha256 = "0".repeat(64)), "NOTIFICATION_FRAME_INCONSISTENT"],
+      [(f) => (f[2]!.sha256 = null), "FRAME_RECEIPT_DIGEST_INCONSISTENT"],
+      [(f) => (f[2]!.disposition = "EPOCH_LIMIT_EXCEEDED"), "FRAME_DISPOSITION_INCONSISTENT"],
+      [(f) => (f[2]!.disposition = "INVENTED"), "FRAME_DISPOSITION_UNKNOWN"],
+      [(f) => (f[2]!.byteLength = FRAME_BYTES + 1), "FRAME_LENGTH_INCONSISTENT"],
+      [(f) => (f[2]!.disposition = "UNEXPECTED_METHOD"), "NOTIFICATION_FRAME_INCONSISTENT"],
+      [
+        (f) => (f[2]!.receivedAtMs = (f[2]!.receivedAtMs as number) + 1),
+        "NOTIFICATION_FRAME_INCONSISTENT",
+      ],
+    ];
+    for (const [mutate, code] of cases) {
+      const d = copyOf(r.outDir);
+      reseal(d, COL, (c) => mutate(frameRecords(c)));
+      const c = collectorOf(d);
+      expect(c.status, code).toBe("MISMATCH");
+      expect(c.findings, code).toEqual(
+        expect.arrayContaining([`MISMATCH:${code}`, "LIMITED_BY_REDACTION:FRAME_PAYLOAD_REDACTED"]),
+      );
+      // Structural checking never resumes replay through the unavailable bytes.
+      expect(c, code).toMatchObject({
+        replayedFrames: 1,
+        structurallyCheckedFrames: 3,
+        epochReportCompared: false,
+      });
+    }
+    // Control: a legitimate unhashed terminal refusal is still only missing evidence.
+    const run = await genuineRun({ collectorLimits: { maxEpochFrames: 2 } });
+    const t = sealCpmmObservationEvidence(
+      sealInput(run.snapshot, run.recorder, {}, run.recorderLimits, run.collectorLimits),
+    );
+    expect(t.ok).toBe(true);
+    if (!t.ok) return;
+    expect(collectorOf(t.outDir)).toMatchObject({
+      status: "MISSING_EVIDENCE",
+      findings: ["MISSING_EVIDENCE:UNHASHED_TERMINAL_REFUSAL_NOT_REPLAYED"],
+    });
+  });
+
+  it("O3: the owner's recorded binding is compared; unavailable binding evidence is reported, never assumed", async () => {
+    const { dir } = await shared;
+    const OWN = CPMM_EVIDENCE_FILES.ownerReport;
+    const cases: [string, (d: Record<string, unknown>) => void, string][] = [
+      // The review's reproduction: only the owner's binding changes.
+      [
+        OWN,
+        (o) =>
+          ((get(o, "report", "value", "binding") as Record<string, unknown>).candidateMint =
+            WSOL_MINT),
+        "MISMATCH:OWNER_BINDING",
+      ],
+      [
+        OWN,
+        (o) =>
+          ((get(o, "report", "value", "binding") as Record<string, unknown>).poolAddress =
+            CANDIDATE),
+        "MISMATCH:OWNER_BINDING",
+      ],
+      [
+        OWN,
+        (o) => delete (get(o, "report", "value") as Record<string, unknown>).binding,
+        "MISSING_EVIDENCE:OWNER_BINDING_UNAVAILABLE",
+      ],
+      [
+        OWN,
+        (o) => (o.report = { status: "READ_FAILED", code: "THREW" }),
+        "MISSING_EVIDENCE:OWNER_BINDING_UNAVAILABLE",
+      ],
+      [
+        COL,
+        (c) => ((c.epochReport as Record<string, unknown>).value = null),
+        "MISSING_EVIDENCE:COLLECTOR_BINDING_UNAVAILABLE",
+      ],
+    ];
+    for (const [file, mutate, finding] of cases) {
+      const d = copyOf(dir);
+      reseal(d, file, mutate);
+      const v = verifyCpmmObservationEvidence(d);
+      expect(v.integrity, finding).toEqual({ ok: true, problems: [] });
+      const pc = v.rederivation.components!.poolContext;
+      expect(pc.findings, finding).toContain(finding);
+      expect(pc.status, finding).toBe(finding.split(":")[0]);
+      expect(v.poolContextProvenance).toBe("SUPPLIED_UNVERIFIED");
+    }
+    // The owner's binding is pool context: the collection itself still reproduces.
+    const d = copyOf(dir);
+    reseal(d, OWN, (o) => {
+      (get(o, "report", "value", "binding") as Record<string, unknown>).candidateMint = WSOL_MINT;
+    });
+    const v = verifyCpmmObservationEvidence(d);
+    expect(v.rederivation.components!.collector.status).toBe("REPRODUCED");
+    expect(v.rederivation.implementedComponents).toBe("MISMATCH");
   });
 });

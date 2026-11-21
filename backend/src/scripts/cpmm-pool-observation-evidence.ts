@@ -26,7 +26,10 @@ import {
   CPMM_EXCHANGE_ENDPOINT_LABEL,
   type CpmmObservationSnapshot,
 } from "../candidate-scanner/CpmmPoolObservationRecorder.js";
-import { CpmmPoolNotificationCollector } from "../candidate-scanner/CpmmPoolNotificationCollector.js";
+import {
+  CPMM_FRAME_DISPOSITIONS,
+  CpmmPoolNotificationCollector,
+} from "../candidate-scanner/CpmmPoolNotificationCollector.js";
 import { adaptRaydiumCpmmPoolState } from "../candidate-scanner/RaydiumCpmmPoolStateAdapter.js";
 import { CPMM_TX_PURPOSE } from "../candidate-scanner/RaydiumCpmmTransactionSourceAdapter.js";
 import {
@@ -125,6 +128,11 @@ export const CPMM_EVIDENCE_VERIFIER_LIMITS = Object.freeze({
   /** Listed files (the manifest excluded), and directory entries walked. */
   maxEntries: 4096,
   maxWalkDepth: 2,
+  /**
+   * Nesting depth of any parsed document, checked iteratively before anything recursive (copies,
+   * comparisons, freezing) touches it. Sealed inputs are at most 64 deep, plus the file's wrapping.
+   */
+  maxDocumentDepth: 80,
 });
 
 const SEAL_LIMITS = Object.freeze({
@@ -1883,6 +1891,7 @@ export function verifyCpmmObservationEvidence(outDir: string): CpmmEvidenceVerif
     else {
       const doc = parseStrict(b);
       if (!isRec(doc)) problems.push(`FILE_NOT_JSON:${p}`);
+      else if (!depthWithin(doc, VL.maxDocumentDepth)) problems.push(`FILE_TOO_DEEP:${p}`);
       else docs.set(p, doc);
     }
   }
@@ -1903,18 +1912,57 @@ export function verifyCpmmObservationEvidence(outDir: string): CpmmEvidenceVerif
     reasons = ["RETENTION_UNDETERMINABLE"];
   }
   // 6. Re-derivation (item G, partial), only now that integrity holds, over the same parsed and
-  //    bounded documents; nothing is read again.
-  const report = docs.get(CPMM_EVIDENCE_FILES.report)!;
-  return result(
-    { status: reasons.length === 0 ? "COMPLETE" : "INCOMPLETE", reasons },
-    "SUPPLIED_UNVERIFIED",
-    rederive(docs),
-    {
+  //    bounded documents; nothing is read again. The claims copied below were validated, and every
+  //    document's depth bounded, by the integrity checks; nothing may escape as an exception.
+  try {
+    const report = docs.get(CPMM_EVIDENCE_FILES.report)!;
+    const claims = {
       rederivation: copyJson(report.rederivation),
       poolContextProvenance: report.poolContextProvenance,
       acquisitionProvenance: report.acquisitionProvenance,
       runOutcome: copyJson(report.runOutcome),
-    },
+    };
+    return result(
+      { status: reasons.length === 0 ? "COMPLETE" : "INCOMPLETE", reasons },
+      "SUPPLIED_UNVERIFIED",
+      rederive(docs),
+      claims,
+    );
+  } catch {
+    problems.push("EVIDENCE_STRUCTURE_INVALID");
+    return integrityFailure();
+  }
+}
+
+/** Iterative (no recursion): true when no array or object nests deeper than `max`. */
+function depthWithin(root: unknown, max: number): boolean {
+  const work: { v: unknown; d: number }[] = [{ v: root, d: 0 }];
+  while (work.length > 0) {
+    const { v, d } = work.pop()!;
+    if (typeof v !== "object" || v === null) continue;
+    if (d >= max) return false;
+    for (const x of Array.isArray(v) ? v : Object.values(v)) work.push({ v: x, d: d + 1 });
+  }
+  return true;
+}
+
+/** The sealer's run outcome: a flat terminal record, a cleanup status and the clean flag. */
+function runOutcomeOk(o: unknown): boolean {
+  if (!sameKeys(o, ["terminal", "cleanupStatus", "connectionRunClean"])) return false;
+  const t = get(o, "terminal");
+  const flat =
+    t === null ||
+    (isRec(t) &&
+      Object.keys(t).length <= 16 &&
+      Object.values(t).every(
+        (x) => x === null || ["string", "number", "boolean"].includes(typeof x),
+      ));
+  const cleanup = get(o, "cleanupStatus");
+  const clean = get(o, "connectionRunClean");
+  return (
+    flat &&
+    (cleanup === null || typeof cleanup === "string") &&
+    (clean === null || typeof clean === "boolean")
   );
 }
 
@@ -1947,6 +1995,11 @@ function checkDocuments(
   if (get(report, "rederivation", "status") !== "NOT_IMPLEMENTED") {
     problems.push("REPORT_REDERIVATION_CLAIM_INVALID");
   }
+  if (!sameKeys(report.rederivation, ["status"]))
+    problems.push("REPORT_REDERIVATION_CLAIM_INVALID");
+  if (report.acquisitionProvenance !== "OPEN_G3")
+    problems.push("REPORT_ACQUISITION_PROVENANCE_INVALID");
+  if (!runOutcomeOk(report.runOutcome)) problems.push("REPORT_RUN_OUTCOME_MALFORMED");
   if (report.poolContextProvenance !== "SUPPLIED_UNVERIFIED") {
     problems.push("REPORT_POOL_PROVENANCE_INVALID");
   }
@@ -2310,17 +2363,16 @@ function rederivePoolContext(
   const recorded = get(ctx, "adaptedPool");
   if (!sameBinding(target, binding)) f.add("MISMATCH", "TARGET_BINDING");
   if (!sameBinding(recorded, binding)) f.add("MISMATCH", "ADAPTED_POOL_BINDING");
-  const collector = docs.get(CPMM_EVIDENCE_FILES.collector);
-  if (get(collector, "epochReport", "status") === "READ") {
-    const epochBinding = get(collector, "epochReport", "value", "binding");
-    if (
-      epochBinding !== null &&
-      epochBinding !== undefined &&
-      !sameBinding(epochBinding, binding)
-    ) {
-      f.add("MISMATCH", "COLLECTOR_BINDING");
-    }
-  }
+  // Every component binding that was read must agree; one that was not is reported, never assumed.
+  const componentBinding = (file: string, section: string, label: string): void => {
+    const doc = docs.get(file);
+    const b =
+      get(doc, section, "status") === "READ" ? get(doc, section, "value", "binding") : undefined;
+    if (!isRec(b)) f.add("MISSING_EVIDENCE", `${label}_BINDING_UNAVAILABLE`);
+    else if (!sameBinding(b, binding)) f.add("MISMATCH", `${label}_BINDING`);
+  };
+  componentBinding(CPMM_EVIDENCE_FILES.collector, "epochReport", "COLLECTOR");
+  componentBinding(CPMM_EVIDENCE_FILES.ownerReport, "report", "OWNER");
   const accounts: Record<string, unknown> = {};
   for (const [name, key] of [
     ["pool", "poolAccount"],
@@ -2550,13 +2602,10 @@ function replayCollector(docs: Map<string, Record<string, unknown>>): CpmmCollec
       return;
     }
     if (fr.receivedAtMs === null) {
-      // No receipt time was recorded, so the frame is never replayed (none is invented).
+      // No receipt time was recorded, so the frame is never replayed (none is invented); its shape
+      // and position are checked by the structural pass below.
       out.structurallyCheckedFrames++;
       stopped = true;
-      if (fr.sha256 !== null || !UNHASHED_REFUSALS.has(fr.disposition)) {
-        f.add("MISMATCH", "UNHASHED_REFUSAL_SHAPE");
-      }
-      if (i !== handedOver.length - 1) f.add("MISMATCH", "UNHASHED_REFUSAL_NOT_TERMINAL");
       f.add("MISSING_EVIDENCE", "UNHASHED_TERMINAL_REFUSAL_NOT_REPLAYED");
       return;
     }
@@ -2573,6 +2622,18 @@ function replayCollector(docs: Map<string, Record<string, unknown>>): CpmmCollec
     c.acceptFrame({ epoch, bytes: b.bytes, receivedAtMs: fr.receivedAtMs as number });
     out.replayedFrames++;
   });
+
+  // Independently of replay (and so also beyond where it stopped): every handed-over frame and
+  // retained notification must obey the accepted collector's receipt and refusal rules.
+  for (const code of frameStructureProblems(
+    frames.slice(0, handed),
+    handed,
+    notes,
+    epochReport.observationStartMs,
+    get(plan, "limits", "collector", "maxFrameBytes"),
+  )) {
+    f.add("MISMATCH", code);
+  }
 
   const compare = (replayed: unknown, recorded: unknown, code: string): void => {
     if (canonical(copyJson(replayed)) !== canonical(recorded)) f.add("MISMATCH", code);
@@ -2600,6 +2661,76 @@ function replayCollector(docs: Map<string, Record<string, unknown>>): CpmmCollec
   out.epochReportCompared = true;
   out.countersCompared = true;
   return done();
+}
+
+const DISPOSITIONS: ReadonlySet<unknown> = new Set(CPMM_FRAME_DISPOSITIONS);
+
+/**
+ * The accepted collector's rules, checked on the recorded frames without replay:
+ * - a frame has a receipt time exactly when it has a digest (refusals before the receipt step
+ *   record neither); the disposition is a known one;
+ * - an unhashed frame is a pre-receipt refusal and the last frame the owner handed over (every such
+ *   refusal ends the run);
+ * - a hashed frame was not refused before its receipt, its receipt time is a positive safe integer,
+ *   not before the epoch's start nor an earlier receipt, and its length is within `maxFrameBytes`;
+ *   an OVERSIZE_FRAME refusal is beyond it;
+ * - a notification's frame, when retained, was accepted as a notification at the same receipt time
+ *   and digest.
+ */
+function frameStructureProblems(
+  frames: readonly unknown[],
+  handed: number,
+  notes: readonly unknown[],
+  observationStartMs: unknown,
+  maxFrameBytes: unknown,
+): string[] {
+  const problems = new Set<string>();
+  let lastReceipt: number | null = null;
+  frames.forEach((fr, i) => {
+    if (!isRec(fr)) return;
+    const at = fr.receivedAtMs;
+    const digest = fr.sha256;
+    if (!DISPOSITIONS.has(fr.disposition)) problems.add("FRAME_DISPOSITION_UNKNOWN");
+    if ((at === null) !== (digest === null)) problems.add("FRAME_RECEIPT_DIGEST_INCONSISTENT");
+    if (!isInt(fr.byteLength)) problems.add("FRAME_LENGTH_INCONSISTENT");
+    const beyondLimit =
+      isInt(maxFrameBytes) && isInt(fr.byteLength) && fr.byteLength > maxFrameBytes;
+    if (fr.disposition === "OVERSIZE_FRAME" && !beyondLimit)
+      problems.add("FRAME_LENGTH_INCONSISTENT");
+    if (at === null) {
+      if (!UNHASHED_REFUSALS.has(fr.disposition)) problems.add("UNHASHED_REFUSAL_SHAPE");
+      if (i !== handed - 1) problems.add("UNHASHED_REFUSAL_NOT_TERMINAL");
+      return;
+    }
+    if (UNHASHED_REFUSALS.has(fr.disposition)) problems.add("FRAME_DISPOSITION_INCONSISTENT");
+    if (digest !== null && !(typeof digest === "string" && HEX64.test(digest))) {
+      problems.add("FRAME_RECEIPT_DIGEST_INCONSISTENT");
+    }
+    if (beyondLimit) problems.add("FRAME_LENGTH_INCONSISTENT");
+    if (
+      !isInt(at) ||
+      at < 1 ||
+      (isInt(observationStartMs) && at < observationStartMs) ||
+      (lastReceipt !== null && at < lastReceipt)
+    ) {
+      problems.add("FRAME_RECEIPT_INVALID");
+    } else {
+      lastReceipt = at;
+    }
+  });
+  for (const n of notes) {
+    const seq = get(n, "frameSequence");
+    const fr = isInt(seq) && seq >= 1 ? frames[seq - 1] : undefined;
+    if (!isRec(fr)) continue; // its frame record was not retained (or not handed over)
+    if (
+      fr.disposition !== "NOTIFICATION_ACCEPTED" ||
+      fr.receivedAtMs !== get(n, "receivedAtMs") ||
+      fr.sha256 !== get(n, "frameSha256")
+    ) {
+      problems.add("NOTIFICATION_FRAME_INCONSISTENT");
+    }
+  }
+  return [...problems];
 }
 
 /** Each implemented component in its own guard: an internal failure is never a success. */
