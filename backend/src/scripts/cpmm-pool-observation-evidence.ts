@@ -31,6 +31,7 @@ import {
   CpmmPoolNotificationCollector,
 } from "../candidate-scanner/CpmmPoolNotificationCollector.js";
 import { adaptRaydiumCpmmPoolState } from "../candidate-scanner/RaydiumCpmmPoolStateAdapter.js";
+import { isValidSolanaSignature } from "../candidate-scanner/ExactPoolHistoryEnumerator.js";
 import { CPMM_TX_PURPOSE } from "../candidate-scanner/RaydiumCpmmTransactionSourceAdapter.js";
 import {
   EVIDENCE_SANITIZER_LIMITS,
@@ -2625,15 +2626,19 @@ function replayCollector(docs: Map<string, Record<string, unknown>>): CpmmCollec
 
   // Independently of replay (and so also beyond where it stopped): every handed-over frame and
   // retained notification must obey the accepted collector's receipt and refusal rules.
-  for (const code of frameStructureProblems(
-    frames.slice(0, handed),
+  const structure = frameStructureProblems({
+    frames: frames.slice(0, handed),
     handed,
     notes,
-    epochReport.observationStartMs,
-    get(plan, "limits", "collector", "maxFrameBytes"),
-  )) {
-    f.add("MISMATCH", code);
-  }
+    epoch,
+    observationStartMs: epochReport.observationStartMs,
+    subscriptionId: epochReport.subscriptionId,
+    epochNotificationsAccepted: epochReport.notificationsAccepted,
+    notificationsAccepted: counters.notificationsAccepted,
+    maxFrameBytes: get(plan, "limits", "collector", "maxFrameBytes"),
+  });
+  for (const code of structure.mismatch) f.add("MISMATCH", code);
+  for (const code of structure.missing) f.add("MISSING_EVIDENCE", code);
 
   const compare = (replayed: unknown, recorded: unknown, code: string): void => {
     if (canonical(copyJson(replayed)) !== canonical(recorded)) f.add("MISMATCH", code);
@@ -2674,17 +2679,32 @@ const DISPOSITIONS: ReadonlySet<unknown> = new Set(CPMM_FRAME_DISPOSITIONS);
  * - a hashed frame was not refused before its receipt, its receipt time is a positive safe integer,
  *   not before the epoch's start nor an earlier receipt, and its length is within `maxFrameBytes`;
  *   an OVERSIZE_FRAME refusal is beyond it;
- * - a notification's frame, when retained, was accepted as a notification at the same receipt time
- *   and digest.
+ * - every retained notification has the collector's exact schema and numeric domains (checked
+ *   before any frame lookup); its sequence is its collector-wide acceptance order (retained
+ *   notifications are the first ones, so the i-th has sequence i + 1) within the recorded counts;
+ *   its frame reference is an integer within the handed-over range, strictly increasing; its epoch
+ *   is the run's and its subscription id the acknowledged one;
+ * - a notification's frame, when retained, is in the same epoch and was accepted as a notification
+ *   (the k-th accepted frame being the k-th notification) at the same receipt time and digest. A
+ *   valid reference to a frame record that was genuinely not retained is missing evidence, never a
+ *   mismatch; an invalid reference is a mismatch, never "not retained".
+ * Payload-derived values (signature, slot, error flag) are checked for their domains only: without
+ * the bytes they cannot be checked further, and that stays the replay's limitation.
  */
-function frameStructureProblems(
-  frames: readonly unknown[],
-  handed: number,
-  notes: readonly unknown[],
-  observationStartMs: unknown,
-  maxFrameBytes: unknown,
-): string[] {
+function frameStructureProblems(x: {
+  frames: readonly unknown[];
+  handed: number;
+  notes: readonly unknown[];
+  epoch: unknown;
+  observationStartMs: unknown;
+  subscriptionId: unknown;
+  epochNotificationsAccepted: unknown;
+  notificationsAccepted: unknown;
+  maxFrameBytes: unknown;
+}): { mismatch: string[]; missing: string[] } {
+  const { frames, handed, notes, observationStartMs, maxFrameBytes } = x;
   const problems = new Set<string>();
+  const missing = new Set<string>();
   let lastReceipt: number | null = null;
   frames.forEach((fr, i) => {
     if (!isRec(fr)) return;
@@ -2718,20 +2738,88 @@ function frameStructureProblems(
       lastReceipt = at;
     }
   });
-  for (const n of notes) {
-    const seq = get(n, "frameSequence");
-    const fr = isInt(seq) && seq >= 1 ? frames[seq - 1] : undefined;
-    if (!isRec(fr)) continue; // its frame record was not retained (or not handed over)
+  // The k-th frame accepted as a notification is the k-th notification (retained frame records
+  // are the collector's first ones, so counting from the start is exact).
+  const acceptedOrder = new Map<number, number>();
+  frames.forEach((fr, i) => {
+    if (isRec(fr) && fr.disposition === "NOTIFICATION_ACCEPTED") {
+      acceptedOrder.set(i + 1, acceptedOrder.size + 1);
+    }
+  });
+  const accepted = x.notificationsAccepted;
+  if (
+    (isInt(accepted) && (notes.length > accepted || acceptedOrder.size > accepted)) ||
+    (isInt(x.epochNotificationsAccepted) && notes.length > x.epochNotificationsAccepted)
+  ) {
+    problems.add("NOTIFICATION_COUNT_INCONSISTENT");
+  }
+  let lastReference = 0;
+  notes.forEach((n, i) => {
+    if (!sameKeys(n, NOTIFICATION_KEYS)) {
+      problems.add("NOTIFICATION_MALFORMED");
+      return;
+    }
+    const o = n as Record<string, unknown>;
+    // The reference first: an integer frame sequence within the handed-over range, increasing.
+    const ref = o.frameSequence;
+    if (!isInt(ref) || ref < 1 || ref > handed || ref <= lastReference) {
+      problems.add("NOTIFICATION_FRAME_REFERENCE_INVALID");
+      return;
+    }
+    lastReference = ref;
+    if (
+      !isInt(o.sequence) ||
+      !isInt(o.epoch) ||
+      !isInt(o.subscriptionId) ||
+      !isValidSolanaSignature(o.signature) ||
+      !isInt(o.slot) ||
+      !isInt(o.receivedAtMs) ||
+      o.receivedAtMs < 1 ||
+      (o.notifiedTransactionError !== "NULL" && o.notifiedTransactionError !== "PRESENT") ||
+      typeof o.frameSha256 !== "string" ||
+      !HEX64.test(o.frameSha256)
+    ) {
+      problems.add("NOTIFICATION_MALFORMED");
+      return;
+    }
+    if (o.sequence !== i + 1 || (isInt(accepted) && o.sequence > accepted)) {
+      problems.add("NOTIFICATION_SEQUENCE_INCONSISTENT");
+    }
+    if (o.epoch !== x.epoch) problems.add("NOTIFICATION_EPOCH_INCONSISTENT");
+    if (o.subscriptionId !== x.subscriptionId)
+      problems.add("NOTIFICATION_SUBSCRIPTION_INCONSISTENT");
+    const fr = frames[ref - 1];
+    if (!isRec(fr)) {
+      // A valid reference, but that frame record was not retained: missing, not contradicted.
+      missing.add("NOTIFICATION_FRAME_NOT_RETAINED");
+      return;
+    }
+    if (fr.epoch !== o.epoch) problems.add("NOTIFICATION_EPOCH_INCONSISTENT");
     if (
       fr.disposition !== "NOTIFICATION_ACCEPTED" ||
-      fr.receivedAtMs !== get(n, "receivedAtMs") ||
-      fr.sha256 !== get(n, "frameSha256")
+      fr.receivedAtMs !== o.receivedAtMs ||
+      fr.sha256 !== o.frameSha256
     ) {
       problems.add("NOTIFICATION_FRAME_INCONSISTENT");
+    } else if (acceptedOrder.get(ref) !== o.sequence) {
+      problems.add("NOTIFICATION_SEQUENCE_INCONSISTENT");
     }
-  }
-  return [...problems];
+  });
+  return { mismatch: [...problems], missing: [...missing] };
 }
+
+/** The accepted collector's notification record (`CpmmCollectedNotification`), exactly. */
+const NOTIFICATION_KEYS = [
+  "sequence",
+  "frameSequence",
+  "epoch",
+  "subscriptionId",
+  "signature",
+  "slot",
+  "receivedAtMs",
+  "notifiedTransactionError",
+  "frameSha256",
+];
 
 /** Each implemented component in its own guard: an internal failure is never a success. */
 function rederive(docs: Map<string, Record<string, unknown>>): CpmmRederivation {

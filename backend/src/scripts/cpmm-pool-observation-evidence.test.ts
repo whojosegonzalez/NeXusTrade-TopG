@@ -1555,6 +1555,7 @@ describe("CPMM observation evidence: verification", () => {
       "../candidate-scanner/CpmmPoolObservationRecorder.js",
       "../candidate-scanner/CpmmPoolNotificationCollector.js",
       "../candidate-scanner/RaydiumCpmmPoolStateAdapter.js",
+      "../candidate-scanner/ExactPoolHistoryEnumerator.js",
       "../candidate-scanner/RaydiumCpmmTransactionSourceAdapter.js",
       "./evidence-credential-sanitizer.js",
     ]);
@@ -2635,23 +2636,32 @@ describe("Re-derivation, partial (item G): pool context and collector replay", (
     const pc = components(pingDir).collector;
     expect(pc).toMatchObject({ status: "REPRODUCED", findings: [], replayedFrames: 4 });
     // An omitted payload, dropped frame records and dropped recorder records are missing evidence.
-    const missing: [Parameters<typeof genuineRun>[0], string, number][] = [
-      [{ limits: { maxIncomingPayloadBytes: 8 } }, "MISSING_EVIDENCE:FRAME_PAYLOAD_UNAVAILABLE", 0],
+    const missing: [Parameters<typeof genuineRun>[0], string[], number][] = [
+      [
+        { limits: { maxIncomingPayloadBytes: 8 } },
+        ["MISSING_EVIDENCE:FRAME_PAYLOAD_UNAVAILABLE"],
+        0,
+      ],
       [
         { collectorLimits: { maxRetainedFrameRecords: 1 } },
-        "MISSING_EVIDENCE:FRAME_RECORDS_DROPPED",
+        // The retained notifications validly reference frames whose records were not retained.
+        [
+          "MISSING_EVIDENCE:FRAME_RECORDS_DROPPED",
+          "MISSING_EVIDENCE:NOTIFICATION_FRAME_NOT_RETAINED",
+        ],
         1,
       ],
       [
         { limits: { maxIncomingRecords: 2 } },
-        "MISSING_EVIDENCE:TRANSPORT_RECORDS_DROPPED:incoming",
+        ["MISSING_EVIDENCE:TRANSPORT_RECORDS_DROPPED:incoming"],
         0,
       ],
     ];
-    for (const [o, finding, replayed] of missing) {
+    for (const [o, findings, replayed] of missing) {
+      const finding = findings[0]!;
       const run = await genuineRun(o);
       const c = components(sealRun(run)).collector;
-      expect(c.findings, finding).toEqual([finding]);
+      expect(c.findings, finding).toEqual(findings);
       expect(c.status, finding).toBe("MISSING_EVIDENCE");
       expect(c.replayedFrames, finding).toBe(replayed);
       expect(c.epochReportCompared, finding).toBe(false);
@@ -2953,5 +2963,152 @@ describe("Re-derivation corrections (review of b5308e4)", () => {
     const v = verifyCpmmObservationEvidence(d);
     expect(v.rederivation.components!.collector.status).toBe("REPRODUCED");
     expect(v.rederivation.implementedComponents).toBe("MISMATCH");
+  });
+});
+
+describe("Notification structure (review of 84a5ff9)", () => {
+  const COL = CPMM_EVIDENCE_FILES.collector;
+  type Run = Awaited<ReturnType<typeof genuineRun>>;
+  const sealRun = (run: Run) => {
+    const r = sealCpmmObservationEvidence(
+      sealInput(run.snapshot, run.recorder, {}, run.recorderLimits, run.collectorLimits),
+    );
+    if (!r.ok) throw new Error(`seal failed: ${r.code}`);
+    return r.outDir;
+  };
+  const collectorOf = (dir: string) => {
+    const v = verifyCpmmObservationEvidence(dir);
+    expect(v.integrity).toEqual({ ok: true, problems: [] });
+    expect(v.flags).toEqual(CPMM_EVIDENCE_FALSE_FLAGS);
+    expect(v.poolContextProvenance).toBe("SUPPLIED_UNVERIFIED");
+    return v.rederivation.components!.collector;
+  };
+  const notifications = (c: Record<string, unknown>) =>
+    get(c, "notifications", "value") as Record<string, unknown>[];
+
+  it("O4: after replay stops, every retained notification's identity and frame reference is still checked", async () => {
+    const red = await genuineRun({ logs: [`Program log: ${SECRET}`] });
+    const dir = sealRun(red);
+    // Control: honest redaction is the only limitation of the untouched capture.
+    expect(collectorOf(dir)).toMatchObject({
+      status: "LIMITED_BY_REDACTION",
+      findings: ["LIMITED_BY_REDACTION:FRAME_PAYLOAD_REDACTED"],
+      replayedFrames: 1,
+    });
+    const cases: [(c: Record<string, unknown>) => void, string][] = [
+      // The review's reproductions, on the second notification (frame 3, beyond the stop).
+      [(c) => (notifications(c)[1]!.frameSequence = 0), "NOTIFICATION_FRAME_REFERENCE_INVALID"],
+      [(c) => (notifications(c)[1]!.frameSequence = 999), "NOTIFICATION_FRAME_REFERENCE_INVALID"],
+      [(c) => (notifications(c)[1]!.frameSequence = 2.5), "NOTIFICATION_FRAME_REFERENCE_INVALID"],
+      [(c) => (notifications(c)[1]!.epoch = 2), "NOTIFICATION_EPOCH_INCONSISTENT"],
+      [(c) => (notifications(c)[1]!.sequence = 999), "NOTIFICATION_SEQUENCE_INCONSISTENT"],
+      [
+        (c) => (notifications(c)[1]!.subscriptionId = 999),
+        "NOTIFICATION_SUBSCRIPTION_INCONSISTENT",
+      ],
+      // References must increase: two notifications cannot come from one frame.
+      [(c) => (notifications(c)[1]!.frameSequence = 2), "NOTIFICATION_FRAME_REFERENCE_INVALID"],
+      // Sequences follow acceptance order, and the k-th accepted frame is the k-th notification.
+      [
+        (c) => {
+          const [a, b] = notifications(c);
+          [a!.sequence, b!.sequence] = [b!.sequence, a!.sequence];
+        },
+        "NOTIFICATION_SEQUENCE_INCONSISTENT",
+      ],
+      // The referenced frame's epoch.
+      [
+        (c) => ((get(c, "frameRecords", "value") as Record<string, unknown>[])[2]!.epoch = 2),
+        "NOTIFICATION_EPOCH_INCONSISTENT",
+      ],
+      // The schema and numeric domains of the accepted collector's record.
+      [(c) => (notifications(c)[1]!.extra = 1), "NOTIFICATION_MALFORMED"],
+      [(c) => delete notifications(c)[1]!.slot, "NOTIFICATION_MALFORMED"],
+      [(c) => (notifications(c)[1]!.slot = -1), "NOTIFICATION_MALFORMED"],
+      [(c) => (notifications(c)[1]!.signature = "not-a-signature"), "NOTIFICATION_MALFORMED"],
+      [(c) => (notifications(c)[1]!.notifiedTransactionError = "MAYBE"), "NOTIFICATION_MALFORMED"],
+      [(c) => (notifications(c)[1]!.frameSha256 = "ABC"), "NOTIFICATION_MALFORMED"],
+      // More frames accepted as notifications than the collector accepted (the unsubscribe
+      // acknowledgement relabelled, beyond the stop and referenced by no notification).
+      [
+        (c) =>
+          ((get(c, "frameRecords", "value") as Record<string, unknown>[])[3]!.disposition =
+            "NOTIFICATION_ACCEPTED"),
+        "NOTIFICATION_COUNT_INCONSISTENT",
+      ],
+      // Fewer accepted notifications in the epoch than are retained.
+      [
+        (c) =>
+          ((get(c, "epochReport", "value") as Record<string, unknown>).notificationsAccepted = 1),
+        "NOTIFICATION_COUNT_INCONSISTENT",
+      ],
+    ];
+    for (const [mutate, code] of cases) {
+      const d = copyOf(dir);
+      reseal(d, COL, mutate);
+      const c = collectorOf(d);
+      expect(c.status, code).toBe("MISMATCH");
+      expect(c.findings, code).toEqual(
+        expect.arrayContaining([`MISMATCH:${code}`, "LIMITED_BY_REDACTION:FRAME_PAYLOAD_REDACTED"]),
+      );
+      // Checked structurally only: replay is not resumed and nothing is invented.
+      expect(c, code).toMatchObject({
+        replayedFrames: 1,
+        structurallyCheckedFrames: 3,
+        epochReportCompared: false,
+        countersCompared: false,
+      });
+    }
+  });
+
+  it("O5: controls: clean and duplicate notifications, dropped notification records, and genuinely unretained frame records", async () => {
+    // A clean collection with two notifications of the same signature reproduces (G1's capture).
+    const { dir } = await shared;
+    const notes = notifications(readJson(dir, COL));
+    expect(notes.map((n) => n.signature)).toEqual([signatureOf(1), signatureOf(1)]);
+    expect(notes.map((n) => [n.sequence, n.frameSequence])).toEqual([
+      [1, 2],
+      [2, 3],
+    ]);
+    expect(collectorOf(dir)).toMatchObject({ status: "REPRODUCED", findings: [] });
+    // Notification records dropped by the collector: the retained one still links exactly.
+    const fewer = await genuineRun({ collectorLimits: { maxRetainedNotifications: 1 } });
+    expect(collectorOf(sealRun(fewer))).toMatchObject({ status: "REPRODUCED", findings: [] });
+    // Frame records dropped: valid references to unretained frames are missing, not contradicted.
+    const dropped = await genuineRun({ collectorLimits: { maxRetainedFrameRecords: 1 } });
+    const dd = sealRun(dropped);
+    const c = collectorOf(dd);
+    expect(c.status).toBe("MISSING_EVIDENCE");
+    expect(c.findings).toEqual([
+      "MISSING_EVIDENCE:FRAME_RECORDS_DROPPED",
+      "MISSING_EVIDENCE:NOTIFICATION_FRAME_NOT_RETAINED",
+    ]);
+    // ...while an invalid reference or identity in the same capture is still a contradiction,
+    // checked without the frame record.
+    const unretained: [(c: Record<string, unknown>) => void, string][] = [
+      [(o) => (notifications(o)[1]!.frameSequence = 999), "NOTIFICATION_FRAME_REFERENCE_INVALID"],
+      [(o) => (notifications(o)[0]!.sequence = 999), "NOTIFICATION_SEQUENCE_INCONSISTENT"],
+      [(o) => (notifications(o)[0]!.epoch = 2), "NOTIFICATION_EPOCH_INCONSISTENT"],
+    ];
+    for (const [mutate, code] of unretained) {
+      const bad = copyOf(dd);
+      reseal(bad, COL, mutate);
+      const cb = collectorOf(bad);
+      expect(cb.status, code).toBe("MISMATCH");
+      expect(cb.findings, code).toContain(`MISMATCH:${code}`);
+    }
+    // One retained notification claiming the second accepted frame (its time and digest copied):
+    // its position says sequence 1, but the second accepted frame is the second notification.
+    const fewerDir = sealRun(fewer);
+    const shifted = copyOf(fewerDir);
+    reseal(shifted, COL, (o) => {
+      const third = (get(o, "frameRecords", "value") as Record<string, unknown>[])[2]!;
+      Object.assign(notifications(o)[0]!, {
+        frameSequence: 3,
+        receivedAtMs: third.receivedAtMs,
+        frameSha256: third.sha256,
+      });
+    });
+    expect(collectorOf(shifted).findings).toContain("MISMATCH:NOTIFICATION_SEQUENCE_INCONSISTENT");
   });
 });
