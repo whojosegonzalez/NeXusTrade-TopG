@@ -1512,9 +1512,16 @@ interface ExchangeView {
 }
 
 /**
- * The session's body rules: a POST carries a request body (a GET none); COMPLETE and
- * PARTIAL_OVERFLOW carry a retained body with an observed size (equal to, or beyond, the
- * original), NOT_READ carries neither; `bodyComplete` is true exactly for COMPLETE.
+ * The session's body rules (`PaperRequestSession` over the accepted `readBoundedStream`):
+ * - a POST carries a request body (a GET none); `bodyComplete` is true exactly for COMPLETE;
+ * - the limit is a positive safe integer (the session refuses any other);
+ * - COMPLETE: every observed byte was retained, so the observed size equals the original body
+ *   length and is within the limit;
+ * - PARTIAL_OVERFLOW: reading stops at the first chunk that takes the observed size beyond the
+ *   limit, having retained exactly the limit, so the observed size exceeds the limit and a known
+ *   original prefix length equals it;
+ * - NOT_READ: neither a body nor an observed size.
+ * Lengths are the original byte counts, independent of any redaction of the stored bytes.
  */
 function exchangeProblem(x: ExchangeView, originalBytesOf: (p: unknown) => unknown): string | null {
   if (x.method !== "GET" && x.method !== "POST") return "EXCHANGE_METHOD_INVALID";
@@ -1529,20 +1536,21 @@ function exchangeProblem(x: ExchangeView, originalBytesOf: (p: unknown) => unkno
   }
   if (x.bodyComplete !== (x.bodyState === "COMPLETE"))
     return "EXCHANGE_BODY_COMPLETENESS_INCONSISTENT";
-  if (!isInt(x.maxResponseBytes)) return "EXCHANGE_MALFORMED";
+  if (!isInt(x.maxResponseBytes) || x.maxResponseBytes < 1) return "EXCHANGE_LIMIT_INVALID";
   if (x.bodyState === "NOT_READ") {
     return x.body === null && x.observedBodyBytes === null ? null : "EXCHANGE_BODY_INCONSISTENT";
   }
   if (!isRec(x.body)) return "EXCHANGE_BODY_MISSING";
   if (!isInt(x.observedBodyBytes)) return "EXCHANGE_BODY_INCONSISTENT";
+  const limit = x.maxResponseBytes;
+  const observed = x.observedBodyBytes;
   const original = originalBytesOf(x.body);
-  if (isInt(original)) {
-    if (x.bodyState === "COMPLETE" && x.observedBodyBytes !== original) {
-      return "EXCHANGE_BODY_INCONSISTENT";
-    }
-    if (x.bodyState === "PARTIAL_OVERFLOW" && x.observedBodyBytes <= original) {
-      return "EXCHANGE_BODY_INCONSISTENT";
-    }
+  if (x.bodyState === "COMPLETE") {
+    if (observed > limit) return "EXCHANGE_BODY_EXCEEDS_LIMIT";
+    if (isInt(original) && observed !== original) return "EXCHANGE_BODY_INCONSISTENT";
+  } else {
+    if (observed <= limit) return "EXCHANGE_OVERFLOW_WITHIN_LIMIT";
+    if (isInt(original) && original !== limit) return "EXCHANGE_PREFIX_LENGTH_INCONSISTENT";
   }
   return null;
 }

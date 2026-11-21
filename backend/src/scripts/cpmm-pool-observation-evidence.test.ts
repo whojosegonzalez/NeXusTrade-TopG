@@ -1674,7 +1674,7 @@ describe("Structural and retention boundaries (review of 84546f3)", () => {
         (x) => (x.observedBodyBytes = (x.observedBodyBytes as number) + 1),
         "EXCHANGE_BODY_INCONSISTENT",
       ],
-      [exchange, (x) => (x.maxResponseBytes = null), "EXCHANGE_MALFORMED"],
+      [exchange, (x) => (x.maxResponseBytes = null), "EXCHANGE_LIMIT_INVALID"],
       [
         exchange,
         (x) => {
@@ -1687,11 +1687,11 @@ describe("Structural and retention boundaries (review of 84546f3)", () => {
       [
         exchange,
         (x) => {
-          // A partial body whose observed size does not exceed what was retained.
+          // A partial body whose observed size does not exceed the limit.
           x.bodyState = "PARTIAL_OVERFLOW";
           (x.entry as Record<string, unknown>).bodyComplete = false;
         },
-        "EXCHANGE_BODY_INCONSISTENT",
+        "EXCHANGE_OVERFLOW_WITHIN_LIMIT",
       ],
       [TR, (t) => (record(t, isMessage).payload = null), "TRANSPORT_RECORD_PAYLOAD_MISSING"],
       [TR, (t) => delete record(t, isMessage).payload, "TRANSPORT_RECORD_PAYLOAD_MISSING"],
@@ -1900,5 +1900,198 @@ describe("Structural and retention boundaries (review of 84546f3)", () => {
       });
       expect(existsSync(path.join(input.projectRoot, "data")), expected).toBe(false);
     }
+  });
+});
+
+describe("Response-limit relationships (review of 55daf13)", () => {
+  /** The effective limit: the stricter of the lane (200,000) and the adapter's request (100,000). */
+  const LIMIT = ADAPTER_LIMITS.maxResponseBytes;
+  const exchangeFileOf = (dir: string) =>
+    (readJson(dir, CPMM_EVIDENCE_FILES.exchangeIndex).exchanges as { path: string }[])[0]!.path;
+  /** Rewrites the exchange and keeps the session window's `bodyComplete` in agreement. */
+  const rewrite = (dir: string, mutate: (x: Record<string, unknown>) => void) => {
+    const file = exchangeFileOf(dir);
+    const seq = get(readJson(dir, file), "entry", "seq");
+    reseal(dir, file, mutate);
+    const bodyComplete = get(readJson(dir, file), "entry", "bodyComplete");
+    reseal(dir, CPMM_EVIDENCE_FILES.sessionLedger, (s) => {
+      for (const e of get(s, "window", "value") as Record<string, unknown>[]) {
+        if (e.seq === seq) e.bodyComplete = bodyComplete;
+      }
+    });
+  };
+  const partial = (observed: (o: number) => number, limit: (o: number) => number) => {
+    return (x: Record<string, unknown>) => {
+      const original = get(x, "body", "originalBytes") as number;
+      x.bodyState = "PARTIAL_OVERFLOW";
+      (x.entry as Record<string, unknown>).bodyComplete = false;
+      x.observedBodyBytes = observed(original);
+      x.maxResponseBytes = limit(original);
+    };
+  };
+
+  it("N6: limits and observed sizes that the bounded reader cannot produce fail integrity", async () => {
+    const { dir } = await shared;
+    const clean = readJson(dir, exchangeFileOf(dir));
+    expect(clean).toMatchObject({ bodyState: "COMPLETE", maxResponseBytes: LIMIT });
+    expect(clean.observedBodyBytes).toBe(get(clean, "body", "originalBytes"));
+    const cases: [(x: Record<string, unknown>) => void, string][] = [
+      // The review's reproduction: the clean 2,373-byte complete response under a limit of 1 or 0.
+      [(x) => (x.maxResponseBytes = 1), "EXCHANGE_BODY_EXCEEDS_LIMIT"],
+      [(x) => (x.maxResponseBytes = 0), "EXCHANGE_LIMIT_INVALID"],
+      [(x) => (x.maxResponseBytes = -1), "EXCHANGE_LIMIT_INVALID"],
+      [(x) => (x.maxResponseBytes = 1.5), "EXCHANGE_LIMIT_INVALID"],
+      [(x) => (x.maxResponseBytes = String(LIMIT)), "EXCHANGE_LIMIT_INVALID"],
+      [
+        (x) => (x.maxResponseBytes = (x.observedBodyBytes as number) - 1),
+        "EXCHANGE_BODY_EXCEEDS_LIMIT",
+      ],
+      // The review's second reproduction: an overflow claimed one byte past the original, far
+      // below the limit, with the session window in agreement.
+      [
+        partial(
+          (o) => o + 1,
+          () => LIMIT,
+        ),
+        "EXCHANGE_OVERFLOW_WITHIN_LIMIT",
+      ],
+      [
+        partial(
+          (o) => o,
+          (o) => o,
+        ),
+        "EXCHANGE_OVERFLOW_WITHIN_LIMIT",
+      ],
+      // Beyond the limit, but the retained prefix is not the limit's length.
+      [
+        partial(
+          (o) => o + 1,
+          (o) => o - 1,
+        ),
+        "EXCHANGE_PREFIX_LENGTH_INCONSISTENT",
+      ],
+      [
+        partial(
+          (o) => o + 10,
+          (o) => o + 1,
+        ),
+        "EXCHANGE_PREFIX_LENGTH_INCONSISTENT",
+      ],
+    ];
+    for (const [mutate, expected] of cases) {
+      const d = copyOf(dir);
+      rewrite(d, mutate);
+      const v = verifyCpmmObservationEvidence(d);
+      expect(v.integrity.problems, expected).toContain(expected);
+      expect(v.retention, expected).toEqual({ status: "NOT_EVALUATED", reasons: [] });
+    }
+    // The shape the bounded reader does produce (prefix = limit < observed) is accepted, and
+    // retention says the body is partial.
+    const ok = copyOf(dir);
+    rewrite(
+      ok,
+      partial(
+        (o) => o + 1,
+        (o) => o,
+      ),
+    );
+    const v = verifyCpmmObservationEvidence(ok);
+    expect(v.integrity).toEqual({ ok: true, problems: [] });
+    expect(v.retention.reasons).toEqual(["EXCHANGE_BODY_PARTIAL"]);
+  });
+
+  it("N7: sealing refuses the same limit relationships before any directory exists", async () => {
+    const { run } = await shared;
+    const cases: [(x: Record<string, unknown>) => void, string][] = [
+      [(x) => (x.maxResponseBytes = 1), "EXCHANGE_BODY_EXCEEDS_LIMIT"],
+      [(x) => (x.maxResponseBytes = 0), "EXCHANGE_LIMIT_INVALID"],
+      [
+        (x) => {
+          x.bodyState = "PARTIAL_OVERFLOW";
+          (x.entry as Record<string, unknown>).bodyComplete = false;
+          x.observedBodyBytes = (get(x, "body", "byteLength") as number) + 1;
+        },
+        "EXCHANGE_OVERFLOW_WITHIN_LIMIT",
+      ],
+      [
+        (x) => {
+          const original = get(x, "body", "byteLength") as number;
+          x.bodyState = "PARTIAL_OVERFLOW";
+          (x.entry as Record<string, unknown>).bodyComplete = false;
+          x.observedBodyBytes = original + 1;
+          x.maxResponseBytes = original - 1;
+        },
+        "EXCHANGE_PREFIX_LENGTH_INCONSISTENT",
+      ],
+    ];
+    for (const [mutate, expected] of cases) {
+      const s = JSON.parse(JSON.stringify(run.snapshot)) as Record<string, unknown>;
+      mutate((s.exchanges as Record<string, unknown>[])[0]!);
+      const input = sealInput(s as unknown as CpmmObservationSnapshot, run.recorder);
+      expect(sealCpmmObservationEvidence(input), expected).toMatchObject({
+        ok: false,
+        status: "SEAL_INPUT_INVALID",
+        code: `SNAPSHOT_STRUCTURE_INVALID:${expected}`,
+      });
+      expect(existsSync(path.join(input.projectRoot, "data")), expected).toBe(false);
+    }
+  });
+
+  it("N8: controls: an empty complete body, completion exactly at the limit, overflow by one byte, and a redacted body", async () => {
+    const cases: [string, Responder, string, number, number, string[]][] = [
+      ["empty", async () => new Response("", { status: 200 }), "COMPLETE", 0, 0, []],
+      [
+        "at the limit",
+        async () => new Response("x".repeat(LIMIT), { status: 200 }),
+        "COMPLETE",
+        LIMIT,
+        LIMIT,
+        [],
+      ],
+      [
+        "one byte beyond",
+        async () => new Response("x".repeat(LIMIT + 1), { status: 200 }),
+        "PARTIAL_OVERFLOW",
+        LIMIT + 1,
+        LIMIT,
+        ["EXCHANGE_BODY_PARTIAL"],
+      ],
+    ];
+    for (const [label, responder, state, observed, original, reasons] of cases) {
+      const run = await genuineRun({ responder });
+      const r = sealCpmmObservationEvidence(sealInput(run.snapshot, run.recorder));
+      expect(r.ok, label).toBe(true);
+      if (!r.ok) continue;
+      const ex = readJson(r.outDir, exchangeFileOf(r.outDir));
+      expect(ex, label).toMatchObject({
+        bodyState: state,
+        observedBodyBytes: observed,
+        maxResponseBytes: LIMIT,
+        body: { originalBytes: original },
+      });
+      const v = verifyCpmmObservationEvidence(r.outDir);
+      expect(v.integrity, label).toEqual({ ok: true, problems: [] });
+      expect(v.retention, label).toEqual({
+        status: reasons.length === 0 ? "COMPLETE" : "INCOMPLETE",
+        reasons,
+      });
+      expect(v.rederivation).toEqual({ status: "NOT_IMPLEMENTED" });
+      expect(v.flags).toEqual(CPMM_EVIDENCE_FALSE_FLAGS);
+    }
+    // Redaction changes the stored length; the rules compare original byte counts.
+    const run = await genuineRun({
+      responder: async ({ id }) =>
+        new Response(JSON.stringify({ jsonrpc: "2.0", id, result: null, note: SECRET }), {
+          status: 200,
+        }),
+    });
+    const r = sealCpmmObservationEvidence(sealInput(run.snapshot, run.recorder));
+    expect(r.ok).toBe(true);
+    if (!r.ok) return;
+    const ex = readJson(r.outDir, exchangeFileOf(r.outDir));
+    expect(ex.body).toMatchObject({ payloadRedacted: true });
+    expect(get(ex, "body", "storedBytes")).not.toBe(get(ex, "body", "originalBytes"));
+    expect(ex.observedBodyBytes).toBe(get(ex, "body", "originalBytes"));
+    expect(verifyCpmmObservationEvidence(r.outDir).integrity).toEqual({ ok: true, problems: [] });
   });
 });
