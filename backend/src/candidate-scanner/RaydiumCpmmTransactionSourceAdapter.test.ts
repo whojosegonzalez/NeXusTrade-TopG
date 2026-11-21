@@ -2082,4 +2082,127 @@ describe("Raydium CPMM transaction source adapter (synthetic, offline)", () => {
     expect(h.adapter.reservedSignatureCount).toBe(1);
     expect(h.ledger()).toHaveLength(1);
   });
+  /** A valid swap response for notice(1) with id 7, and the matching analysis input. */
+  const swapCase = () => {
+    const bytes = Buffer.from(
+      JSON.stringify({ jsonrpc: "2.0", id: 7, result: txResult(signatureOf(1), [swapIx("BUY")]) }),
+    );
+    return analysisInput(1, 7, bytes);
+  };
+
+  it("T-25 (G2 review): the pool context is validated and snapshotted without running caller code", () => {
+    // The ordinary context still analyses (and the caller's pool object is neither frozen nor changed).
+    const callerPool = structuredCloneable(POOL);
+    const ordinary = analyzeCpmmTransactionResponse({ ...swapCase(), pool: callerPool });
+    expect(ordinary.status === "ANALYZED" && ordinary.kind).toBe("RESOLVED_SWAPS");
+    expect(Object.isFrozen(callerPool)).toBe(false);
+    expect(Object.isFrozen(callerPool.verification)).toBe(false);
+    expect(callerPool).toEqual(POOL);
+
+    let runs = 0;
+    const traps = { n: 0 };
+    const counting = <T extends object>(t: T): T =>
+      new Proxy(t, {
+        get: (o, k, r) => (traps.n++, Reflect.get(o, k, r)),
+        has: (o, k) => (traps.n++, Reflect.has(o, k)),
+        ownKeys: (o) => (traps.n++, Reflect.ownKeys(o)),
+        getOwnPropertyDescriptor: (o, k) => (traps.n++, Reflect.getOwnPropertyDescriptor(o, k)),
+        getPrototypeOf: (o) => (traps.n++, Reflect.getPrototypeOf(o)),
+      });
+    const okGetter = structuredCloneable(POOL) as unknown as Record<string, unknown>;
+    Object.defineProperty(okGetter, "ok", { get: () => (runs++, true), enumerable: true });
+    const flagGetter = structuredCloneable(POOL);
+    Object.defineProperty(flagGetter.verification, "ownerVerified", {
+      get: () => (runs++, true),
+      enumerable: true,
+    });
+    const nestedProxy = {
+      ...structuredCloneable(POOL),
+      verification: counting({ ...POOL.verification }),
+    };
+    const addressGetter = structuredCloneable(POOL) as unknown as Record<string, unknown>;
+    Object.defineProperty(addressGetter, "baseVaultAddress", {
+      get: () => (runs++, POOL.baseVaultAddress),
+      enumerable: true,
+    });
+    const unconsumedGetter = structuredCloneable(POOL) as unknown as Record<string, unknown>;
+    Object.defineProperty(unconsumedGetter, "lpSupply", {
+      get: () => (runs++, 1n),
+      enumerable: true,
+    });
+    const symbolKey = { ...structuredCloneable(POOL), [Symbol("x")]: 1 };
+    const classPool = Object.assign(Object.create({ inherited: 1 }), structuredCloneable(POOL));
+    const arrayVerification = {
+      ...structuredCloneable(POOL),
+      verification: [true, true, true, true],
+    };
+    for (const [label, pool] of [
+      ["ok getter", okGetter],
+      ["verification flag getter", flagGetter],
+      ["verification proxy", nestedProxy],
+      ["consumed address getter", addressGetter],
+      ["unconsumed field getter", unconsumedGetter],
+      ["symbol key", symbolKey],
+      ["non-plain prototype", classPool],
+      ["array verification", arrayVerification],
+    ] as const) {
+      const r = analyzeCpmmTransactionResponse({ ...swapCase(), pool });
+      expect(r, label).toEqual({
+        status: "INPUT_INVALID",
+        code: "POOL_CONTEXT_INVALID",
+        scope: "RESPONSE_VALIDATION_AND_DECODING_ONLY",
+      });
+    }
+    expect(runs).toBe(0);
+    expect(traps.n).toBe(0);
+    // The accepted live constructor is unchanged: it still accepts the ordinary context.
+    expect(() => harness()).not.toThrow();
+  });
+
+  it("T-26 (G2 review): revoked proxies in every input position are refused with fixed codes", () => {
+    const revoked = <T extends object>(t: T): T => {
+      const r = Proxy.revocable(t, {});
+      r.revoke();
+      return r.proxy;
+    };
+    const base = swapCase();
+    const cases: [unknown, string][] = [
+      [{ ...base, secrets: revoked([...SECRETS]) }, "SECRETS_INVALID"],
+      [revoked({ ...base }), "INPUT_NOT_PLAIN_DATA"],
+      [{ ...base, notification: revoked(notice(1)) }, "NOTIFICATION_NOT_PLAIN_DATA"],
+      [{ ...base, pool: revoked({ ...POOL }) }, "POOL_CONTEXT_INVALID"],
+      [
+        {
+          ...base,
+          pool: { ...structuredCloneable(POOL), verification: revoked({ ...POOL.verification }) },
+        },
+        "POOL_CONTEXT_INVALID",
+      ],
+      [{ ...base, responseBytes: revoked(Buffer.from("{}")) }, "RESPONSE_BYTES_INVALID"],
+      [{ ...base, jsonRpcId: revoked({}) }, "JSON_RPC_ID_INVALID"],
+      [{ ...base, maxResponseBytes: revoked({}) }, "MAX_RESPONSE_BYTES_INVALID"],
+    ];
+    for (const [input, code] of cases) {
+      let r: unknown;
+      expect(() => {
+        r = analyzeCpmmTransactionResponse(input);
+      }, code).not.toThrow();
+      expect(r, code).toEqual({
+        status: "INPUT_INVALID",
+        code,
+        scope: "RESPONSE_VALIDATION_AND_DECODING_ONLY",
+      });
+    }
+    // The valid input still analyses.
+    const ok = analyzeCpmmTransactionResponse(base);
+    expect(ok.status === "ANALYZED" && ok.kind).toBe("RESOLVED_SWAPS");
+  });
 });
+
+/** A structural copy of a pool context (bigints kept) whose nested objects are fresh. */
+function structuredCloneable(pool: RaydiumCpmmPoolStateSuccess): RaydiumCpmmPoolStateSuccess {
+  return {
+    ...pool,
+    verification: { ...pool.verification, slotProvenance: { ...pool.verification.slotProvenance } },
+  };
+}

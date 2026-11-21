@@ -1436,7 +1436,8 @@ function boundedBytesCopy(v: unknown, max: number): Buffer | string {
 
 /** A genuine, non-proxy array of own data-property strings; null otherwise (no getter runs). */
 function readStringArray(v: unknown): string[] | null {
-  if (!Array.isArray(v) || isProxy(v) || Object.getPrototypeOf(v) !== Array.prototype) return null;
+  // The proxy check comes first: Array.isArray throws on a revoked proxy.
+  if (isProxy(v) || !Array.isArray(v) || Object.getPrototypeOf(v) !== Array.prototype) return null;
   const ld = Object.getOwnPropertyDescriptor(v, "length");
   if (!ld || !("value" in ld) || !isSafeNonNegative(ld.value) || ld.value > MAX_SECRETS) {
     return null;
@@ -1448,6 +1449,54 @@ function readStringArray(v: unknown): string[] | null {
     out.push(d.value);
   }
   return out;
+}
+
+/** Own data properties of a plain, non-proxy record; null otherwise. No getter or trap runs. */
+function safeDataRecord(v: unknown): Record<string, unknown> | null {
+  if (typeof v !== "object" || v === null || isProxy(v)) return null;
+  try {
+    return readDataRecord(v);
+  } catch {
+    return null;
+  }
+}
+
+/** The pool fields the accepted decoder reads (`validatePool`), and its verification flags. */
+const POOL_CONSUMED_KEYS = [
+  "ok",
+  "poolAddress",
+  "candidateMint",
+  "wsolMint",
+  "orientation",
+  "baseDecimals",
+  "quoteDecimals",
+  "baseVaultAddress",
+  "quoteVaultAddress",
+] as const;
+const VERIFICATION_CONSUMED_KEYS = [
+  "ownerVerified",
+  "vaultAuthoritiesVerified",
+  "tokenProgramsVerified",
+  "authBumpVerified",
+] as const;
+
+/**
+ * A stable snapshot of the pool context for the decoder: the pool and its `verification` object
+ * must be plain, non-proxy records of own data properties (any accessor or symbol key refuses);
+ * only the fields the decoder consumes are copied. The caller's objects are neither read through
+ * getters nor mutated or frozen.
+ */
+function snapshotPoolContext(v: unknown): RaydiumCpmmPoolStateSuccess | null {
+  const pool = safeDataRecord(v);
+  if (pool === null) return null;
+  const verification = safeDataRecord(pool.verification);
+  if (verification === null) return null;
+  const snapshot: Record<string, unknown> = {};
+  for (const k of POOL_CONSUMED_KEYS) snapshot[k] = pool[k];
+  const flags: Record<string, unknown> = {};
+  for (const k of VERIFICATION_CONSUMED_KEYS) flags[k] = verification[k];
+  snapshot.verification = flags;
+  return deepFreeze(snapshot) as unknown as RaydiumCpmmPoolStateSuccess;
 }
 
 /**
@@ -1479,10 +1528,9 @@ export function analyzeCpmmTransactionResponse(input: unknown): CpmmTransactionR
   if (typeof id !== "number" || !Number.isSafeInteger(id) || id < 1) {
     return invalid("JSON_RPC_ID_INVALID");
   }
-  if (typeof r.pool !== "object" || r.pool === null || isProxy(r.pool)) {
-    return invalid("POOL_CONTEXT_INVALID");
-  }
-  const pool = r.pool as RaydiumCpmmPoolStateSuccess;
+  // Validated and snapshotted before the first probe: the decoder only ever sees the snapshot.
+  const pool = snapshotPoolContext(r.pool);
+  if (pool === null) return invalid("POOL_CONTEXT_INVALID");
   let probeOk = false;
   try {
     const probe = decodeRaydiumCpmmTransactionSwaps(null, pool, { receiptTimestampMs: 1 });

@@ -6501,7 +6501,7 @@ Mutation checks for the corrections: all 11 caught.
 > - **Notification collection**: passive, bounded, exact-pool CPMM notification collector ([`CpmmPoolNotificationCollector.ts`](file:///u:/Projects/TopG/backend/src/candidate-scanner/CpmmPoolNotificationCollector.ts), 23/23 tests; 22/22 original targeted mutants caught, and 16 of 17 review mutants caught with 1 equivalent) implemented and verified offline on 2026-11-19 (item 14), then corrected after an offline review of `b06108c` (genuine byte-view validation through internal slots, close-time chronology, `BUILT_UNOBSERVED`). It binds one owner-supplied pool and mint, one epoch and one acknowledged subscription, checks acquisition limits before copying or decoding, gives every frame an explicit disposition, forwards failed-status claims while keeping them blocking, never produces a block time, and retains metadata only (no raw replay). It owns no connection, sends no request, never calls the ledger and establishes no completeness.
 > - **Connection owner**: bounded, single-connection CPMM connection owner ([`CpmmPoolConnectionOwner.ts`](file:///u:/Projects/TopG/backend/src/candidate-scanner/CpmmPoolConnectionOwner.ts), 55/55 tests) implemented and verified offline on 2026-11-20 (item 15), then corrected the same day for three lifecycle defects found in review of `dfeee4c`: deadlines are now enforced before anything is admitted, ingested or credited, clock regression and invalid time are latched as blocking, and settlement waits for every unfinished external call (item 15 M). A finalization defect found in review of `5aaeef1` was also corrected: cancellation, session stop, ownership and the clock are rechecked after the final listener disposal and before the report is frozen (item 15 N), with read-only `getBinding()` accessors on the collector and ledger. Independent review of `446eec4` accepted the isolated owner and its finalization correction, with the 205 focused tests, the backend typecheck and independent lifecycle reproductions passing. It drives one injected dormant, detachable transport, verifies the three bindings and exclusive epoch ownership, applies one-time deadlines through authoritative checks, feeds the collector, hands every accepted envelope to the ledger or counts it as explicitly unprocessed, and reports a strict clean-run predicate. It is not wired: there is no real transport wrapper, endpoint lookup, sealing or operator command, and no transport, request or capture is authorized.
 > - **Transport wrapper**: bounded CPMM WebSocket transport wrapper ([`CpmmPoolWebSocketTransport.ts`](file:///u:/Projects/TopG/backend/src/candidate-scanner/CpmmPoolWebSocketTransport.ts), 22/22 tests including the real accepted owner over it; 34 of 36 targeted mutants caught, the 2 survivors not observable) implemented and verified offline on 2026-11-20 (item 16). It uses an injected `ws`-compatible client constructor, constructs nothing before `start()`, passes a complete bounded option set, copies messages byte-for-byte under exact bounds, reports only fixed error categories, translates a latched local payload refusal to 1009 at the actual close, and keeps `readyState` truthful. Independent review of `87b50b3` accepted the isolated wrapper, with the 227 focused tests, the backend typecheck, 81 additional checks, static compatibility with the installed `ws` constructor and the runtime pin check passing. It is not wired: no production constructor, endpoint, sealing or operator command, and no socket, request or capture is authorized.
-> - **Evidence recording, sealing and re-derivation**: contract and synthetic test plan proposed (item 17) and corrected after review. Recording would be by composition: a transport decorator recording each event once, a delegating ledger and an inspectable session exchange-observer fan-out. Of its prerequisites, only G2 is implemented: the pure adapter export `analyzeCpmmTransactionResponse`, which shares the live adapter's response validation and decoding, returns an unbranded analysis that `ingest()` refuses, and proves response validation and decoding only (25/25 adapter tests, 15 of 15 targeted mutants caught). The recorder, sanitizer and sealer are not implemented; G1 and G5 are out of scope, and G3 (pool-account acquisition) remains open.
+> - **Evidence recording, sealing and re-derivation**: contract and synthetic test plan proposed (item 17) and corrected after review. Recording would be by composition: a transport decorator recording each event once, a delegating ledger and an inspectable session exchange-observer fan-out. Of its prerequisites, only G2 is implemented: the pure adapter export `analyzeCpmmTransactionResponse`, which shares the live adapter's response validation and decoding, returns an unbranded analysis that `ingest()` refuses, and proves response validation and decoding only. Its pool context is validated and snapshotted without running caller code, and revoked proxies are refused in every input position (review of `9f50e24`). Results: 27/27 adapter tests; 20 of 20 targeted mutants caught across the export and its review corrections. The recorder, sanitizer and sealer are not implemented; G1 and G5 are out of scope, and G3 (pool-account acquisition) remains open.
 >   Raydium CPMM targets remain strictly **quarantined from strategy admission** until swap flow decoding, LP evidence, and security evaluation are complete, tested, and independently reviewed. The existing market parser rejection of the `"CPMM"` label in `DexScreenerSingleCandidateMarketParser.ts` remains active and unmodified; coordinator, runner, and live admission paths remain completely unconnected and unchanged.
 
 Raydium CPMM (`CPMMoo8L3F4NbTegBCKVNunggL7H1ZpdTHKxQB5qKP1C`) represents Raydium's modern constant-product AMM architecture. Below is the documentation for the implemented Stage 1 adapter (`RaydiumCpmmPoolStateAdapter.ts`), Stage 2 pure market parser (`DexScreenerCpmmCandidateMarketParser.ts`), and proposed Stage 3 swap decoder (`RaydiumCpmmSwapDecoder.ts`) with their verified acceptance tests, contracts, and explicit behavioral invariants.
@@ -9937,11 +9937,11 @@ This capture is observation and decoding evidence. It does not establish notific
 - **Inputs** (plain data only; unknown or missing keys refused):
   - the full notification (signature, slot, receipt time, optional blockTime), validated by the adapter's own rule;
   - the expected JSON-RPC id (a positive safe integer);
-  - the pool context (refused if proxied, then probed exactly as the constructor does);
+  - the pool context. The pool and its `verification` object must be plain, non-proxy records of own data properties, and any accessor or symbol key refuses without being run. Only the fields the accepted decoder consumes are copied into a frozen snapshot. That snapshot is then probed exactly as the constructor probes the pool, and used for classification. The caller's objects are neither read through getters nor mutated or frozen (corrected in the review of `9f50e24`);
   - the response bytes: a genuine `Uint8Array`, read through captured intrinsics, bounded by `maxResponseBytes` (at most `CPMM_MAX_ANALYSIS_RESPONSE_BYTES`, 64 MiB) before any copy, and copied;
   - the secrets (the constructor's rule, read without running getters).
 
-  Top-level proxies are refused before any trap runs. Refusals are `INPUT_INVALID` with a fixed code.
+  Proxies, including revoked ones, are refused in every input position before any operation that could run a trap or throw. Refusals are `INPUT_INVALID` with a fixed code.
 
 - **Result**: an unbranded, deep-frozen `ANALYZED` record. It contains:
   - the fact's kind, code, detail, RPC error code (never the message), decoder status, events and replay;
@@ -9953,7 +9953,7 @@ This capture is observation and decoding evidence. It does not establish notific
 
 - **Limits**: a body that decodes here may belong to a runtime `LATE_RESPONSE` record; that is not automatically a mismatch.
 
-**Tests** (adapter suite, 25):
+**Tests** (adapter suite, 27; T-25 and T-26 below):
 
 - **T-21**: live and pure agree on unchanged ids and bytes for 16 response outcomes:
   - swaps, no target swap, failed transaction and decoder unresolved;
@@ -9975,18 +9975,37 @@ This capture is observation and decoding evidence. It does not establish notific
 - removing the shared id comparison, or turning shared credential withholding into a malformed response;
 - skipping the live lifecycle check.
 
-**Results** (2026-11-20, each command under an external 60-second limit):
+**Review corrections (review of `9f50e24`)**: two defects in the new export, both reproduced by new tests that fail on `9f50e24` and pass now.
+
+1. **Pool inspection ran caller code.**
+   - **Defect**: only the top-level pool was checked for a proxy, and the original object went to the decoder probe, which reads pool fields and the nested `verification` object directly. A getter on `pool.ok` or `pool.verification.ownerVerified` ran and the analysis returned `RESOLVED_SWAPS`. A counting proxy around `verification` ran eight traps.
+   - **Fix**: the pool context is snapshotted before the first probe (item above). The accepted decoder and the live constructor are unchanged.
+   - **T-25**: getters on `ok`, a verification flag, a consumed address and an unconsumed field; a proxied `verification`; a symbol key; a non-plain prototype; and an array `verification`. Each now returns `POOL_CONTEXT_INVALID` with zero getter runs and zero proxy traps. The ordinary context still analyses (`RESOLVED_SWAPS`), and the caller's pool is neither frozen nor changed. On `9f50e24`, the getter on `ok` analysed to `RESOLVED_SWAPS`.
+2. **A revoked secrets proxy escaped validation.**
+   - **Defect**: `readStringArray()` called `Array.isArray` before the proxy check, and `Array.isArray` throws on a revoked proxy. On `9f50e24` this surfaced as an uncaught `TypeError: Cannot perform 'IsArray' on a proxy that has been revoked`.
+   - **Fix**: the proxy check comes first.
+   - **T-26**: revoked proxies as the whole input, the notification, the pool, the nested `verification`, the secrets, the response bytes, the JSON-RPC id and the body limit. Each returns `INPUT_INVALID` with its fixed code (`INPUT_NOT_PLAIN_DATA`, `NOTIFICATION_NOT_PLAIN_DATA`, `POOL_CONTEXT_INVALID`, `SECRETS_INVALID`, `RESPONSE_BYTES_INVALID`, `JSON_RPC_ID_INVALID`, `MAX_RESPONSE_BYTES_INVALID`), without throwing.
+
+Valid contexts, response outcomes, byte bounds, validation order and `FOREIGN_FACT` protection are unchanged; T-21 to T-24 pass unchanged. Five targeted mutants of the new guards were all killed:
+
+- `Array.isArray` before the proxy check;
+- no snapshot (top-level proxy check only);
+- `verification` copied without validation;
+- records read without the proxy check;
+- freezing the caller's pool instead of the snapshot.
+
+**Results** (2026-11-20, each command under an external 60-second limit; updated after the review corrections):
 
 | Check                                                                                                                  | Result                                               |
 | ---------------------------------------------------------------------------------------------------------------------- | ---------------------------------------------------- |
-| Adapter suite                                                                                                          | 25/25                                                |
-| Focused set: wrapper, owner, collector, ledger, decoder, adapter, tracker, `fresh-amm-v4-watch`, `paper-pilot-handoff` | 231/231 (22 + 55 + 24 + 25 + 16 + 25 + 40 + 11 + 13) |
+| Adapter suite                                                                                                          | 27/27                                                |
+| Focused set: wrapper, owner, collector, ledger, decoder, adapter, tracker, `fresh-amm-v4-watch`, `paper-pilot-handoff` | 233/233 (22 + 55 + 24 + 25 + 16 + 27 + 40 + 11 + 13) |
 | Backend typecheck (`tsc --noEmit`)                                                                                     | Clean                                                |
 | ESLint and Prettier on the two changed source and test files                                                           | Clean                                                |
 | Pin (`paper-pilot-handoff`, including H-12)                                                                            | 13/13 (no pin change)                                |
 | Wallet `.tmp/virtual-wallet.json`                                                                                      | Unchanged (`7F2C2353…ED9`)                           |
 
-No recorder, sanitizer, sealer, session, ledger, owner, pin, configuration or dependency change was made, and no request, socket, capture, wallet change or operator command was run.
+No recorder, sanitizer, sealer, session, ledger, owner, decoder, pin, configuration or dependency change was made, and no request, socket, capture, wallet change or operator command was run.
 
 ---
 
