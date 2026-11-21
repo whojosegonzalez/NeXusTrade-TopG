@@ -6491,7 +6491,7 @@ Mutation checks for the corrections: all 11 caught.
 #### 8.38.17 CPMM Support Reassessment: Implemented Pool-State Adapter, Pure Market Parser, Isolated Swap Decoder, Transaction Source Adapter and Resolution Accounting Ledger
 
 > [!IMPORTANT]
-> **Status: PRELIMINARY REASSESSMENT (STAGES 1–3 AND TRANSACTION RESOLUTION AND RESOLUTION ACCOUNTING IMPLEMENTED & VERIFIED OFFLINE AS ISOLATED MODULES; NOTIFICATION COLLECTION IMPLEMENTED & VERIFIED OFFLINE AS AN ISOLATED PASSIVE MODULE; CONNECTION OWNER IMPLEMENTED, VERIFIED OFFLINE AND ACCEPTED IN REVIEW AS AN ISOLATED MODULE; TRANSPORT WRAPPER IMPLEMENTED, VERIFIED OFFLINE AND ACCEPTED IN REVIEW AS AN ISOLATED MODULE; EVIDENCE RECORDING, SEALING AND RE-DERIVATION CONTRACT PROPOSED (ITS PURE RESPONSE-ANALYSIS AND CREDENTIAL-SANITIZER PREREQUISITES AND THE IN-MEMORY RECORDER IMPLEMENTED; NO SEALER); NOT CONNECTED TO FLOW OR ADMISSION).**
+> **Status: PRELIMINARY REASSESSMENT (STAGES 1–3 AND TRANSACTION RESOLUTION AND RESOLUTION ACCOUNTING IMPLEMENTED & VERIFIED OFFLINE AS ISOLATED MODULES; NOTIFICATION COLLECTION IMPLEMENTED & VERIFIED OFFLINE AS AN ISOLATED PASSIVE MODULE; CONNECTION OWNER IMPLEMENTED, VERIFIED OFFLINE AND ACCEPTED IN REVIEW AS AN ISOLATED MODULE; TRANSPORT WRAPPER IMPLEMENTED, VERIFIED OFFLINE AND ACCEPTED IN REVIEW AS AN ISOLATED MODULE; EVIDENCE RECORDING, SEALING AND RE-DERIVATION CONTRACT PROPOSED (PARTIALLY IMPLEMENTED: ITS PURE RESPONSE-ANALYSIS AND CREDENTIAL-SANITIZER PREREQUISITES, THE IN-MEMORY RECORDER, AND OFFLINE SEALING WITH INTEGRITY VERIFICATION; NO COMPONENT RE-DERIVATION); NOT CONNECTED TO FLOW OR ADMISSION).**
 >
 > - **Stage 1**: Pure pool-state adapter ([`RaydiumCpmmPoolStateAdapter.ts`](file:///u:/Projects/TopG/backend/src/candidate-scanner/RaydiumCpmmPoolStateAdapter.ts), 40/40 tests) implemented and verified offline at commit `52809e64`.
 > - **Stage 2**: Pure CPMM market parser ([`DexScreenerCpmmCandidateMarketParser.ts`](file:///u:/Projects/TopG/backend/src/candidate-scanner/DexScreenerCpmmCandidateMarketParser.ts), 43/43 tests) implemented and verified offline at commit `06b0ea6c`.
@@ -6501,7 +6501,7 @@ Mutation checks for the corrections: all 11 caught.
 > - **Notification collection**: passive, bounded, exact-pool CPMM notification collector ([`CpmmPoolNotificationCollector.ts`](file:///u:/Projects/TopG/backend/src/candidate-scanner/CpmmPoolNotificationCollector.ts), 23/23 tests; 22/22 original targeted mutants caught, and 16 of 17 review mutants caught with 1 equivalent) implemented and verified offline on 2026-11-19 (item 14), then corrected after an offline review of `b06108c` (genuine byte-view validation through internal slots, close-time chronology, `BUILT_UNOBSERVED`). It binds one owner-supplied pool and mint, one epoch and one acknowledged subscription, checks acquisition limits before copying or decoding, gives every frame an explicit disposition, forwards failed-status claims while keeping them blocking, never produces a block time, and retains metadata only (no raw replay). It owns no connection, sends no request, never calls the ledger and establishes no completeness.
 > - **Connection owner**: bounded, single-connection CPMM connection owner ([`CpmmPoolConnectionOwner.ts`](file:///u:/Projects/TopG/backend/src/candidate-scanner/CpmmPoolConnectionOwner.ts), 55/55 tests) implemented and verified offline on 2026-11-20 (item 15), then corrected the same day for three lifecycle defects found in review of `dfeee4c`: deadlines are now enforced before anything is admitted, ingested or credited, clock regression and invalid time are latched as blocking, and settlement waits for every unfinished external call (item 15 M). A finalization defect found in review of `5aaeef1` was also corrected: cancellation, session stop, ownership and the clock are rechecked after the final listener disposal and before the report is frozen (item 15 N), with read-only `getBinding()` accessors on the collector and ledger. Independent review of `446eec4` accepted the isolated owner and its finalization correction, with the 205 focused tests, the backend typecheck and independent lifecycle reproductions passing. It drives one injected dormant, detachable transport, verifies the three bindings and exclusive epoch ownership, applies one-time deadlines through authoritative checks, feeds the collector, hands every accepted envelope to the ledger or counts it as explicitly unprocessed, and reports a strict clean-run predicate. It is not wired: there is no real transport wrapper, endpoint lookup, sealing or operator command, and no transport, request or capture is authorized.
 > - **Transport wrapper**: bounded CPMM WebSocket transport wrapper ([`CpmmPoolWebSocketTransport.ts`](file:///u:/Projects/TopG/backend/src/candidate-scanner/CpmmPoolWebSocketTransport.ts), 22/22 tests including the real accepted owner over it; 34 of 36 targeted mutants caught, the 2 survivors not observable) implemented and verified offline on 2026-11-20 (item 16). It uses an injected `ws`-compatible client constructor, constructs nothing before `start()`, passes a complete bounded option set, copies messages byte-for-byte under exact bounds, reports only fixed error categories, translates a latched local payload refusal to 1009 at the actual close, and keeps `readyState` truthful. Independent review of `87b50b3` accepted the isolated wrapper, with the 227 focused tests, the backend typecheck, 81 additional checks, static compatibility with the installed `ws` constructor and the runtime pin check passing. It is not wired: no production constructor, endpoint, sealing or operator command, and no socket, request or capture is authorized.
-> - **Evidence recording, sealing and re-derivation**: contract and synthetic test plan proposed (item 17) and corrected after review. Recording would be by composition: a transport decorator recording each event once, a delegating ledger and an inspectable session exchange-observer fan-out. Of its prerequisites, only G2 is implemented: the pure adapter export `analyzeCpmmTransactionResponse`, which shares the live adapter's response validation and decoding, returns an unbranded analysis that `ingest()` refuses, and proves response validation and decoding only. Its pool context is validated and snapshotted without running caller code, and revoked proxies are refused in every input position (review of `9f50e24`). A second review (of `e612042`) made every consumed pool field's primitive type a condition before anything is frozen. Results: 28/28 adapter tests; 21 of 24 targeted mutants caught across the export and its review corrections, with the 3 survivors redundant with, or equivalent under, the accepted decoder's strict checks. Independent review accepted the export and its corrections. The item D credential-sanitizer prerequisite is also implemented offline (`evidence-credential-sanitizer.ts`; 21/21 tests. A review of `bafc6ec` closed two credential-leak paths: Unicode credentials recovered through escape decoding, and encoded URL components. A review of `c3bdae7` closed a third: context-sensitive lower-casing of the Greek capital sigma. Mutants: 18 of 21 original, 13 of 13 for the first corrections and 7 of 9 for the second caught; the survivors are not observable or redundant by design), with no consumer and no migration. Independent review accepted the sanitizer for its documented coverage and limits. The in-memory observation recorder and the exchange-observer fan-out are now implemented offline (`CpmmPoolObservationRecorder.ts`; 21/21 tests, including the real owner, wrapper, collector, ledger, adapter and session; 26 of 26 original and 12 of 12 finalization-boundary mutants caught; item M), with no production factory and no consumer. It records each wrapper event once with explicit owner-delivery correlation, returns the ledger's original promise, and makes no replay or qualification claim. A review of `c7518fe` found that `finish()` called from inside a callback snapshotted an unfinished outcome; `finish()` is now refused while an owner listener or completion callback runs through the recorder. The sealer is not implemented; G1 and G5 are out of scope, and G3 (pool-account acquisition) remains open.
+> - **Evidence recording, sealing and re-derivation**: contract and synthetic test plan proposed (item 17) and corrected after review. Recording would be by composition: a transport decorator recording each event once, a delegating ledger and an inspectable session exchange-observer fan-out. Of its prerequisites, only G2 is implemented: the pure adapter export `analyzeCpmmTransactionResponse`, which shares the live adapter's response validation and decoding, returns an unbranded analysis that `ingest()` refuses, and proves response validation and decoding only. Its pool context is validated and snapshotted without running caller code, and revoked proxies are refused in every input position (review of `9f50e24`). A second review (of `e612042`) made every consumed pool field's primitive type a condition before anything is frozen. Results: 28/28 adapter tests; 21 of 24 targeted mutants caught across the export and its review corrections, with the 3 survivors redundant with, or equivalent under, the accepted decoder's strict checks. Independent review accepted the export and its corrections. The item D credential-sanitizer prerequisite is also implemented offline (`evidence-credential-sanitizer.ts`; 21/21 tests. A review of `bafc6ec` closed two credential-leak paths: Unicode credentials recovered through escape decoding, and encoded URL components. A review of `c3bdae7` closed a third: context-sensitive lower-casing of the Greek capital sigma. Mutants: 18 of 21 original, 13 of 13 for the first corrections and 7 of 9 for the second caught; the survivors are not observable or redundant by design), with no consumer and no migration. Independent review accepted the sanitizer for its documented coverage and limits. The in-memory observation recorder and the exchange-observer fan-out are now implemented offline (`CpmmPoolObservationRecorder.ts`; 21/21 tests, including the real owner, wrapper, collector, ledger, adapter and session; 26 of 26 original and 12 of 12 finalization-boundary mutants caught; item M), with no production factory and no consumer. It records each wrapper event once with explicit owner-delivery correlation, returns the ledger's original promise, and makes no replay or qualification claim. A review of `c7518fe` found that `finish()` called from inside a callback snapshotted an unfinished outcome; `finish()` is now refused while an owner listener or completion callback runs through the recorder. Independent review accepted that correction. Offline sealing and integrity verification (items D–F) are now implemented as a partial implementation of item 17 (`cpmm-pool-observation-evidence.ts`; 14/14 tests over genuine recorder snapshots and temporary directories; 25 of 25 targeted refusal-boundary mutants caught; item N). Component re-derivation (item G) is reported `NOT_IMPLEMENTED`, all five item F flags stay `false`, and supplied pool accounts stay `SUPPLIED_UNVERIFIED`. G1 and G5 are out of scope, and G3 (pool-account acquisition) remains open.
 >   Raydium CPMM targets remain strictly **quarantined from strategy admission** until swap flow decoding, LP evidence, and security evaluation are complete, tested, and independently reviewed. The existing market parser rejection of the `"CPMM"` label in `DexScreenerSingleCandidateMarketParser.ts` remains active and unmodified; coordinator, runner, and live admission paths remain completely unconnected and unchanged.
 
 Raydium CPMM (`CPMMoo8L3F4NbTegBCKVNunggL7H1ZpdTHKxQB5qKP1C`) represents Raydium's modern constant-product AMM architecture. Below is the documentation for the implemented Stage 1 adapter (`RaydiumCpmmPoolStateAdapter.ts`), Stage 2 pure market parser (`DexScreenerCpmmCandidateMarketParser.ts`), and proposed Stage 3 swap decoder (`RaydiumCpmmSwapDecoder.ts`) with their verified acceptance tests, contracts, and explicit behavioral invariants.
@@ -9544,11 +9544,11 @@ Corrections 4–8 are implemented as described in item B and tested as mapped in
 
 The evidence recording, sealing and re-derivation contract is proposed in item 17. These steps remain, each separately approved: wiring the production `ws` constructor and an endpoint through a reviewed factory (with the composition checks above); sealing, re-derivation and credential scanning; an endpoint and budget review; and a separate operator approval for a first unqualified diagnostic capture (item 15 K).
 
-##### 17. CPMM Pool Observation Recording, Sealing and Re-derivation (Proposed Contract; G2, Item D and the Recorder Implemented)
+##### 17. CPMM Pool Observation Recording, Sealing and Re-derivation (Partially Implemented: G2, Item D, the Recorder, Sealing and Integrity Verification; No Re-derivation)
 
-**Status**: a proposed contract (2026-11-20, `b623440`), corrected after review (item K). Of its prerequisites, two are implemented: G2, the pure adapter export `analyzeCpmmTransactionResponse` (item K, accepted in review), and item D's credential sanitizer, `evidence-credential-sanitizer.ts` (item L, accepted in review for its documented coverage and limits). The in-memory recorder and exchange-observer fan-out of item B are implemented offline (item M). The sealer is not approved for implementation and does not exist. The item describes how one bounded CPMM pool observation run would be recorded, sealed as evidence and re-derived offline, on top of the accepted owner (item 15), wrapper (item 16), collector, ledger, transaction adapter and shared session.
+**Status**: a proposed contract (2026-11-20, `b623440`), corrected after review (item K). Of its prerequisites, two are implemented: G2, the pure adapter export `analyzeCpmmTransactionResponse` (item K, accepted in review), and item D's credential sanitizer, `evidence-credential-sanitizer.ts` (item L, accepted in review for its documented coverage and limits). The in-memory recorder and exchange-observer fan-out of item B are implemented offline (item M, accepted in review with its finalization correction). Offline sealing and integrity verification of items D–F are implemented (item N). Component re-derivation (item G) is not implemented, and verification reports it as such. The item describes how one bounded CPMM pool observation run would be recorded, sealed as evidence and re-derived offline, on top of the accepted owner (item 15), wrapper (item 16), collector, ledger, transaction adapter and shared session.
 
-- **Changed so far**: the adapter and its tests (G2); the new sanitizer, its tests and the pin entry for exactly those two files (item D); the new recorder, its tests and the pin entry for exactly those two files (item M). No session, ledger, owner, wrapper, collector, decoder, configuration or dependency change, and no consumer migrated.
+- **Changed so far**: the adapter and its tests (G2); the new sanitizer, its tests and the pin entry for exactly those two files (item D); the new recorder, its tests and the pin entry for exactly those two files (item M); the new evidence module, its tests and the pin entry for exactly those two files (item N). No session, ledger, owner, wrapper, collector, decoder, recorder, sanitizer, configuration or dependency change, and no consumer migrated.
 - **Not run**: no request, socket, capture, wallet change or operator command.
 - **Not selected**: no production factory, endpoint lookup or live limit.
 - **Scope**: the capture provides observation and decoding evidence only (item H). CPMM remains excluded from admission.
@@ -9558,7 +9558,7 @@ The evidence recording, sealing and re-derivation contract is proposed in item 1
 | File                                                                        | Purpose                                                                                                                                                                                                       |
 | --------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | `backend/src/candidate-scanner/CpmmPoolObservationRecorder.ts` / `.test.ts` | In-memory, bounded recording by composition: a transport decorator, a delegating ledger, a session exchange-observer fan-out, and a final snapshot. No I/O, clock read, timer, request or credential handling |
-| `backend/src/scripts/cpmm-pool-observation-evidence.ts` / `.test.ts`        | Offline sealing (sanitize, exclusive-create, manifest last), verification (integrity and retention completeness) and re-derivation through fresh accepted components                                          |
+| `backend/src/scripts/cpmm-pool-observation-evidence.ts` / `.test.ts`        | Offline sealing (sanitize, exclusive-create, manifest last) and verification (integrity and retention completeness): implemented (item N). Re-derivation through fresh accepted components: not implemented   |
 | `paper-pilot-handoff.ts` / `.test.ts` (at implementation review)            | Allowlist exactly those four paths, plus the shared sanitizer of item D if it is approved                                                                                                                     |
 
 ###### A. Inspection Findings That Shape the Contract
@@ -9789,7 +9789,7 @@ export function sanitizeEvidenceBytes(
 
 ###### F. Evidence Layout, Manifest and Sealing (`cpmm-pool-observation-evidence.ts`)
 
-A new directory `data/research/cpmm-observations/<runId>/` is created exclusively and must not exist. All files are written with `flag: "wx"`, and `cpmm-observation-manifest.json` is written last.
+Sealing and verification rules 1 and 2 are implemented offline (item N, authoritative where it refines this layout); rule 3, re-derivation, is not implemented. A new directory `data/research/cpmm-observations/<runId>/` is created exclusively and must not exist. All files are written with `flag: "wx"`, and `cpmm-observation-manifest.json` is written last.
 
 | File                                              | Content (all sanitized before writing)                                                                                                                                                                                                         |
 | ------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
@@ -10226,7 +10226,7 @@ Three survived, none observable here:
   - Credentials that are only canonically equivalent to the configured characters (for example, a precomposed versus a decomposed accent). No Unicode normalization is applied, so only the exact configured code points and their context-free case fold are matched. Characters whose fold expands (for example, a dotted capital I) are matched in folded form and can only widen what is withheld.
 - **Coverage depends on `parseJson`**: parsed keys and values are inspected only for complete, valid UTF-8 JSON with `parseJson` set. Otherwise `jsonInspection` says why, truthfully.
 - **Worst-case cost**: the bounds above allow seconds of CPU per call. Detection scans two raw views, each with an exact and a folded pass, all within the same character budget. The byte-level trailing-fragment matching recurses at most once per secret character (at most 4,096 levels), while the decoded-tail checks (exact and folded) are linear.
-- **No consumer**: the sealer is not implemented or approved, the recorder (item M) deliberately does not sanitize, and no existing module is migrated.
+- **One consumer**: the offline sealer of item N. The recorder (item M) deliberately does not sanitize, and no existing module is migrated.
 
 No adapter, decoder, session, ledger, owner, wrapper, recorder, sealer, configuration or dependency change was made, and no request, socket, capture, wallet change or operator command was run.
 
@@ -10373,6 +10373,7 @@ No adapter, decoder, session, ledger, owner, wrapper, recorder, sealer, configur
   - **An asynchronous send completion calls `finish()`, then throws**: the snapshot had `doneThrew: false`, every pending count zero, complete instrumentation and no late activity, while the wrapper then counted `completions.doneThrew: 1`.
   - **An owner listener calls `finish()`, then throws**: the record had `ownerDeliveries: 1` and `ownerListenerThrew: 0`, with no late activity, while the wrapper counted `ownerListenerThrew: 1`.
 - **Cause**: the shims recorded a callback's delivery or completion before calling it, and `finish()` froze the snapshot while the callback was still running, so its throw landed only on a recorder-internal record.
+- **Accepted**: independent review accepted the correction at `5de691f` (276 focused tests, typecheck, pin verification and 21 recorder cases).
 - **Rule chosen**: refuse the first finalization while callback bookkeeping is active, without latching anything (the `finish()` section above). The alternative, pending outcomes reconciled after `finish()`, was not chosen: it would make the snapshot depend on work that has not ended.
 - **Regression**: R10a, R10b and R10d fail on `c7518fe` and pass now; R10c (preservation) passes on both. Transport behaviour and every accepted component interface are unchanged; only the recorder's own `finish()` refusal and two late counters were added.
 
@@ -10399,9 +10400,179 @@ No adapter, decoder, session, ledger, owner, wrapper, recorder, sealer, configur
   - `maxPayloadBytesPerRecord` at least the wrapper's `maxFrameBytes` and the session lane's response limit, otherwise payloads and bodies stay unhashed.
 - **Costs**: hashing and copying are bounded per record by `maxPayloadBytesPerRecord` and in total by the record allowances.
 - **Finishing from a callback**: a caller that tries `finish()` from inside an owner listener or completion callback is refused and must finish again after the callback returns. Callbacks the inner transport invokes without the recorder's shims (for example a non-function `done`, passed through unchanged) are outside this boundary.
-- **No persistence and no consumer**: the snapshot holds unsanitized bytes in memory only. Nothing persists it, and no production factory, sealer or migration uses it.
+- **No persistence of its own**: the snapshot holds unsanitized bytes in memory only. Only the offline sealer of item N consumes it, sanitizing every payload first; no production factory or migration uses it.
 
 No session, ledger, owner, wrapper, collector, adapter, decoder, sanitizer, sealer, configuration or dependency change was made, and no request, socket, capture, wallet change or operator command was run.
+
+###### N. Item 17 Sealing and Integrity Verification (Partial Implementation, Offline 2026-11-21)
+
+**Scope**: the sealing and integrity-verification portion of items D–F, a partial implementation of item 17.
+
+- **Not implemented**: component re-derivation (item G). Verification always reports it as `NOT_IMPLEMENTED`, or `NOT_ATTEMPTED` after an integrity failure, never as a success.
+- **Pool context**: the five item F flags are `false` in every outcome. Supplied pool accounts stay `SUPPLIED_UNVERIFIED`, and G3 acquisition provenance stays open (`acquisitionProvenance: "OPEN_G3"`).
+- **Not added**: no CLI, production factory, endpoint lookup, configuration loading or provider activity, and importing the module does nothing.
+
+**Files**:
+
+| File                                                                                                                            | Change                                                                                                                                                                                                                                                                                                                                                                                                              |
+| ------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| [`cpmm-pool-observation-evidence.ts`](file:///u:/Projects/TopG/backend/src/scripts/cpmm-pool-observation-evidence.ts)           | New. Imports `node:crypto`, `node:fs`, `node:path` and `node:util` (`types.isProxy`, `isUint8Array`); the recorder's snapshot type and endpoint label; the adapter's purpose constant; and the accepted sanitizer. It reads no environment, configuration, clock or network, and touches the file system only inside the two exported functions                                                                     |
+| [`cpmm-pool-observation-evidence.test.ts`](file:///u:/Projects/TopG/backend/src/scripts/cpmm-pool-observation-evidence.test.ts) | New. 14 synthetic tests over genuine recorder snapshots (the real owner, wrapper, collector, ledger, adapter and session, or the recorder over the real wrapper) and temporary directories                                                                                                                                                                                                                          |
+| `paper-pilot-handoff.ts` / `.test.ts`                                                                                           | Exactly the two new paths are allowlisted and added to H-12, and they leave H-12's refused list. New refused lookalikes: `cpmm-pool-observation-evidence.test-support.ts`, `.fixtures.ts`, `cpmm-pool-observation-evidence-extra.ts`, `cpmm-pool-observation-evidence-cli.ts`, `cpmm-observation-evidence.ts` and `candidate-scanner/cpmm-pool-observation-evidence.ts`. Baseline and endpoint exceptions unchanged |
+
+**API**:
+
+- `sealCpmmObservationEvidence(input)`. The input is the project root (absolute), a run id, the recorder's frozen snapshot, the plan, the component versions, the pool context, the credentials (endpoint URLs and extra secrets), and the recorder's `lateActivity()` or `null`. For tests only, the exclusive file write can be injected.
+  - Success returns `SEALED` with the manifest digest, the file entries and a payload summary.
+  - Otherwise it returns `SEAL_INPUT_INVALID`, `SEAL_REFUSED`, `OUTPUT_DIRECTORY_UNAVAILABLE` or `ARTIFACT_WRITE_FAILED`, with a fixed code (never caller text or a raw exception), the failed file, and the files and directories already created.
+- `verifyCpmmObservationEvidence(outDir)` returns `integrity { ok, problems }`, `retention { status, reasons }`, `rederivation`, the pool-context and acquisition provenance, and the five flags.
+
+**Inputs**:
+
+- **Read safely**: every input is read through own data properties. A proxy, an accessor (at any depth), a symbol key, a non-plain object or an array hole is refused without running any getter or trap. Inputs are copied as plain JSON data, and no caller object is frozen or mutated.
+- **Tagged values**: bigints (the adapted pool's raw amounts) become `{ "$bigint": "<decimal>" }`, and non-finite numbers become `{ "$number": ... }`. Keys beginning with `$` are refused.
+- **The snapshot**: it must be the recorder's (kind, version, `UNSANITIZED_MEMORY_ONLY`). Each recorder payload is strictly decoded and must match its recorded length and SHA-256 (`SNAPSHOT_PAYLOAD_INCONSISTENT`).
+- **The plan**: component kinds; the limits of the owner, wrapper, collector, ledger, adapter, session lanes and recorder (which must equal the snapshot's); binding; epoch; request ids; and endpoint labels (`/^[A-Z][A-Z0-9_]*$/`, so never a URL).
+- **Component versions**: exactly owner, wrapper, collector, ledger, adapter, decoder, session, recorder and sanitizer, each a commit identifier.
+- **Pool context**:
+  - the target;
+  - three raw accounts (base58 addresses, slot, data bytes copied through captured typed-array getters);
+  - the adapted pool;
+  - `acquisition: "SUPPLIED_UNVERIFIED"`, the only accepted value.
+- **Credentials**: the secrets come from the accepted `deriveEvidenceSecrets` and are never persisted.
+
+**Sealing order** (item F, as implemented):
+
+1. **Validate and sanitize in memory**: validate and copy every input; sanitize every payload on bytes with the accepted sanitizer before any text or base64 encoding:
+   - message and `send` payloads, request bodies and response bodies with JSON inspection;
+   - control payloads and raw account data as binary;
+   - partial response bodies with trailing-fragment handling.
+2. **Render every file** in memory.
+3. **Scan for residue**: every rendered file (report and manifest included) is checked against the literal secrets, then put through the accepted sanitizer as a whole (raw views, escapes, percent decoding, parsed JSON keys and values).
+   - Anything redactable or detectable refuses the seal: `RESIDUAL_CREDENTIAL:<file>`.
+   - An inconclusive whole-file scan refuses it too: `RESIDUE_SCAN_INCONCLUSIVE:<file>`.
+   - A file larger than one sanitizer payload (8 MiB) is refused: `RENDERED_FILE_TOO_LARGE`.
+
+   Nothing has touched the file system yet.
+
+4. **Create the directory**: the parent is created if needed, then the run directory itself is created non-recursively. An existing directory is `OUTPUT_DIRECTORY_EXISTS` and is left untouched.
+5. **Write**: files are written with `flag: "wx"` in a fixed order, `exchanges/` is created exclusively before its first file, and the manifest goes last. The first failure returns `ARTIFACT_WRITE_FAILED:<errno>` with the files and directories created so far. There is no manifest, no retry and no acquisition.
+
+**Payload states** (every sealed payload has exactly one):
+
+| State    | Fields                                                                                                                                                                                                                                                            |
+| -------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Stored   | `storedEncoding` (`utf8` for valid UTF-8, otherwise `base64`), `stored`, `storedBytes`, `storedSha256` of the sanitized bytes; `originalBytes` and `originalSha256` of the original; `payloadRedacted`, `redactions`, `partialFragmentRedacted`, `jsonInspection` |
+| Withheld | `withheldReason` from the sanitizer (`CREDENTIAL_MATERIAL_DETECTED`, `CREDENTIAL_SCAN_INCONCLUSIVE`, `SCAN_BUDGET_EXHAUSTED`, `OUTPUT_LIMIT_EXCEEDED`), with the original length and digest; nothing stored                                                       |
+| Omitted  | the recorder's `payloadOmitted` (`BYTE_ALLOWANCE` keeps the original length and digest; `OVERSIZE_NOT_HASHED` and `NOT_BYTES` have none); nothing stored                                                                                                          |
+
+**Layout as implemented**:
+
+- **Common fields**: each file carries a `kind` and the evidence schema version (1). The manifest carries its own kind and version, the schema version, the component versions and the sorted `files` (path, bytes, SHA-256), and never lists itself.
+- **`report.json`**:
+  - every other file by path, bytes and digest;
+  - the run outcome (terminal cause, cleanup status, `connectionRunClean`) copied from the owner report;
+  - the payload summary;
+  - the recorder's own completeness flags, labelled informational;
+  - `rederivation: NOT_IMPLEMENTED`, `poolContextProvenance: SUPPLIED_UNVERIFIED`, `acquisitionProvenance: OPEN_G3`;
+  - `credentialsRecorded: false`, `endpointUrlsRecorded: false`, and the five `false` flags.
+- **Component files**: the owner report, transport diagnostics, collector, ledger and session-ledger files keep each component read as the recorder took it (`READ`, `NOT_SUPPLIED` or `READ_FAILED`). `transport-records.json` merges the four record categories in strict ordinal order. Each CPMM exchange is `exchanges/<seq>.json` (six digits), listed in `exchanges/index.json`.
+- **`recording.json`**: the recorder's limits, retention counts, instrumentation, pending work, fan-out diagnostics, payload summary and the supplied late activity.
+
+**Verifier-owned limits**, fixed before any untrusted metadata is read or allocated from:
+
+- a manifest of at most 1 MiB;
+- files of at most 8 MiB each and 256 MiB in all;
+- at most 4,096 listed files and walked directory entries, and a walk depth of 2.
+
+Sizes come from `lstat` before any read and are compared again after it.
+
+**Integrity checks** (fail-closed; the first failing stage stops everything; retention is then `NOT_EVALUATED` and re-derivation `NOT_ATTEMPTED`):
+
+1. **The directory**: an absolute path that is a real directory, not a link or junction.
+2. **The manifest**: strict UTF-8 JSON with exact keys, kind, version, evidence schema version and component versions.
+3. **Entries**:
+   - exact keys and lower-case digests;
+   - paths only from the fixed set or `exchanges/NNNNNN.json`, so no absolute path, traversal, unknown name or the manifest itself;
+   - unique and strictly sorted;
+   - sizes and the total within the limits;
+   - every required file listed.
+4. **The tree**: no link or junction, special file, unknown directory (only `exchanges/` at depth 1) or unlisted file at any depth.
+5. **Each listed file**: every path component is a real directory and the file is a regular file with a single link (hard links rejected). Its size and SHA-256 must match, and it must be strict UTF-8 JSON.
+6. **Each document**: its kind and version; the report's references, equal to the manifest's entries; its fixed claims and flags; and the pool context's provenance.
+7. **Each payload**: one state only; strict canonical base64 (re-encoding must match, and base64 only for bytes that are not valid UTF-8) or well-formed UTF-8 text. The decoded length and SHA-256 match the stored values, and the original against the stored digests agree with the redaction flags.
+8. **Transport records**: in strictly increasing ordinal order, with known categories.
+9. **Exchanges**:
+   - the index is sorted, unique and agrees with the exchange files (path, sequence, ordinal), and every exchange file is indexed;
+   - the endpoint label is fixed;
+   - each indexed exchange matches its session-ledger window entry: lane, owner, purpose, identity, JSON-RPC id, both times, status, `bodyComplete`, and the error as a fixed code or `UNRECOGNIZED`.
+
+   When the window itself was not read, every sealed exchange fails this check.
+
+**Retention**: derived from the evidence; recorded completeness flags are never trusted. `COMPLETE` only when no reason applies. The reasons are:
+
+- an omitted or withheld payload anywhere (transport records, exchanges, pool accounts);
+- a record category whose recorded `observed` count differs from the records actually sealed;
+- any instrumentation failure, or a transport or ledger that was not recorded;
+- any pending work;
+- fan-out failures;
+- an unavailable component read;
+- collector metadata retention not shown complete;
+- truncated ledger duplicate details;
+- a CPMM request in the session window without a sealed exchange (`EXCHANGE_MISSING`).
+
+**Tests** (2026-11-21; synthetic and offline):
+
+| Test | Covers                                                                                                                                                                                                                                                                                                                                                                                 |
+| ---- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| E1   | A genuine clean run seals: exclusive `wx` writes, manifest last, exactly the listed files. Integrity OK, retention `COMPLETE`, re-derivation `NOT_IMPLEMENTED`, five flags `false`, `SUPPLIED_UNVERIFIED`, `OPEN_G3`. Exchange bound and digests kept; bigints tagged; no credential in any file; caller objects neither changed nor frozen                                            |
+| E2   | Retention pressure (record and byte allowances): sealed with integrity; retention `INCOMPLETE` with derived reasons; omitted payloads keep their original digests                                                                                                                                                                                                                      |
+| E3   | Credentials in a structured payload (key and value), a binary payload, a control payload; a URL prefix (withheld, detected) and never-settling percent decoding (withheld, inconclusive); stored and original digests distinct; no credential in any file; retention `INCOMPLETE`                                                                                                      |
+| E3b  | A credential in a structured response body is redacted (parsed JSON inspected), and the exchange still binds to the session ledger                                                                                                                                                                                                                                                     |
+| E4   | A residual credential in a rendered file (literal, `\u00XX`-escaped, percent-encoded) refuses the seal before any directory exists                                                                                                                                                                                                                                                     |
+| E5   | Input validation without running getters (top level and nested) or proxies: snapshot kind and payload consistency, recorder limits, component versions, provenance, labels, run id, project root, credentials, account data, late activity; nothing created; nothing frozen                                                                                                            |
+| E6   | An existing directory is refused and left byte-identical; it still verifies                                                                                                                                                                                                                                                                                                            |
+| E7   | A partial write failure (with a credential-bearing error) reports the files and directories created, writes no manifest, is not retried, and leaks nothing; verification reports `MANIFEST_MISSING`                                                                                                                                                                                    |
+| V1   | A changed byte, an appended byte, a missing file, unlisted files and directories: integrity fails, retention `NOT_EVALUATED`, re-derivation `NOT_ATTEMPTED`                                                                                                                                                                                                                            |
+| V2   | A junction inside the directory, a hard-linked file, a junction as the directory itself, a relative and a missing directory                                                                                                                                                                                                                                                            |
+| V3   | Manifest kind, versions, component versions, extra keys, traversal and absolute paths, the manifest listing itself, duplicates, order, a missing required file, oversized entries, malformed digests, too many entries (refused before reading entries), an oversized manifest (refused before reading), invalid UTF-8                                                                 |
+| V4   | Consistent rewrites still caught: report flags, claims and references; provenance; file kinds; payload size, digest, encoding (non-canonical base64 that decodes to the same byte; lone surrogates; base64 for UTF-8), redaction and state consistency; ordinal order; exchange and session-ledger disagreement, a missing or unread window, an unindexed exchange, the endpoint label |
+| V5   | Retention is derived: recorded flags rewritten to "complete" do not hide an omitted payload; a removed exchange with consistent integrity is `EXCHANGE_MISSING`                                                                                                                                                                                                                        |
+| V6   | Source boundary: imports, no environment, clock, network, console, CLI or top-level file access                                                                                                                                                                                                                                                                                        |
+
+**Mutation checks**: 25 targeted mutants of the refusal boundaries, each run under an external 60-second limit, with the source restored and compared byte for byte afterwards. All 25 were caught, one only after an added test. The mutants:
+
+- **Sealing**: no whole-file residue scan; a literal-only residue check; a non-exclusive output directory; non-exclusive writes; the manifest first; continuing after a write failure; payloads not sanitized; snapshot payloads not checked against their digests.
+- **Input reading**: nested accessors read (it survived until E5 gained a nested-getter case); proxies copied.
+- **Verification**: directory-walk links accepted; hard links accepted; unlisted files accepted; unknown directories walked; unconfined manifest paths; sizes not checked before reading; payload digests and canonical base64 unchecked; exchange and session-ledger fields unchecked; unindexed exchange files accepted; report references and flags unchecked; omitted and withheld payloads not retention reasons; integrity failures not stopping processing.
+
+**Results** (2026-11-21, each command under an external 60-second limit):
+
+| Check                                                                                                                                                                              | Result                                                             |
+| ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------ |
+| Evidence suite                                                                                                                                                                     | 14/14                                                              |
+| Focused set plus evidence, in two groups: evidence, recorder, sanitizer, wrapper, `paper-pilot-handoff`, `fresh-amm-v4-watch`; owner, collector, ledger, decoder, adapter, tracker | 290/290 (14 + 21 + 21 + 22 + 13 + 11; 55 + 24 + 25 + 16 + 28 + 40) |
+| Backend typecheck (`tsc --noEmit`, actual exit code)                                                                                                                               | Clean (exit 0)                                                     |
+| ESLint and Prettier on the changed files                                                                                                                                           | Clean                                                              |
+| Pin (`paper-pilot-handoff`, including H-12)                                                                                                                                        | 13/13                                                              |
+| Wallet `.tmp/virtual-wallet.json`                                                                                                                                                  | Unchanged (`7F2C2353…ED9`)                                         |
+
+**Remaining limitations**:
+
+- **No re-derivation** (item G): pool context, collector replay, transaction analysis and the ledger's structural checks are not run. Integrity and retention say nothing about whether the recorded results are reproducible.
+- **Not authenticated**: integrity detects partial or accidental change. A complete, consistent rewrite of every file and the manifest passes, because nothing is signed.
+- **Pool context**: supplied, sanitized and copied, but not re-adapted or bound to acquisition evidence (G3).
+- **Conservative refusals**:
+  - a whole-file residue scan that is inconclusive (for example, deeply nested escapes in component data) refuses the seal, as does a rendered file over 8 MiB;
+  - the sanitizer's over-withholding (any URL-secret prefix) applies to payloads;
+  - the sanitizer's secret derivation accepts any supplied URL string, as reviewed.
+- **Conservative retention**: any omitted or withheld payload, any pending work and any unavailable component read makes retention `INCOMPLETE`. It does not distinguish material that a later re-derivation would not need.
+- **Fail-closed exchange binding**: an exchange sealed without a readable session-ledger window fails integrity.
+- **Races with the file system**: files are read after their `lstat` checks; sizes are re-checked after reading, but a concurrent writer is outside the threat model.
+- **Links on Windows**: the tests use a junction and a hard link; creating file symbolic links needs privileges and is not exercised.
+- **No caller**: no CLI or production factory uses the module, and the output root comes from the caller.
+
+No session, ledger, owner, wrapper, collector, adapter, decoder, recorder, sanitizer, configuration or dependency change was made, and no request, socket, capture, daemon, wallet change or operator command was run.
 
 ---
 

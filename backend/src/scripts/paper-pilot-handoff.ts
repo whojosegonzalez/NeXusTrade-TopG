@@ -136,6 +136,10 @@ export const ALLOWED_ADDITIONS_SINCE_REVIEWED_RUNNER = Object.freeze([
   // The in-memory CPMM pool observation recorder and its synthetic tests (section 8.38.17 item 17).
   "backend/src/candidate-scanner/CpmmPoolObservationRecorder.ts",
   "backend/src/candidate-scanner/CpmmPoolObservationRecorder.test.ts",
+  // Offline sealing and integrity verification of CPMM observations, and their synthetic tests
+  // (section 8.38.17 item 17 D-F).
+  "backend/src/scripts/cpmm-pool-observation-evidence.ts",
+  "backend/src/scripts/cpmm-pool-observation-evidence.test.ts",
 ]);
 
 export interface ReviewedTreeEntry {
