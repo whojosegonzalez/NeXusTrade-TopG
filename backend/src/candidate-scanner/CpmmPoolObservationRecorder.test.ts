@@ -1230,9 +1230,11 @@ describe("CPMM pool observation recorder (synthetic, offline)", () => {
     expect(m.r.lateActivity()).toEqual({
       wrapperEvents: 0,
       ownerDeliveries: 1,
+      ownerListenerThrows: 0,
       transportCalls: 1,
       registrations: 0,
       completions: 1,
+      completionThrows: 0,
       ledgerCalls: 0,
       ledgerSettlements: 0,
       exchanges: 0,
@@ -1837,5 +1839,177 @@ describe("Integration: the real owner, wrapper, collector, ledger, adapter and s
     });
     expectNoSecret(s.components.fanOutDiagnostics);
     expect(unhandled).toEqual([]);
+  });
+});
+
+describe("R10: the finalization boundary (finish() refused while a recorder callback runs)", () => {
+  const REFUSED = "[CPMM_RECORDER] FINISH_DURING_CALLBACK";
+
+  it("R10a: an asynchronous completion and an owner listener that finish and then throw are recorded truthfully", async () => {
+    const m = wrapped({ complete: "microtask" });
+    m.t.start();
+    m.c.open();
+    const refusals: unknown[] = [];
+    m.t.send("x", () => {
+      refusals.push(thrown(() => m.r.finish(EMPTY_INPUT)));
+      throw new Error("done failure");
+    });
+    m.t.on("message", (d) => {
+      if (Buffer.from(d as Uint8Array).toString() !== "m") return;
+      refusals.push(thrown(() => m.r.finish(EMPTY_INPUT)));
+      throw new Error("listener failure");
+    });
+    await flush();
+    m.c.message(Buffer.from("m"));
+    expect(refusals.map((e) => (e as Error).message)).toEqual([REFUSED, REFUSED]);
+    expect(m.w.diagnostics().completions.doneThrew).toBe(1);
+    expect(m.w.diagnostics().ownerListenerThrew).toBe(1);
+    // The refusal latched nothing: recording continued, and finish() succeeds afterwards.
+    m.c.message(Buffer.from("after-refusal"));
+    const s = m.r.finish(EMPTY_INPUT);
+    expect(completions(s, "outgoing").map((c) => [c.invocation, c.doneThrew])).toEqual([[1, true]]);
+    expect(events(s, "incoming").map((r) => [r.ownerDeliveries, r.ownerListenerThrew])).toEqual([
+      [1, 1],
+      [1, 0],
+    ]);
+    expect(s.pending.completionsAwaitingFirstCall).toEqual({ send: 0, ping: 0, pong: 0 });
+    expect(s.instrumentation.complete).toBe(true);
+    expect(m.r.lateActivity()).toMatchObject({
+      ownerDeliveries: 0,
+      ownerListenerThrows: 0,
+      completions: 0,
+      completionThrows: 0,
+    });
+  });
+
+  it("R10b: nested callbacks refuse at every depth until the outermost returns", () => {
+    const m = wrapped({ complete: "sync" });
+    m.t.start();
+    m.c.open();
+    const attempts: string[] = [];
+    const attempt = (label: string) => {
+      try {
+        m.r.finish(EMPTY_INPUT);
+        attempts.push(`${label}:finished`);
+      } catch (e) {
+        attempts.push(`${label}:${(e as Error).message === REFUSED ? "refused" : "other"}`);
+      }
+    };
+    m.t.on("message", (d) => {
+      const text = Buffer.from(d as Uint8Array).toString();
+      if (text === "outer") {
+        m.c.message(Buffer.from("inner")); // nested listener invocation
+        // A synchronous completion inside the listener: done is a nested callback too.
+        m.t.send("s", () => attempt("done-in-listener"));
+        attempt("outer-after-nested");
+      } else attempt("inner");
+    });
+    m.c.message(Buffer.from("outer"));
+    expect(attempts).toEqual([
+      "inner:refused",
+      "done-in-listener:refused",
+      "outer-after-nested:refused",
+    ]);
+    // Once every callback has returned, the first finish() succeeds and is final.
+    const s = m.r.finish(EMPTY_INPUT);
+    expect(m.r.finish(EMPTY_INPUT)).toBe(s);
+    expect(events(s, "incoming").map((r) => [r.ownerDeliveries, r.ownerListenerThrew])).toEqual([
+      [1, 0],
+      [1, 0],
+    ]);
+    expect(completions(s, "outgoing")).toEqual([
+      expect.objectContaining({ invocation: 1, afterCallEnded: false, doneThrew: false }),
+    ]);
+    expect(s.instrumentation.complete).toBe(true);
+  });
+
+  it("R10c: callbacks keep their receiver, arguments, return values and thrown objects", () => {
+    const listeners: ((...a: unknown[]) => unknown)[] = [];
+    const dones: ((...a: unknown[]) => unknown)[] = [];
+    const inner = {
+      readyState: 1,
+      start: () => undefined,
+      send: (_d: unknown, done: (...a: unknown[]) => unknown) => {
+        dones.push(done);
+      },
+      ping: () => undefined,
+      pong: () => undefined,
+      close: () => undefined,
+      terminate: () => undefined,
+      dispose: () => undefined,
+      on: (_e: string, l: (...a: unknown[]) => unknown) => {
+        listeners.push(l);
+        return () => undefined;
+      },
+    } as unknown as CpmmOwnerTransport;
+    const r = createCpmmPoolObservationRecorder({ limits: RLIMITS });
+    const t = r.recordTransport(inner);
+    const seen: { self: unknown; args: unknown[] }[] = [];
+    const failure = new Error("same object");
+    let fail = false;
+    t.on("message", function (this: unknown, ...args: unknown[]) {
+      seen.push({ self: this, args });
+      if (fail) throw failure;
+      return "listener-result";
+    } as unknown as (d: unknown) => void);
+    t.send("x", function (this: unknown, ...args: unknown[]) {
+      seen.push({ self: this, args });
+      if (fail) throw failure;
+      return "done-result";
+    } as unknown as (failed: boolean) => void);
+    const ownerShim = listeners[6]!; // after the six observation listeners
+    const receiver = { receiver: true };
+    const payload = new Uint8Array([1]);
+    listeners[1]!.call(undefined, payload); // the observation listener for "message"
+    expect(ownerShim.call(receiver, payload, "extra")).toBe("listener-result");
+    expect(dones[0]!.call(receiver, false, "extra")).toBe("done-result");
+    fail = true;
+    expect(thrown(() => ownerShim.call(receiver, payload))).toBe(failure);
+    expect(thrown(() => dones[0]!.call(receiver, true))).toBe(failure);
+    expect(seen.map((x) => [x.self, x.args])).toEqual([
+      [receiver, [payload, "extra"]],
+      [receiver, [false, "extra"]],
+      [receiver, [payload]],
+      [receiver, [true]],
+    ]);
+    expect(seen[0]!.args[0]).toBe(payload);
+    const s = r.finish(EMPTY_INPUT);
+    expect(completions(s, "outgoing").map((c) => [c.invocation, c.doneThrew])).toEqual([
+      [1, false],
+      [2, true],
+    ]);
+  });
+
+  it("R10d: after a successful finish(), later callbacks forward unchanged, finish() returns the same snapshot, and late throws are counted", () => {
+    const m = wrapped({ complete: "never" });
+    m.t.start();
+    m.c.open();
+    let s: CpmmObservationSnapshot | null = null;
+    const inside: unknown[] = [];
+    m.t.on("message", () => {
+      inside.push(m.r.finish(EMPTY_INPUT));
+      throw new Error("late listener failure");
+    });
+    m.t.send("x", () => {
+      inside.push(m.r.finish(EMPTY_INPUT));
+      throw new Error("late done failure");
+    });
+    s = m.r.finish(EMPTY_INPUT);
+    const json = JSON.stringify(s);
+    expect(s.pending.completionsAwaitingFirstCall).toEqual({ send: 1, ping: 0, pong: 0 });
+    m.c.message(Buffer.from("late"));
+    m.c.pending[0]!();
+    expect(inside).toEqual([s, s]);
+    expect(inside[0]).toBe(s);
+    expect(m.w.diagnostics().ownerListenerThrew).toBe(1);
+    expect(m.w.diagnostics().completions.doneThrew).toBe(1);
+    expect(m.r.lateActivity()).toMatchObject({
+      ownerDeliveries: 1,
+      ownerListenerThrows: 1,
+      completions: 1,
+      completionThrows: 1,
+    });
+    expect(JSON.stringify(s)).toBe(json);
+    expectDeepFrozen(s);
   });
 });

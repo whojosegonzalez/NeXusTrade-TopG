@@ -15,7 +15,9 @@
  * - **Exchange observer** (`observeExchange`) and the constructor-time fan-out
  *   (`createExchangeObserverFanOut`), with the adapter's evidence recorder first.
  * - **`finish()`**: idempotent; detaches the observation listeners (closing and stopping nothing)
- *   and returns one deeply immutable snapshot of recorder-owned copies.
+ *   and returns one deeply immutable snapshot of recorder-owned copies. It is refused, without
+ *   any state change, while an owner listener or completion callback invoked through the
+ *   recorder is still running, so no unfinished callback outcome is ever snapshotted.
  *
  * The snapshot is raw, unsanitized memory-only material (`material`): it may contain credential
  * bytes from payloads or response bodies and must pass the reviewed sealer before persistence.
@@ -159,7 +161,11 @@ export interface CpmmPoolObservationRecorder {
   recordLedger(ledger: CpmmResolutionAccountingLedger): CpmmResolutionAccountingLedger;
   /** One target of the session's exchange-observer fan-out. Returns undefined; never throws. */
   readonly observeExchange: (evidence: PaperRequestExchangeEvidence) => void;
-  /** Idempotent: the first call builds the snapshot, later calls return the same object. */
+  /**
+   * Idempotent: the first successful call builds the snapshot, later calls return the same
+   * object. Refused with `[CPMM_RECORDER] FINISH_DURING_CALLBACK` (and no state change) while an
+   * owner listener or completion callback invoked through the recorder is still running.
+   */
   finish(input: CpmmObservationFinishInput): CpmmObservationSnapshot;
   /** Exact counts of activity after finish() (never part of the snapshot). */
   lateActivity(): CpmmRecorderLateActivity;
@@ -168,9 +174,13 @@ export interface CpmmPoolObservationRecorder {
 export interface CpmmRecorderLateActivity {
   readonly wrapperEvents: number;
   readonly ownerDeliveries: number;
+  /** Owner listeners that began after finish() and threw (rethrown unchanged). */
+  readonly ownerListenerThrows: number;
   readonly transportCalls: number;
   readonly registrations: number;
   readonly completions: number;
+  /** Completion callbacks that began after finish() and threw (rethrown unchanged). */
+  readonly completionThrows: number;
   readonly ledgerCalls: number;
   readonly ledgerSettlements: number;
   readonly exchanges: number;
@@ -752,13 +762,17 @@ class ObservationRecorder implements CpmmPoolObservationRecorder {
   // Finish
   private finished = false;
   private finishing = false;
+  /** Owner listeners and completion callbacks currently running through the shims. */
+  private activeCallbacks = 0;
   private snapshot: CpmmObservationSnapshot | null = null;
   private readonly late: Mutable<CpmmRecorderLateActivity> = {
     wrapperEvents: 0,
     ownerDeliveries: 0,
+    ownerListenerThrows: 0,
     transportCalls: 0,
     registrations: 0,
     completions: 0,
+    completionThrows: 0,
     ledgerCalls: 0,
     ledgerSettlements: 0,
     exchanges: 0,
@@ -1087,17 +1101,23 @@ class ObservationRecorder implements CpmmPoolObservationRecorder {
     // eslint-disable-next-line @typescript-eslint/no-this-alias -- the shim keeps its caller's this
     const rec = this;
     const shim = function (this: unknown, ...a: unknown[]): unknown {
+      const late = rec.finished;
       let completion: Mutable<CpmmRecordedCompletion> | null = null;
       try {
         completion = rec.onCompletion(state, a);
       } catch {
         rec.fail("TRANSPORT", "COMPLETION_RECORD_FAILED");
       }
+      // While done runs, finish() is refused: its outcome is not known yet.
+      rec.activeCallbacks++;
       try {
         return reflectApply(done, this, a);
       } catch (e) {
         if (completion !== null) completion.doneThrew = true;
+        else if (late) rec.late.completionThrows++;
         throw e;
+      } finally {
+        rec.activeCallbacks--;
       }
     };
     return shim;
@@ -1144,17 +1164,23 @@ class ObservationRecorder implements CpmmPoolObservationRecorder {
     const rec = this;
     const fn = listener as (...a: unknown[]) => unknown;
     const shim = function (this: unknown, ...a: unknown[]): unknown {
+      const late = rec.finished;
       let dispatch: Dispatch | null = null;
       try {
         dispatch = rec.attribute(reg);
       } catch {
         rec.fail("TRANSPORT", "DELIVERY_RECORD_FAILED");
       }
+      // While the owner's listener runs, finish() is refused: its outcome is not known yet.
+      rec.activeCallbacks++;
       try {
         return reflectApply(fn, this, a);
       } catch (e) {
         if (dispatch !== null && dispatch.record !== null) dispatch.record.ownerListenerThrew++;
+        else if (late) rec.late.ownerListenerThrows++;
         throw e;
+      } finally {
+        rec.activeCallbacks--;
       }
     };
     const callArgs = [...args];
@@ -1564,9 +1590,17 @@ class ObservationRecorder implements CpmmPoolObservationRecorder {
     return objectFreeze({ ...this.late });
   }
 
+  /**
+   * Finalization boundary: the first finish() is refused, with no state change, while an owner
+   * listener or a completion callback invoked through this recorder is still running (at any
+   * nesting depth). Its outcome (a return or a throw) is not known yet, and recording it as a
+   * completed `false` would be untrue. The caller finishes again after the callback returns.
+   * After a successful finish() every call returns the same snapshot, from anywhere.
+   */
   public finish(input: CpmmObservationFinishInput): CpmmObservationSnapshot {
     if (this.snapshot !== null) return this.snapshot;
     if (this.finishing) throw new Error("[CPMM_RECORDER] FINISH_REENTERED");
+    if (this.activeCallbacks > 0) throw new Error("[CPMM_RECORDER] FINISH_DURING_CALLBACK");
     this.finishing = true;
     // Recording ends here: later callbacks keep their behaviour and are only counted.
     this.finished = true;
