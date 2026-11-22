@@ -1300,6 +1300,49 @@ interface DecodedSwapEvents {
   readonly blockTimeSec: number | null;
 }
 
+/**
+ * Item G (partial): structural cross-checks of the owner's report, the wrapper's diagnostics and
+ * the decorator's transport records, by phase. Neither the owner nor the wrapper is run again.
+ */
+export interface CpmmOwnerWrapperStructuralCheck {
+  readonly status: "STRUCTURALLY_CONSISTENT" | "MISSING_EVIDENCE" | "MISMATCH";
+  readonly scope: "RECORDED_OWNER_WRAPPER_STRUCTURE_ONLY";
+  readonly ownerReplayed: false;
+  readonly wrapperReplayed: false;
+  readonly findings: readonly string[];
+  readonly checked: {
+    readonly transportRecords: number;
+    readonly wrapperObservedEvents: number;
+    /** Events at least one owner listener received. */
+    readonly ownerReceivedEvents: number;
+    /** Events the wrapper dispatched with no owner listener (before registration or after disposal). */
+    readonly wrapperOnlyEvents: number;
+    readonly outgoingCalls: number;
+    /** Completions compared with the owner's attempts (before its settlement). */
+    readonly completions: number;
+    /** Records after the settlement boundary: late owner events, completions, later activity. */
+    readonly afterSettlementRecords: number;
+  };
+  /**
+   * The owner's last recorded transport action: its report is frozen after it, while the
+   * wrapper's diagnostics run to finish(). Null when retention loss hides it.
+   */
+  readonly settlementBoundaryOrdinal: number | null;
+  /** Which exact comparisons the recorded scope supported (false: a finding says why not). */
+  readonly coverage: {
+    /** The wrapper's diagnostics against every record, exactly. */
+    readonly wrapper: boolean;
+    /** The owner's incoming and late event counts against what its listeners received. */
+    readonly ownerIncoming: boolean;
+    /** The owner's application, ping and pong attempts against calls and completions. */
+    readonly ownerOutgoing: boolean;
+    /** The owner's cleanup against its own calls and close observation before settlement. */
+    readonly cleanup: boolean;
+    /** The report's times and the collector's receipts in order. */
+    readonly timing: boolean;
+  };
+}
+
 export interface CpmmRederivation {
   readonly status: "PARTIAL" | "NOT_ATTEMPTED";
   /**
@@ -1312,7 +1355,7 @@ export interface CpmmRederivation {
     readonly collector: CpmmCollectorRederivation;
     readonly transactionAnalysis: CpmmTransactionRederivation;
     readonly ledger: CpmmLedgerStructuralCheck;
-    readonly ownerWrapperCrossChecks: { readonly status: "NOT_IMPLEMENTED" };
+    readonly ownerWrapperCrossChecks: CpmmOwnerWrapperStructuralCheck;
     readonly runtimeAccounting: { readonly status: "RUNTIME_ACCOUNTING_NOT_REPRODUCED" };
   } | null;
 }
@@ -3010,20 +3053,34 @@ function rederive(
   } catch {
     ledger = ledgerResult(failed(), EMPTY_LEDGER_CHECKED, NO_LEDGER_COVERAGE);
   }
-  const ledgerRank: CpmmRederivationStatus =
-    ledger.status === "STRUCTURALLY_CONSISTENT" ? "REPRODUCED" : ledger.status;
+  let ownerWrapperCrossChecks: CpmmOwnerWrapperStructuralCheck;
+  try {
+    ownerWrapperCrossChecks = checkOwnerWrapperStructure(docs);
+  } catch {
+    ownerWrapperCrossChecks = ownerWrapperResult(
+      failed(),
+      EMPTY_OWNER_WRAPPER_CHECKED,
+      null,
+      NO_OWNER_WRAPPER_COVERAGE,
+    );
+  }
+  const rank = (s: CpmmLedgerStructuralCheck["status"]): CpmmRederivationStatus =>
+    s === "STRUCTURALLY_CONSISTENT" ? "REPRODUCED" : s;
   return {
     status: "PARTIAL",
     implementedComponents: worstOf(
-      worstOf(worstOf(poolContext.status, collector.status), transactionAnalysis.status),
-      ledgerRank,
+      worstOf(
+        worstOf(worstOf(poolContext.status, collector.status), transactionAnalysis.status),
+        rank(ledger.status),
+      ),
+      rank(ownerWrapperCrossChecks.status),
     ),
     components: {
       poolContext,
       collector,
       transactionAnalysis,
       ledger,
-      ownerWrapperCrossChecks: { status: "NOT_IMPLEMENTED" },
+      ownerWrapperCrossChecks,
       runtimeAccounting: { status: "RUNTIME_ACCOUNTING_NOT_REPRODUCED" },
     },
   };
@@ -4542,5 +4599,803 @@ function checkLedgerStructure(
       duplicateDetails: recordsComplete && !anyTruncated,
       eventMetadata: recordsComplete && !metadataUncorroborated,
     },
+  );
+}
+
+// ---------------------------------------------------------------------------------------------
+// Owner and wrapper structure (item G, partial): the report, the wrapper's diagnostics and the
+// decorator's records, by phase
+// ---------------------------------------------------------------------------------------------
+
+type TransportRecord = Record<string, unknown> & { readonly ordinal: number };
+
+const OWNER_LATE_KEYS = [
+  "open",
+  "message",
+  "error",
+  "close",
+  "ping",
+  "pong",
+  "localCompletion",
+  "accountSettlement",
+  "timer",
+  "abort",
+  "sessionStop",
+] as const;
+const OWNER_EVENTS = ["open", "message", "error", "close", "ping", "pong"] as const;
+const LOCAL_OUTCOMES: ReadonlySet<unknown> = new Set([
+  "NOT_ATTEMPTED",
+  "THREW",
+  "COMPLETED",
+  "FAILED",
+  "UNRESOLVED",
+]);
+const OBSERVED_OUTCOMES: ReadonlySet<unknown> = new Set([
+  "NOT_OBSERVED",
+  "ACKNOWLEDGED",
+  "REJECTED",
+  "MALFORMED",
+]);
+const CLEANUP_STATUSES: ReadonlySet<unknown> = new Set([
+  "NOT_NEEDED",
+  "DISPOSED_UNSTARTED",
+  "DISPOSE_FAILED",
+  "SETTLED",
+  "SETTLED_AFTER_TERMINATE",
+  "FAILED_STILL_OPEN",
+]);
+const CONTROL_ATTEMPT_KEYS = ["reserved", "threw", "completed", "failed", "unresolved"] as const;
+const DEADLINE_KEYS = [
+  "startedAtMs",
+  "ackDeadlineMs",
+  "nominalEndMs",
+  "intakeEndMs",
+  "drainDeadlineMs",
+  "runCeilingMs",
+  "sessionDeadlineMs",
+] as const;
+
+const intOrNull = (v: unknown): boolean => v === null || isInt(v);
+const allInts = (o: unknown, keys: readonly string[]): boolean =>
+  isRec(o) && keys.every((k) => isInt(o[k]));
+
+/** The owner report's fields used here, in their domains (structure only). */
+function ownerReportValid(r: unknown): boolean {
+  if (!isRec(r)) return false;
+  const attempt = (a: unknown) =>
+    isRec(a) &&
+    typeof a.prepared === "boolean" &&
+    intOrNull(a.reservedAtMs) &&
+    LOCAL_OUTCOMES.has(a.local) &&
+    intOrNull(a.localAtMs) &&
+    OBSERVED_OUTCOMES.has(a.observed);
+  const o = r.outgoing;
+  const t = r.transport;
+  const c = r.cleanup;
+  const d = r.deadlines;
+  return (
+    isInt(r.settledAtMs) &&
+    isInt(get(r, "terminal", "atMs")) &&
+    Array.isArray(r.uncertainties) &&
+    (d === null || allInts(d, DEADLINE_KEYS)) &&
+    allInts(r.incoming, [
+      "messageEvents",
+      "passedToCollector",
+      "messagesBeforeStart",
+      "pingsReceived",
+      "pongsReceived",
+      "controlFrames",
+    ]) &&
+    isRec(r.intake) &&
+    intOrNull(r.intake.stoppedAtMs) &&
+    allInts(r.intake, ["framesAfterIntake", "controlFramesAfterIntake"]) &&
+    isRec(t) &&
+    typeof t.constructed === "boolean" &&
+    typeof t.started === "boolean" &&
+    intOrNull(t.openedAtMs) &&
+    allInts(t, ["eventsBeforeStart", "disposeFailures"]) &&
+    isRec(o) &&
+    attempt(o.subscribe) &&
+    attempt(o.unsubscribe) &&
+    allInts(o, [
+      "applicationFramesReserved",
+      "pongsMatched",
+      "pongsUnmatched",
+      "duplicateCompletions",
+    ]) &&
+    allInts(o.pings, CONTROL_ATTEMPT_KEYS) &&
+    allInts(o.pongReplies, CONTROL_ATTEMPT_KEYS) &&
+    isRec(c) &&
+    CLEANUP_STATUSES.has(c.status) &&
+    intOrNull(c.startedAtMs) &&
+    intOrNull(c.endedAtMs) &&
+    typeof c.closeThrew === "boolean" &&
+    typeof c.terminateAttempted === "boolean" &&
+    typeof c.terminateThrew === "boolean" &&
+    intOrNull(c.closeCode) &&
+    intOrNull(c.closeObservedAtMs) &&
+    intOrNull(get(r, "cancellation", "requestedAtMs"))
+  );
+}
+
+/** The wrapper diagnostics' fields used here, in their domains. */
+function wrapperDiagnosticsValid(w: unknown): boolean {
+  return (
+    isRec(w) &&
+    isInt(get(w, "messages", "delivered")) &&
+    allInts(w.control, ["pingsDelivered", "pongsDelivered"]) &&
+    isRec(w.close) &&
+    typeof w.close.observed === "boolean" &&
+    intOrNull(w.close.rawCode) &&
+    intOrNull(w.close.deliveredCode) &&
+    allInts(w.completions, ["completed", "failed", "duplicate", "doneThrew"]) &&
+    allInts(w.callsThrew, ["send", "ping", "pong", "close", "terminate"]) &&
+    isInt(w.ownerListenerThrew)
+  );
+}
+
+const EMPTY_OWNER_WRAPPER_CHECKED: CpmmOwnerWrapperStructuralCheck["checked"] = Object.freeze({
+  transportRecords: 0,
+  wrapperObservedEvents: 0,
+  ownerReceivedEvents: 0,
+  wrapperOnlyEvents: 0,
+  outgoingCalls: 0,
+  completions: 0,
+  afterSettlementRecords: 0,
+});
+const NO_OWNER_WRAPPER_COVERAGE: CpmmOwnerWrapperStructuralCheck["coverage"] = Object.freeze({
+  wrapper: false,
+  ownerIncoming: false,
+  ownerOutgoing: false,
+  cleanup: false,
+  timing: false,
+});
+
+function ownerWrapperResult(
+  f: Findings,
+  checked: CpmmOwnerWrapperStructuralCheck["checked"],
+  boundary: number | null,
+  coverage: CpmmOwnerWrapperStructuralCheck["coverage"],
+): CpmmOwnerWrapperStructuralCheck {
+  return {
+    status:
+      f.status === "REPRODUCED"
+        ? "STRUCTURALLY_CONSISTENT"
+        : f.status === "MISMATCH"
+          ? "MISMATCH"
+          : "MISSING_EVIDENCE",
+    scope: "RECORDED_OWNER_WRAPPER_STRUCTURE_ONLY",
+    ownerReplayed: false,
+    wrapperReplayed: false,
+    findings: f.list,
+    checked: { ...checked },
+    settlementBoundaryOrdinal: boundary,
+    coverage: { ...coverage },
+  };
+}
+
+/**
+ * Owner and wrapper structural cross-checks (item G, partial), over the validated documents only:
+ * no owner, wrapper, socket or timer is constructed, and nothing is replayed.
+ * - the decorator's records against themselves: delivery labels and owner deliveries against the
+ *   registrations live at dispatch, event indices, completions against their calls;
+ * - the wrapper's diagnostics (read at finish, so including later activity) against every record:
+ *   delivered messages, pings and pongs, the actual close, completions, throws;
+ * - the owner's report (frozen at settlement) against the records before its settlement boundary
+ *   (its last recorded transport action): owner-received events, application, ping and pong
+ *   attempts with their local outcomes and duplicates, pong matches, cleanup; the late counts
+ *   against what the owner received or completed after it. Remote acknowledgement is the
+ *   collector's alone: a local completion never establishes it;
+ * - the report's own times in order, and the collector's receipts, account calls and exchanges
+ *   placed in the recorder's order after the messages that caused them.
+ * Wrapper-observed and owner-received events stay apart: wrapper-only events after the owner's
+ * disposal and later activity are counted and labelled, never folded into the owner's counts.
+ */
+function checkOwnerWrapperStructure(
+  docs: Map<string, Record<string, unknown>>,
+): CpmmOwnerWrapperStructuralCheck {
+  const f = new Findings();
+  const ownerDoc = docs.get(CPMM_EVIDENCE_FILES.ownerReport);
+  const read = (doc: unknown, key: string): unknown =>
+    get(doc, key, "status") === "READ" ? get(doc, key, "value") : undefined;
+  let report = read(ownerDoc, "report") as Record<string, unknown> | undefined;
+  let late = read(ownerDoc, "lateEvents") as Record<string, number> | undefined;
+  let wrapper = read(docs.get(CPMM_EVIDENCE_FILES.transportDiagnostics), "diagnostics") as
+    | Record<string, unknown>
+    | undefined;
+  if (report === undefined) f.add("MISSING_EVIDENCE", "OWNER_REPORT_UNAVAILABLE");
+  else if (!ownerReportValid(report)) {
+    f.add("MISMATCH", "OWNER_REPORT_MALFORMED");
+    report = undefined;
+  }
+  if (late === undefined) f.add("MISSING_EVIDENCE", "OWNER_LATE_EVENTS_UNAVAILABLE");
+  else if (!allInts(late, OWNER_LATE_KEYS)) {
+    f.add("MISMATCH", "OWNER_LATE_EVENTS_MALFORMED");
+    late = undefined;
+  }
+  if (wrapper === undefined) f.add("MISSING_EVIDENCE", "WRAPPER_DIAGNOSTICS_UNAVAILABLE");
+  else if (!wrapperDiagnosticsValid(wrapper)) {
+    f.add("MISMATCH", "WRAPPER_DIAGNOSTICS_MALFORMED");
+    wrapper = undefined;
+  }
+  const recording = docs.get(CPMM_EVIDENCE_FILES.recording);
+  if (get(recording, "transportRecorded") !== true) {
+    f.add("MISSING_EVIDENCE", "TRANSPORT_NOT_RECORDED");
+    return ownerWrapperResult(f, EMPTY_OWNER_WRAPPER_CHECKED, null, NO_OWNER_WRAPPER_COVERAGE);
+  }
+
+  // Retention, pending work and instrumentation: what limits exact comparisons.
+  const complete: Record<string, boolean> = {};
+  for (const c of TRANSPORT_CATEGORIES) {
+    complete[c] = get(recording, "retention", c, "dropped") === 0;
+    if (!complete[c]) f.add("MISSING_EVIDENCE", `TRANSPORT_RECORDS_DROPPED:${c}`);
+  }
+  const failures = get(recording, "instrumentation", "retainedFailures");
+  const correlationGap =
+    get(recording, "instrumentation", "droppedFailureRecords") !== 0 ||
+    !Array.isArray(failures) ||
+    failures.some((x) => get(x, "layer") === "TRANSPORT");
+  if (correlationGap) f.add("MISSING_EVIDENCE", "TRANSPORT_INSTRUMENTATION_INCOMPLETE");
+  const pending = get(recording, "pending");
+  const deliveriesPending = get(pending, "dispatchesAwaitingOwnerDelivery") !== 0;
+  const callsPending =
+    get(pending, "transportCallsInProgress") !== 0 ||
+    ["send", "ping", "pong"].some((m) => get(pending, "completionsAwaitingFirstCall", m) !== 0);
+  if (deliveriesPending) f.add("MISSING_EVIDENCE", "OWNER_DELIVERIES_PENDING_AT_FINISH");
+  if (callsPending) f.add("MISSING_EVIDENCE", "TRANSPORT_CALLS_PENDING_AT_FINISH");
+
+  const records = (
+    get(docs.get(CPMM_EVIDENCE_FILES.transportRecords), "records") as TransportRecord[]
+  )
+    .slice()
+    .sort((a, b) => a.ordinal - b.ordinal);
+  const events = records.filter((r) => r.kind === "EVENT");
+  const calls = records.filter((r) => r.kind === "CALL");
+  const completions = records.filter((r) => r.kind === "COMPLETION");
+  const registrations = records.filter((r) => r.kind === "REGISTER" || r.kind === "UNREGISTER");
+  const eventsComplete =
+    complete.incoming! &&
+    complete.control! &&
+    complete.lifecycle! &&
+    !correlationGap &&
+    !deliveriesPending;
+  const outgoingComplete =
+    complete.outgoing! && complete.control! && complete.lifecycle! && !callsPending;
+
+  // The decorator's records against themselves.
+  const live = new Map<unknown, Set<unknown>>();
+  const disposedBefore = new Set<unknown>();
+  const lastIndex = new Map<unknown, number>();
+  const callByOrdinal = new Map(calls.map((c) => [c.ordinal, c]));
+  for (const r of records) {
+    if (r.kind === "REGISTER" && r.outcome === "RETURNED" && r.registration !== null) {
+      if (!live.has(r.event)) live.set(r.event, new Set());
+      live.get(r.event)!.add(r.registration);
+    } else if (r.kind === "UNREGISTER" && r.outcome === "RETURNED") {
+      live.get(r.event)?.delete(r.registration);
+      disposedBefore.add(r.event);
+    } else if (r.kind === "EVENT") {
+      const registered = r.ownerRegistrationsAtDispatch as number;
+      const expectedLabel =
+        registered > 0
+          ? "OWNER_LISTENERS_REGISTERED"
+          : disposedBefore.has(r.event)
+            ? "WRAPPER_ONLY_AFTER_OWNER_DISPOSAL"
+            : "WRAPPER_ONLY_NO_OWNER_LISTENER";
+      const index = r.eventIndex as number;
+      if (
+        !isInt(registered) ||
+        !isInt(r.ownerDeliveries) ||
+        !isInt(r.ownerListenerThrew) ||
+        !isInt(index) ||
+        r.ownerDeliveries > registered ||
+        r.ownerListenerThrew > r.ownerDeliveries ||
+        index <= (lastIndex.get(r.event) ?? 0) ||
+        (complete.lifecycle &&
+          (r.delivery !== expectedLabel || registered !== (live.get(r.event)?.size ?? 0))) ||
+        (!complete.lifecycle && registered > 0 !== (r.delivery === "OWNER_LISTENERS_REGISTERED")) ||
+        (eventsComplete && index !== (lastIndex.get(r.event) ?? 0) + 1)
+      ) {
+        f.add("MISMATCH", "TRANSPORT_EVENT_RECORD");
+      }
+      lastIndex.set(r.event, isInt(index) ? index : (lastIndex.get(r.event) ?? 0));
+    } else if (r.kind === "CALL") {
+      if (
+        (r.outcome === "IN_PROGRESS") !== (r.endOrdinal === null) ||
+        (r.endOrdinal !== null && !(isInt(r.endOrdinal) && r.endOrdinal > r.ordinal))
+      ) {
+        f.add("MISMATCH", "TRANSPORT_CALL_RECORD");
+      }
+    }
+  }
+  const invocations = new Map<unknown, number>();
+  for (const c of completions) {
+    const call = callByOrdinal.get(c.callOrdinal as number);
+    const n = (invocations.get(c.callOrdinal) ?? 0) + 1;
+    invocations.set(c.callOrdinal, n);
+    if (
+      call === undefined
+        ? outgoingComplete
+        : call.method !== c.method ||
+          call.completionObserved !== true ||
+          c.ordinal <= call.ordinal ||
+          c.afterCallEnded !==
+            (call.endOrdinal !== null && c.ordinal > (call.endOrdinal as number)) ||
+          (outgoingComplete && c.invocation !== n)
+    ) {
+      f.add("MISMATCH", "TRANSPORT_COMPLETION_RECORD");
+    }
+  }
+
+  // The wrapper's diagnostics, read at finish(): every record, later activity included.
+  const count = (event: string) => events.filter((e) => e.event === event).length;
+  const sum = (xs: TransportRecord[], key: string) =>
+    xs.reduce((s, r) => s + (isInt(r[key]) ? (r[key] as number) : 0), 0);
+  const fits = (n: number, total: number, exact: boolean) => (exact ? n === total : n <= total);
+  const wrapperComplete = wrapper !== undefined && eventsComplete && outgoingComplete;
+  if (wrapper !== undefined) {
+    const w = wrapper;
+    if (
+      !fits(lastIndex.get("message") ?? 0, get(w, "messages", "delivered") as number, false) ||
+      !fits(count("message"), get(w, "messages", "delivered") as number, complete.incoming!) ||
+      !fits(count("ping"), get(w, "control", "pingsDelivered") as number, complete.control!) ||
+      !fits(count("pong"), get(w, "control", "pongsDelivered") as number, complete.control!)
+    ) {
+      f.add("MISMATCH", "WRAPPER_DELIVERY_COUNTS");
+    }
+    const closes = events.filter((e) => e.event === "close");
+    if (
+      closes.length > 1 ||
+      (closes.length === 1 &&
+        (get(w, "close", "observed") !== true ||
+          closes[0]!.closeCode !== get(w, "close", "deliveredCode"))) ||
+      (closes.length === 0 && complete.lifecycle && get(w, "close", "observed") === true)
+    ) {
+      f.add("MISMATCH", "WRAPPER_CLOSE");
+    }
+    const first = completions.filter((c) => c.invocation === 1);
+    const exact = outgoingComplete;
+    if (
+      !fits(
+        first.filter((c) => c.failedArgument === false).length,
+        get(w, "completions", "completed") as number,
+        exact,
+      ) ||
+      !fits(
+        first.filter((c) => c.failedArgument !== false).length,
+        get(w, "completions", "failed") as number,
+        exact,
+      ) ||
+      !fits(
+        completions.filter((c) => (c.invocation as number) > 1).length,
+        get(w, "completions", "duplicate") as number,
+        exact,
+      ) ||
+      !fits(
+        completions.filter((c) => c.doneThrew === true).length,
+        get(w, "completions", "doneThrew") as number,
+        exact,
+      )
+    ) {
+      f.add("MISMATCH", "WRAPPER_COMPLETIONS");
+    }
+    // The wrapper counts only the client's own throws; the decorator records every throw.
+    if (
+      outgoingComplete &&
+      (["send", "ping", "pong", "close", "terminate"] as const).some(
+        (m) =>
+          (get(w, "callsThrew", m) as number) >
+          calls.filter((c) => c.method === m && c.outcome === "THREW").length,
+      )
+    ) {
+      f.add("MISMATCH", "WRAPPER_CALLS_THREW");
+    }
+    if (!fits(sum(events, "ownerListenerThrew"), w.ownerListenerThrew as number, eventsComplete)) {
+      f.add("MISMATCH", "WRAPPER_LISTENER_THROWS");
+    }
+  }
+
+  // The settlement boundary: the owner's last recorded transport action. The owner makes no
+  // transport call after settlement, and its final listener disposal immediately precedes it.
+  const ownerActions = records.filter(
+    (r) =>
+      r.kind === "CALL" ||
+      r.kind === "READY_STATE" ||
+      r.kind === "REGISTER" ||
+      r.kind === "UNREGISTER",
+  );
+  const boundaryKnown = complete.lifecycle! && complete.outgoing! && complete.control!;
+  let boundary: number | null = null;
+  for (const r of ownerActions) {
+    const end = r.kind === "CALL" && isInt(r.endOrdinal) ? r.endOrdinal : r.ordinal;
+    boundary = boundary === null ? end : Math.max(boundary, end);
+  }
+  if (!boundaryKnown) boundary = null;
+  const before = (r: TransportRecord) => boundary !== null && r.ordinal < boundary;
+  const after = (r: TransportRecord) => boundary !== null && r.ordinal > boundary;
+  const owned = events.filter((e) => isInt(e.ownerDeliveries) && e.ownerDeliveries > 0);
+  const startCall = calls.find((c) => c.method === "start");
+
+  const ownerIncoming =
+    report !== undefined && late !== undefined && eventsComplete && boundary !== null;
+  const ownerOutgoing =
+    report !== undefined && late !== undefined && outgoingComplete && boundary !== null;
+  if (report !== undefined) {
+    const r = report;
+    const t = r.transport as Record<string, unknown>;
+    // Construction and start.
+    if (
+      (startCall !== undefined && t.started !== true) ||
+      (complete.lifecycle && startCall === undefined && t.started === true) ||
+      (registrations.length > 0 && t.constructed !== true) ||
+      (complete.lifecycle &&
+        t.disposeFailures !==
+          registrations.filter((x) => x.kind === "UNREGISTER" && x.outcome === "THREW").length)
+    ) {
+      f.add("MISMATCH", "OWNER_TRANSPORT");
+    }
+    if (t.openedAtMs !== null && !owned.some((e) => e.event === "open")) {
+      f.add("MISMATCH", "OWNER_TRANSPORT");
+    }
+    // The report's own message accounting: every owner-received message is before start,
+    // after intake, or handed to the collector.
+    const inc = r.incoming as Record<string, number>;
+    const intake = r.intake as Record<string, number>;
+    if (
+      inc.messageEvents !==
+        inc.messagesBeforeStart! + intake.framesAfterIntake! + inc.passedToCollector! ||
+      inc.controlFrames !== inc.pingsReceived! + inc.pongsReceived!
+    ) {
+      f.add("MISMATCH", "OWNER_INCOMING_ACCOUNTING");
+    }
+  }
+  if (ownerIncoming) {
+    const r = report!;
+    const inc = r.incoming as Record<string, number>;
+    const intake = r.intake as Record<string, number>;
+    const t = r.transport as Record<string, number>;
+    const deliveries = (xs: TransportRecord[], event?: string) =>
+      sum(event === undefined ? xs : xs.filter((e) => e.event === event), "ownerDeliveries");
+    const pre = owned.filter(before);
+    const afterStart = pre.filter((e) => startCall !== undefined && e.ordinal > startCall.ordinal);
+    const beforeStart = pre.filter((e) => startCall === undefined || e.ordinal < startCall.ordinal);
+    if (
+      deliveries(pre, "message") !== inc.messageEvents ||
+      deliveries(beforeStart) !== t.eventsBeforeStart ||
+      deliveries(beforeStart, "message") !== inc.messagesBeforeStart
+    ) {
+      f.add("MISMATCH", "OWNER_MESSAGE_COUNTS");
+    }
+    const controlAfterStart = afterStart.filter((e) => e.event === "ping" || e.event === "pong");
+    if (
+      deliveries(controlAfterStart) !== inc.controlFrames! + intake.controlFramesAfterIntake! ||
+      deliveries(controlAfterStart, "ping") < inc.pingsReceived! ||
+      deliveries(controlAfterStart, "pong") < inc.pongsReceived!
+    ) {
+      f.add("MISMATCH", "OWNER_CONTROL_COUNTS");
+    }
+    if (
+      wrapper !== undefined &&
+      (get(wrapper, "messages", "delivered") as number) < deliveries(owned, "message")
+    ) {
+      f.add("MISMATCH", "OWNER_EXCEEDS_WRAPPER");
+    }
+    // Late events: owner listeners still invoked after the boundary (a failed disposal).
+    const lateOwned = owned.filter(after);
+    if (OWNER_EVENTS.some((e) => deliveries(lateOwned, e) !== late![e])) {
+      f.add("MISMATCH", "OWNER_LATE_EVENTS");
+    }
+  }
+
+  // Outgoing attempts, replayed from the records as the owner counts them (no transport replay).
+  let completionsChecked = 0;
+  if (ownerOutgoing) {
+    const r = report!;
+    const out = r.outgoing as Record<string, unknown>;
+    let duplicates = 0;
+    /** One attempt's local outcome: the first completion before any throw, else the throw. */
+    const outcome = (call: TransportRecord) => {
+      const mine = completions.filter((c) => c.callOrdinal === call.ordinal && before(c));
+      completionsChecked += mine.length;
+      let state: "PENDING" | "COMPLETED" | "FAILED" | "THREW" = "PENDING";
+      let n = 0;
+      const steps = [
+        ...mine.map((c) => ({ at: c.ordinal, c })),
+        ...(call.outcome === "THREW" ? [{ at: call.endOrdinal as number, c: null }] : []),
+      ].sort((a, b) => a.at - b.at);
+      for (const s of steps) {
+        if (s.c === null) {
+          if (state === "PENDING") state = "THREW";
+          continue;
+        }
+        n++;
+        if (n > 1 || state !== "PENDING") duplicates++;
+        else state = s.c.failedArgument === false ? "COMPLETED" : "FAILED";
+      }
+      return state === "PENDING" ? "UNRESOLVED" : state;
+    };
+    const sends = calls.filter((c) => c.method === "send" && before(c));
+    if (sends.length !== out.applicationFramesReserved)
+      f.add("MISMATCH", "OWNER_APPLICATION_FRAMES");
+    (["subscribe", "unsubscribe"] as const).forEach((which, i) => {
+      const a = out[which] as Record<string, unknown>;
+      const call = sends[i];
+      const local = call === undefined ? "NOT_ATTEMPTED" : outcome(call);
+      if (
+        a.local !== local ||
+        (a.reservedAtMs === null) !== (local === "NOT_ATTEMPTED") ||
+        (a.localAtMs === null) !== (local === "NOT_ATTEMPTED" || local === "UNRESOLVED")
+      ) {
+        f.add("MISMATCH", "OWNER_APPLICATION_ATTEMPT");
+      }
+    });
+    for (const [method, key] of [
+      ["ping", "pings"],
+      ["pong", "pongReplies"],
+    ] as const) {
+      const tally = { reserved: 0, threw: 0, completed: 0, failed: 0, unresolved: 0 };
+      for (const call of calls.filter((c) => c.method === method && before(c))) {
+        tally.reserved++;
+        const o = outcome(call);
+        if (o === "THREW") tally.threw++;
+        else if (o === "COMPLETED") tally.completed++;
+        else if (o === "FAILED") tally.failed++;
+        else tally.unresolved++;
+      }
+      if (CONTROL_ATTEMPT_KEYS.some((k) => get(out, key, k) !== tally[k])) {
+        f.add("MISMATCH", "OWNER_CONTROL_ATTEMPTS");
+      }
+    }
+    if (duplicates !== out.duplicateCompletions) f.add("MISMATCH", "OWNER_DUPLICATE_COMPLETIONS");
+    if (completions.filter(after).length !== late!.localCompletion) {
+      f.add("MISMATCH", "OWNER_LATE_EVENTS");
+    }
+    // A pong matches only an earlier ping's exact payload (original digests survive redaction).
+    const pingDigests = calls
+      .filter((c) => c.method === "ping" && before(c))
+      .map((c) => ({ at: c.ordinal, digest: get(c, "payload", "originalSha256") }));
+    const matchable = owned.filter(
+      (e) =>
+        e.event === "pong" &&
+        before(e) &&
+        pingDigests.some(
+          (p) =>
+            p.at < e.ordinal &&
+            typeof p.digest === "string" &&
+            p.digest === get(e, "payload", "originalSha256"),
+        ),
+    ).length;
+    const inc = r.incoming as Record<string, number>;
+    if (
+      (out.pongsMatched as number) > matchable ||
+      (out.pongsMatched as number) > (get(out, "pings", "reserved") as number) ||
+      (out.pongsMatched as number) + (out.pongsUnmatched as number) > inc.pongsReceived!
+    ) {
+      f.add("MISMATCH", "OWNER_PONG_MATCHES");
+    }
+  }
+
+  // Remote acknowledgement is the collector's alone: an acknowledged attempt needs the frame,
+  // received after its own send. Sending or completing locally establishes nothing remote.
+  const collector = docs.get(CPMM_EVIDENCE_FILES.collector);
+  const frames = read(collector, "frameRecords") as Record<string, unknown>[] | undefined;
+  const epochReportValue = read(collector, "epochReport");
+  const epochReport = isRec(epochReportValue) ? epochReportValue : undefined;
+  if (report !== undefined) {
+    const out = report.outgoing as Record<string, Record<string, unknown>>;
+    const sends = calls.filter((c) => c.method === "send");
+    const handed =
+      startCall === undefined
+        ? []
+        : owned.filter(
+            (e) =>
+              e.event === "message" &&
+              e.ordinal > startCall.ordinal &&
+              (boundary === null || e.ordinal < boundary),
+          );
+    // By the frame's own sequence: the k-th frame is the k-th message handed over.
+    const framesDropped =
+      get(read(collector, "counters"), "metadataRetention", "frameRecordsDropped") !== 0;
+    const frameAfter = (disposition: string, send: TransportRecord | undefined): boolean | null => {
+      if (frames === undefined || !complete.incoming) return null;
+      const fr = frames.find((x) => get(x, "disposition") === disposition);
+      if (fr === undefined) return framesDropped ? null : false;
+      const seq = get(fr, "sequence");
+      const msg = isInt(seq) && seq >= 1 ? handed[seq - 1] : undefined;
+      if (msg === undefined) return null;
+      return send !== undefined && msg.ordinal > send.ordinal;
+    };
+    const ack: [string, number, string, string, unknown][] = [
+      [
+        "subscribe",
+        0,
+        "SUBSCRIBE_ACKNOWLEDGED",
+        "SUBSCRIBE_REJECTED",
+        get(epochReport, "subscription"),
+      ],
+      [
+        "unsubscribe",
+        1,
+        "UNSUBSCRIBE_ACKNOWLEDGED",
+        "UNSUBSCRIBE_REJECTED",
+        get(epochReport, "unsubscribe", "status"),
+      ],
+    ];
+    for (const [which, i, acked, rejected, collectorState] of ack) {
+      const observed = out[which]!.observed;
+      if (observed === "NOT_OBSERVED") continue;
+      const disposition = observed === "ACKNOWLEDGED" ? acked : rejected;
+      const placed = frameAfter(disposition, sends[i]);
+      if (
+        out[which]!.local === "NOT_ATTEMPTED" ||
+        placed === false ||
+        (observed === "ACKNOWLEDGED" &&
+          epochReport !== undefined &&
+          collectorState !== "ACKNOWLEDGED")
+      ) {
+        f.add("MISMATCH", "OWNER_ACKNOWLEDGEMENT");
+      } else if (placed === null) {
+        f.add("MISSING_EVIDENCE", "ACKNOWLEDGEMENT_FRAME_UNAVAILABLE");
+      }
+    }
+  }
+
+  // Cleanup, phase-aware: only what the owner itself did and observed before its freeze. A later
+  // close (wrapper-only, after the boundary) never changes or upgrades the owner's outcome.
+  const cleanupChecked = report !== undefined && boundary !== null;
+  if (cleanupChecked) {
+    const c = report!.cleanup as Record<string, unknown>;
+    const pre = (m: string) => calls.filter((x) => x.method === m && before(x));
+    const closeCalls = pre("close");
+    const terminate = pre("terminate");
+    const dispose = pre("dispose");
+    const ready = records.filter((x) => x.kind === "READY_STATE" && before(x));
+    const ownerClose = owned.find((e) => e.event === "close" && before(e));
+    const ownerCode =
+      ownerClose === undefined ? null : isInt(ownerClose.closeCode) ? ownerClose.closeCode : null;
+    if (
+      c.closeThrew !== closeCalls.some((x) => x.outcome === "THREW") ||
+      c.terminateAttempted !== terminate.length > 0 ||
+      c.terminateThrew !== terminate.some((x) => x.outcome === "THREW") ||
+      c.closeCode !== ownerCode ||
+      (c.closeObservedAtMs === null) !== (ownerClose === undefined)
+    ) {
+      f.add("MISMATCH", "OWNER_CLEANUP");
+    }
+    const started = get(report, "transport", "started") === true;
+    const statusHolds = ((): boolean => {
+      switch (c.status) {
+        case "SETTLED":
+          return ownerClose !== undefined;
+        case "SETTLED_AFTER_TERMINATE":
+          return (
+            terminate.length > 0 &&
+            (ownerClose !== undefined ||
+              ready.some((x) => x.outcome === "RETURNED" && x.value === 3))
+          );
+        case "FAILED_STILL_OPEN":
+          return terminate.length > 0 && ready.some((x) => x.outcome === "THREW" || x.value !== 3);
+        case "DISPOSED_UNSTARTED":
+          return !started && dispose.some((x) => x.outcome === "RETURNED");
+        case "DISPOSE_FAILED":
+          return !started && dispose.some((x) => x.outcome === "THREW");
+        default:
+          return closeCalls.length === 0 && terminate.length === 0;
+      }
+    })();
+    if (!statusHolds) f.add("MISMATCH", "OWNER_CLEANUP_STATUS");
+  }
+
+  // Times: the report's own fixed order, and the collector's receipts within observation.
+  const uncertainties = report === undefined ? [] : (report.uncertainties as unknown[]);
+  const clockUncertain =
+    uncertainties.includes("CLOCK_INVALID") || uncertainties.includes("CLOCK_REGRESSED");
+  if (clockUncertain) f.add("MISSING_EVIDENCE", "OWNER_CLOCK_UNCERTAIN");
+  const timing = report !== undefined && report.deadlines !== null && !clockUncertain;
+  if (timing) {
+    const r = report!;
+    const d = r.deadlines as Record<string, number>;
+    const settled = r.settledAtMs as number;
+    const notAfter = (a: unknown, b: unknown) =>
+      a === null || b === null || (a as number) <= (b as number);
+    const sub = get(r, "outgoing", "subscribe") as Record<string, unknown>;
+    const unsub = get(r, "outgoing", "unsubscribe") as Record<string, unknown>;
+    const ordered =
+      d.startedAtMs! <= d.ackDeadlineMs! &&
+      d.ackDeadlineMs! <= d.nominalEndMs! &&
+      d.nominalEndMs! <= d.intakeEndMs! &&
+      d.intakeEndMs! <= d.drainDeadlineMs! &&
+      notAfter(d.startedAtMs, get(r, "transport", "openedAtMs")) &&
+      notAfter(get(r, "transport", "openedAtMs"), sub.reservedAtMs) &&
+      notAfter(sub.reservedAtMs, sub.localAtMs) &&
+      notAfter(unsub.reservedAtMs, unsub.localAtMs) &&
+      notAfter(d.startedAtMs, get(r, "intake", "stoppedAtMs")) &&
+      notAfter(get(r, "intake", "stoppedAtMs"), settled) &&
+      notAfter(get(r, "terminal", "atMs"), settled) &&
+      notAfter(get(r, "cleanup", "startedAtMs"), get(r, "cleanup", "endedAtMs")) &&
+      notAfter(get(r, "cleanup", "endedAtMs"), settled) &&
+      notAfter(get(r, "cleanup", "closeObservedAtMs"), settled) &&
+      notAfter(get(r, "cancellation", "requestedAtMs"), settled) &&
+      notAfter(d.startedAtMs, settled);
+    if (!ordered) f.add("MISMATCH", "OWNER_TIMING");
+    // Every recorded collector receipt lies in the observation: [start, intake end), and not
+    // after the intake stop.
+    const stopped = get(r, "intake", "stoppedAtMs");
+    if (
+      (frames ?? []).some((fr) => {
+        const at = get(fr, "receivedAtMs");
+        return (
+          isInt(at) &&
+          (at < d.startedAtMs! || at >= d.intakeEndMs! || (isInt(stopped) && at > stopped))
+        );
+      })
+    ) {
+      f.add("MISMATCH", "OBSERVATION_TIMING");
+    }
+  }
+
+  // The recorder's order: an account() call and its exchange follow the message whose
+  // notification caused them; the owner calls account() only before its settlement.
+  const ledgerCalls = (get(docs.get(CPMM_EVIDENCE_FILES.ledger), "calls") ?? []) as Record<
+    string,
+    unknown
+  >[];
+  const notes = read(collector, "notifications") as Record<string, unknown>[] | undefined;
+  if (notes !== undefined && startCall !== undefined && complete.incoming && !correlationGap) {
+    const handed = owned.filter((e) => e.event === "message" && e.ordinal > startCall.ordinal);
+    const exchanges = (
+      get(docs.get(CPMM_EVIDENCE_FILES.exchangeIndex), "exchanges") as unknown[]
+    ).map((x) => docs.get(get(x, "path") as string));
+    const seen = new Set<unknown>();
+    for (const n of notes) {
+      // A signature's first notification caused its first call and its one exchange.
+      if (seen.has(n.signature)) continue;
+      seen.add(n.signature);
+      const msg = isInt(n.frameSequence) ? handed[n.frameSequence - 1] : undefined;
+      if (msg === undefined) continue;
+      const firstCall = ledgerCalls.find(
+        (c) => c.kind === "ACCOUNT_CALL" && c.signature === n.signature,
+      );
+      const exchange = exchanges.find((x) => get(x, "entry", "requestedIdentity") === n.signature);
+      if (
+        (firstCall !== undefined && isInt(firstCall.ordinal) && firstCall.ordinal < msg.ordinal) ||
+        (exchange !== undefined &&
+          isInt(get(exchange, "ordinal")) &&
+          (get(exchange, "ordinal") as number) < msg.ordinal)
+      ) {
+        f.add("MISMATCH", "DISPATCH_ORDER");
+      }
+    }
+  }
+  if (
+    boundary !== null &&
+    ledgerCalls.some((c) => c.kind === "ACCOUNT_CALL" && isInt(c.ordinal) && c.ordinal > boundary!)
+  ) {
+    f.add("MISMATCH", "ACCOUNT_CALL_AFTER_SETTLEMENT");
+  }
+
+  const coverage = {
+    wrapper: wrapperComplete,
+    ownerIncoming,
+    ownerOutgoing,
+    cleanup: cleanupChecked && complete.lifecycle!,
+    timing,
+  };
+  if (boundary === null && boundaryKnown === false) {
+    f.add("MISSING_EVIDENCE", "SETTLEMENT_BOUNDARY_UNKNOWN");
+  }
+  return ownerWrapperResult(
+    f,
+    {
+      transportRecords: records.length,
+      wrapperObservedEvents: events.length,
+      ownerReceivedEvents: owned.length,
+      wrapperOnlyEvents: events.length - owned.length,
+      outgoingCalls: calls.filter((c) => CALLS_WITH_PAYLOAD.has(c.method)).length,
+      completions: completionsChecked,
+      afterSettlementRecords: boundary === null ? 0 : records.filter(after).length,
+    },
+    boundary,
+    coverage,
   );
 }

@@ -94,6 +94,7 @@ import {
   sealCpmmObservationEvidence,
   verifyCpmmObservationEvidence,
   type CpmmLedgerStructuralCheck,
+  type CpmmOwnerWrapperStructuralCheck,
   type SealCpmmObservationInput,
 } from "./cpmm-pool-observation-evidence.js";
 
@@ -506,6 +507,8 @@ function env(
     wrapTransport?: ((t: CpmmOwnerTransport) => CpmmOwnerTransport) | undefined;
     /** A further fan-out observer, after the recorder (e.g. moving the clock at completion). */
     onExchange?: ((clock: { now: number }) => void) | undefined;
+    /** The owner's cancellation signal. */
+    signal?: AbortSignal | undefined;
   } = {},
   ledgerLimits: typeof LEDGER_LIMITS = LEDGER_LIMITS,
 ) {
@@ -593,6 +596,7 @@ function env(
       return recorder.recordTransport(transport.wrapTransport ? transport.wrapTransport(w) : w);
     },
     timers,
+    ...(transport.signal ? { signal: transport.signal } : {}),
     epoch: 1,
     subscribeRequestId: SUB_REQ,
     unsubscribeRequestId: UNSUB_REQ,
@@ -662,13 +666,21 @@ async function genuineRun(
     secondDeliveries?: number;
     /** Runs once the second notification and the ping have been handled. */
     afterSecond?: () => void;
+    /** Runs after the owner settled and before finish() (later wrapper activity). */
+    afterSettlement?: (client: FakeClient) => void;
+    signal?: AbortSignal;
   } = {},
 ) {
   const ledgerLimits = o.ledgerLimits ?? LEDGER_LIMITS;
   const e = env(
     o.limits,
     o.collectorLimits,
-    { closeMode: o.closeMode, wrapTransport: o.wrapTransport, onExchange: o.onExchange },
+    {
+      closeMode: o.closeMode,
+      wrapTransport: o.wrapTransport,
+      onExchange: o.onExchange,
+      signal: o.signal,
+    },
     ledgerLimits,
   );
   const p = e.owner.run();
@@ -699,6 +711,10 @@ async function genuineRun(
       10,
   );
   const report = await p;
+  if (o.afterSettlement) {
+    o.afterSettlement(e.c);
+    await flush();
+  }
   return {
     snapshot: e.finish(report),
     recorder: e.recorder,
@@ -831,16 +847,22 @@ function expectReproduced(
   v: ReturnType<typeof verifyCpmmObservationEvidence>,
   transactionAnalysis: { status: string } & Record<string, unknown> = UNCREDENTIALED,
   ledger: { status: string } & Record<string, unknown> = CONSISTENT_LEDGER,
+  ownerWrapperCrossChecks: { status: string } & Record<string, unknown> = CONSISTENT_OWNER_WRAPPER,
 ): void {
   const rank = ["REPRODUCED", "LIMITED_BY_REDACTION", "MISSING_EVIDENCE", "MISMATCH"];
-  const ledgerRank = ledger.status === "STRUCTURALLY_CONSISTENT" ? "REPRODUCED" : ledger.status;
+  const of = (s: string) => rank.indexOf(s === "STRUCTURALLY_CONSISTENT" ? "REPRODUCED" : s);
   expectLedgerScope(v.rederivation.components!.ledger);
+  expectOwnerWrapperScope(v.rederivation.components!.ownerWrapperCrossChecks);
   expect(v.rederivation).toMatchObject({
     status: "PARTIAL",
     implementedComponents:
-      rank.indexOf(ledgerRank) > rank.indexOf(transactionAnalysis.status)
-        ? ledgerRank
-        : transactionAnalysis.status,
+      rank[
+        Math.max(
+          of(transactionAnalysis.status),
+          of(ledger.status),
+          of(ownerWrapperCrossChecks.status),
+        )
+      ],
     components: {
       poolContext: { status: "REPRODUCED", findings: [] },
       collector: {
@@ -852,13 +874,39 @@ function expectReproduced(
       },
       transactionAnalysis,
       ledger,
-      ownerWrapperCrossChecks: { status: "NOT_IMPLEMENTED" },
+      ownerWrapperCrossChecks,
       runtimeAccounting: { status: "RUNTIME_ACCOUNTING_NOT_REPRODUCED" },
     },
   });
   expect(v.poolContextProvenance).toBe("SUPPLIED_UNVERIFIED");
   expect(v.acquisitionProvenance).toBe("OPEN_G3");
   expect(v.flags).toEqual(CPMM_EVIDENCE_FALSE_FLAGS);
+}
+
+/** A clean run's owner and wrapper evidence: structurally consistent, every comparison covered. */
+const CONSISTENT_OWNER_WRAPPER = {
+  status: "STRUCTURALLY_CONSISTENT",
+  scope: "RECORDED_OWNER_WRAPPER_STRUCTURE_ONLY",
+  ownerReplayed: false,
+  wrapperReplayed: false,
+  findings: [],
+  coverage: {
+    wrapper: true,
+    ownerIncoming: true,
+    ownerOutgoing: true,
+    cleanup: true,
+    timing: true,
+  },
+};
+
+/** The owner/wrapper component's fixed scope: structural checks only, never a replay. */
+function expectOwnerWrapperScope(c: CpmmOwnerWrapperStructuralCheck): void {
+  expect(c).toMatchObject({
+    scope: "RECORDED_OWNER_WRAPPER_STRUCTURE_ONLY",
+    ownerReplayed: false,
+    wrapperReplayed: false,
+  });
+  expect(c.status).not.toBe("REPRODUCED");
 }
 
 /** The ledger component's fixed scope: structural checks only, never a replay. */
@@ -3275,9 +3323,7 @@ describe("Transaction analysis and binding (items C and G, partial)", () => {
     });
     const ledger = v.rederivation.components!.ledger;
     expectLedgerScope(ledger);
-    expect(v.rederivation.components!.ownerWrapperCrossChecks).toEqual({
-      status: "NOT_IMPLEMENTED",
-    });
+    expectOwnerWrapperScope(v.rederivation.components!.ownerWrapperCrossChecks);
     // Credentials are used, never kept: nothing in the result carries one.
     expect(JSON.stringify(v).includes(SECRET)).toBe(false);
     return { v, tx: v.rederivation.components!.transactionAnalysis, ledger };
@@ -4262,9 +4308,7 @@ describe("Ledger structure (item G, partial): recorded ledger cross-checks", () 
     expect(v.rederivation.components!.runtimeAccounting).toEqual({
       status: "RUNTIME_ACCOUNTING_NOT_REPRODUCED",
     });
-    expect(v.rederivation.components!.ownerWrapperCrossChecks).toEqual({
-      status: "NOT_IMPLEMENTED",
-    });
+    expectOwnerWrapperScope(v.rederivation.components!.ownerWrapperCrossChecks);
     const ledger = v.rederivation.components!.ledger;
     expectLedgerScope(ledger);
     return { v, ledger };
@@ -5408,5 +5452,580 @@ describe("Ledger structure (item G, partial): recorded ledger cross-checks", () 
     const omitted = sealRun(await genuineRun({ limits: { maxExchangeBodyBytes: 64 } }));
     expect(recs(readJson(omitted, LEDGER))[0]!.disposition).toBe("INGESTED");
     expect(ledgerOf(omitted).ledger).toMatchObject(UNCORROBORATED_LEDGER);
+  });
+});
+
+describe("Owner and wrapper structure (item G, partial): recorded cross-checks by phase", () => {
+  type Run = Awaited<ReturnType<typeof genuineRun>>;
+  type Row = Record<string, unknown>;
+  const OR = CPMM_EVIDENCE_FILES.ownerReport;
+  const TD = CPMM_EVIDENCE_FILES.transportDiagnostics;
+  const TR = CPMM_EVIDENCE_FILES.transportRecords;
+  const REC = CPMM_EVIDENCE_FILES.recording;
+  const COL = CPMM_EVIDENCE_FILES.collector;
+  const LEDGER = CPMM_EVIDENCE_FILES.ledger;
+
+  const sealRun = (run: Run) => {
+    const r = sealCpmmObservationEvidence(
+      sealInput(run.snapshot, run.recorder, {}, run.recorderLimits, run.collectorLimits),
+    );
+    if (!r.ok) throw new Error(`seal failed: ${r.code}`);
+    return r.outDir;
+  };
+  /** Integrity holds and every fixed non-claim is kept; returns the owner/wrapper component. */
+  const owOf = (dir: string) => {
+    const v = verifyCpmmObservationEvidence(dir, ANALYSIS);
+    expect(v.integrity, "integrity").toEqual({ ok: true, problems: [] });
+    expect(v.flags).toEqual(CPMM_EVIDENCE_FALSE_FLAGS);
+    expect(v.poolContextProvenance).toBe("SUPPLIED_UNVERIFIED");
+    expect(v.acquisitionProvenance).toBe("OPEN_G3");
+    expect(v.rederivation.components!.runtimeAccounting).toEqual({
+      status: "RUNTIME_ACCOUNTING_NOT_REPRODUCED",
+    });
+    const ow = v.rederivation.components!.ownerWrapperCrossChecks;
+    expectOwnerWrapperScope(ow);
+    return { v, ow };
+  };
+  const report = (o: Row) => get(o, "report", "value") as Record<string, Row>;
+  const diagnostics = (o: Row) => get(o, "diagnostics", "value") as Record<string, Row>;
+  const records = (o: Row) => o.records as Row[];
+  const rewrite = (dir: string, rel: string, mutate: (o: Row) => void) => {
+    const d = copyOf(dir);
+    reseal(d, rel, mutate);
+    return d;
+  };
+  const contradicted = (dir: string, label: string, findings: string[]) => {
+    const { ow, v } = owOf(dir);
+    expect(ow.findings, label).toEqual(findings);
+    expect(ow.status, label).toBe("MISMATCH");
+    expect(v.rederivation.implementedComponents, label).toBe("MISMATCH");
+  };
+  const consistent = (dir: string, label: string) => {
+    const { ow } = owOf(dir);
+    expect(ow, label).toMatchObject(CONSISTENT_OWNER_WRAPPER);
+    return ow;
+  };
+  /** A run whose socket never closes for the owner; the actual close arrives after settlement. */
+  const stuckRun = () =>
+    genuineRun({
+      closeMode: "none",
+      afterSettlement: (c) => c.emit("close", 1006, Buffer.from("")),
+    });
+
+  it("W1: the clean capture and a wrapper-only message after intake are structurally consistent, owner and wrapper kept apart", async () => {
+    const { dir } = await shared;
+    expect(owOf(dir).ow).toEqual({
+      ...CONSISTENT_OWNER_WRAPPER,
+      checked: {
+        transportRecords: 33,
+        wrapperObservedEvents: 9,
+        ownerReceivedEvents: 9,
+        wrapperOnlyEvents: 0,
+        outgoingCalls: 5,
+        completions: 5,
+        afterSettlementRecords: 0,
+      },
+      settlementBoundaryOrdinal: 47,
+    });
+    // A message after intake stopped: the wrapper delivered it, the owner had disposed its
+    // listener. Both counts stand, labelled apart.
+    const after = sealRun(
+      await genuineRun({ closeMode: "none", afterIntake: Buffer.from('{"late":true}') }),
+    );
+    const r = report(readJson(after, OR));
+    const w = diagnostics(readJson(after, TD));
+    expect(get(w, "messages", "delivered")).toBe(
+      (get(r, "incoming", "messageEvents") as number) + 1,
+    );
+    const last = records(readJson(after, TR))
+      .filter((x) => x.event === "message")
+      .at(-1);
+    expect(last).toMatchObject({
+      ownerDeliveries: 0,
+      delivery: "WRAPPER_ONLY_AFTER_OWNER_DISPOSAL",
+    });
+    expect(consistent(after, "after intake").checked.wrapperOnlyEvents).toBe(1);
+    // A run without the unsubscribe acknowledgement: sent and completed locally, never
+    // acknowledged; a local completion establishes nothing remote.
+    const noAck = sealRun(await genuineRun({ noUnsubscribeAck: true }));
+    expect(get(report(readJson(noAck, OR)), "outgoing", "unsubscribe")).toMatchObject({
+      local: "COMPLETED",
+      observed: "NOT_OBSERVED",
+    });
+    consistent(noAck, "not acknowledged");
+    contradicted(
+      rewrite(
+        noAck,
+        OR,
+        (o) => ((get(report(o), "outgoing", "unsubscribe") as Row).observed = "ACKNOWLEDGED"),
+      ),
+      "acknowledged without its frame",
+      ["MISMATCH:OWNER_ACKNOWLEDGEMENT"],
+    );
+  });
+
+  it("W2: failed cleanup stays failed: a later wrapper close is labelled after settlement and never upgrades it", async () => {
+    const stuck = sealRun(await stuckRun());
+    const r = report(readJson(stuck, OR));
+    expect(r.cleanup).toMatchObject({
+      status: "FAILED_STILL_OPEN",
+      terminateAttempted: true,
+      closeCode: null,
+      closeObservedAtMs: null,
+    });
+    expect(diagnostics(readJson(stuck, TD)).close).toMatchObject({
+      observed: true,
+      deliveredCode: 1006,
+    });
+    const ow = consistent(stuck, "stuck");
+    expect(ow.checked.afterSettlementRecords).toBeGreaterThan(0);
+    const cleanup = (o: Row) => report(o).cleanup as Row;
+    const cases: [string, (o: Row) => void, string[]][] = [
+      [
+        "upgraded by the later close",
+        (o) =>
+          Object.assign(cleanup(o), {
+            status: "SETTLED",
+            closeCode: 1006,
+            closeObservedAtMs: report(o).settledAtMs,
+          }),
+        ["MISMATCH:OWNER_CLEANUP", "MISMATCH:OWNER_CLEANUP_STATUS"],
+      ],
+      ["the later code claimed", (o) => (cleanup(o).closeCode = 1006), ["MISMATCH:OWNER_CLEANUP"]],
+      [
+        "settled after terminate without a closed state",
+        (o) => (cleanup(o).status = "SETTLED_AFTER_TERMINATE"),
+        ["MISMATCH:OWNER_CLEANUP_STATUS"],
+      ],
+      [
+        "terminate not attempted",
+        (o) => (cleanup(o).terminateAttempted = false),
+        ["MISMATCH:OWNER_CLEANUP"],
+      ],
+      [
+        "the later close as a late owner event",
+        (o) => ((get(o, "lateEvents", "value") as Row).close = 1),
+        ["MISMATCH:OWNER_LATE_EVENTS"],
+      ],
+    ];
+    for (const [label, mutate, findings] of cases)
+      contradicted(rewrite(stuck, OR, mutate), label, findings);
+    // A close the owner observed itself (the clean capture) must match the wrapper's.
+    const { dir } = await shared;
+    contradicted(
+      rewrite(dir, TD, (o) => ((diagnostics(o).close as Row).deliveredCode = 1006)),
+      "wrapper close code",
+      ["MISMATCH:WRAPPER_CLOSE"],
+    );
+    contradicted(
+      rewrite(dir, OR, (o) => ((report(o).cleanup as Row).closeThrew = true)),
+      "close threw",
+      ["MISMATCH:OWNER_CLEANUP"],
+    );
+  });
+
+  it("W3: late owner events and completions are counted after the settlement boundary only", async () => {
+    const { dir } = await shared;
+    // Nothing after the boundary in the clean capture: claimed late events contradict it.
+    for (const key of ["message", "ping", "localCompletion"]) {
+      contradicted(
+        rewrite(dir, OR, (o) => ((get(o, "lateEvents", "value") as Row)[key] = 1)),
+        `late ${key}`,
+        ["MISMATCH:OWNER_LATE_EVENTS"],
+      );
+    }
+    // A failed disposal leaves the owner's close listener registered: the later close is then
+    // a late owner event, consistently recorded and counted.
+    const stuck = sealRun(await stuckRun());
+    const lateOwner = copyOf(stuck);
+    let disposalOrdinal = 0;
+    reseal(lateOwner, TR, (o) => {
+      const regs = records(o).filter((x) => x.kind === "UNREGISTER" && x.event === "close");
+      const last = regs.at(-1)!;
+      Object.assign(last, { outcome: "THREW", exceptionCode: "DISPOSE_FAILED" });
+      disposalOrdinal = last.ordinal as number;
+      const close = records(o).find((x) => x.kind === "EVENT" && x.event === "close")!;
+      Object.assign(close, {
+        ownerRegistrationsAtDispatch: 1,
+        ownerDeliveries: 1,
+        delivery: "OWNER_LISTENERS_REGISTERED",
+      });
+    });
+    expect(disposalOrdinal).toBeGreaterThan(0);
+    reseal(lateOwner, OR, (o) => {
+      (report(o).transport as Row).disposeFailures = 1;
+      (get(o, "lateEvents", "value") as Row).close = 1;
+    });
+    consistent(lateOwner, "late owner close");
+    // Without the late count, or with the disposal claimed successful, it contradicts.
+    contradicted(
+      rewrite(lateOwner, OR, (o) => ((get(o, "lateEvents", "value") as Row).close = 0)),
+      "late close uncounted",
+      ["MISMATCH:OWNER_LATE_EVENTS"],
+    );
+    contradicted(
+      rewrite(lateOwner, OR, (o) => ((report(o).transport as Row).disposeFailures = 0)),
+      "dispose failure uncounted",
+      ["MISMATCH:OWNER_TRANSPORT"],
+    );
+  });
+
+  it("W4: cancellation is preserved as recorded and structurally consistent", async () => {
+    const ac = new AbortController();
+    const run = await genuineRun({ signal: ac.signal, afterSecond: () => ac.abort() });
+    expect(run.report.terminal.cause).toBe("CANCELLED");
+    expect(run.report.cancellation.requestedAtMs).not.toBeNull();
+    const dir = sealRun(run);
+    consistent(dir, "cancelled");
+    contradicted(
+      rewrite(dir, OR, (o) => {
+        (report(o).cancellation as Row).requestedAtMs =
+          (report(o).settledAtMs as unknown as number) + 1;
+      }),
+      "cancelled after settlement",
+      ["MISMATCH:OWNER_TIMING"],
+    );
+  });
+
+  it("W5: retention loss and pending work limit the comparisons; known contradictions stay visible", async () => {
+    // Genuinely dropped records: missing evidence, with the affected comparisons out of scope.
+    const drops: [
+      Partial<CpmmObservationRecorderLimits>,
+      string[],
+      Partial<Record<string, boolean>>,
+    ][] = [
+      [
+        { maxIncomingRecords: 2 },
+        [
+          "MISSING_EVIDENCE:TRANSPORT_RECORDS_DROPPED:incoming",
+          "MISSING_EVIDENCE:ACKNOWLEDGEMENT_FRAME_UNAVAILABLE",
+        ],
+        { wrapper: false, ownerIncoming: false, ownerOutgoing: true, cleanup: true },
+      ],
+      [
+        { maxControlRecords: 2 },
+        [
+          "MISSING_EVIDENCE:TRANSPORT_RECORDS_DROPPED:control",
+          "MISSING_EVIDENCE:SETTLEMENT_BOUNDARY_UNKNOWN",
+        ],
+        { wrapper: false, ownerIncoming: false, ownerOutgoing: false, cleanup: false },
+      ],
+    ];
+    for (const [limits, findings, coverage] of drops) {
+      const d = sealRun(await genuineRun({ limits }));
+      const { ow } = owOf(d);
+      expect(ow.status, JSON.stringify(limits)).toBe("MISSING_EVIDENCE");
+      expect(ow.findings, JSON.stringify(limits)).toEqual(findings);
+      expect(ow.coverage, JSON.stringify(limits)).toMatchObject(coverage);
+    }
+    // ...while a contradiction that needs nothing dropped is still reported beside them.
+    const dropped = sealRun(await genuineRun({ limits: { maxIncomingRecords: 2 } }));
+    contradicted(
+      rewrite(dropped, TD, (o) => ((diagnostics(o).close as Row).deliveredCode = 1006)),
+      "close code with incoming dropped",
+      [
+        "MISSING_EVIDENCE:TRANSPORT_RECORDS_DROPPED:incoming",
+        "MISMATCH:WRAPPER_CLOSE",
+        "MISSING_EVIDENCE:ACKNOWLEDGEMENT_FRAME_UNAVAILABLE",
+      ],
+    );
+    // Collector frame records genuinely dropped: the acknowledgement frame is missing, never a
+    // contradiction.
+    const frameLoss = sealRun(
+      await genuineRun({ collectorLimits: { maxRetainedFrameRecords: 1 } }),
+    );
+    expect(owOf(frameLoss).ow).toMatchObject({
+      status: "MISSING_EVIDENCE",
+      findings: ["MISSING_EVIDENCE:ACKNOWLEDGEMENT_FRAME_UNAVAILABLE"],
+    });
+    // Pending at finish: an owner delivery not yet credited, a call still running.
+    const { dir } = await shared;
+    const pending = (
+      key: string,
+      findings: string[],
+      coverage: Partial<Record<string, boolean>>,
+    ) => {
+      const d = rewrite(dir, REC, (r) => ((r.pending as Row)[key] = 1));
+      const { ow } = owOf(d);
+      expect(ow.findings, key).toEqual(findings);
+      expect(ow.coverage, key).toMatchObject(coverage);
+    };
+    pending(
+      "dispatchesAwaitingOwnerDelivery",
+      ["MISSING_EVIDENCE:OWNER_DELIVERIES_PENDING_AT_FINISH"],
+      {
+        wrapper: false,
+        ownerIncoming: false,
+        ownerOutgoing: true,
+      },
+    );
+    pending("transportCallsInProgress", ["MISSING_EVIDENCE:TRANSPORT_CALLS_PENDING_AT_FINISH"], {
+      wrapper: false,
+      ownerIncoming: true,
+      ownerOutgoing: false,
+    });
+    // Unread components: the rest is still checked.
+    const failedSection = { status: "READ_FAILED", code: "TEST_READ_FAILED" };
+    const noReport = rewrite(dir, OR, (o) => (o.report = failedSection));
+    const { ow: nr } = owOf(noReport);
+    expect(nr).toMatchObject({
+      status: "MISSING_EVIDENCE",
+      findings: ["MISSING_EVIDENCE:OWNER_REPORT_UNAVAILABLE"],
+      coverage: { wrapper: true, ownerIncoming: false, ownerOutgoing: false, cleanup: false },
+    });
+    const noDiagnostics = rewrite(dir, TD, (o) => (o.diagnostics = failedSection));
+    expect(owOf(noDiagnostics).ow).toMatchObject({
+      status: "MISSING_EVIDENCE",
+      findings: ["MISSING_EVIDENCE:WRAPPER_DIAGNOSTICS_UNAVAILABLE"],
+      coverage: { wrapper: false, ownerIncoming: true, ownerOutgoing: true, cleanup: true },
+    });
+  });
+
+  it("W6: outgoing attempts, completions and pong matches equal the decorator's records; sending never acknowledges", async () => {
+    const { dir } = await shared;
+    const out = (o: Row) => report(o).outgoing as Row;
+    const cases: [string, string, (o: Row) => void, string[]][] = [
+      [
+        "subscribe failed",
+        OR,
+        (o) => ((out(o).subscribe as Row).local = "FAILED"),
+        ["MISMATCH:OWNER_APPLICATION_ATTEMPT"],
+      ],
+      [
+        "unsubscribe unresolved",
+        OR,
+        (o) => Object.assign(out(o).unsubscribe as Row, { local: "UNRESOLVED", localAtMs: null }),
+        ["MISMATCH:OWNER_APPLICATION_ATTEMPT"],
+      ],
+      [
+        "a third frame",
+        OR,
+        (o) => (out(o).applicationFramesReserved = 3),
+        ["MISMATCH:OWNER_APPLICATION_FRAMES"],
+      ],
+      [
+        "ping outcomes",
+        OR,
+        (o) => Object.assign(out(o).pings as Row, { completed: 1, unresolved: 1 }),
+        ["MISMATCH:OWNER_CONTROL_ATTEMPTS"],
+      ],
+      [
+        "pong reply threw",
+        OR,
+        (o) => Object.assign(out(o).pongReplies as Row, { completed: 0, threw: 1 }),
+        ["MISMATCH:OWNER_CONTROL_ATTEMPTS"],
+      ],
+      [
+        "a duplicate completion",
+        OR,
+        (o) => (out(o).duplicateCompletions = 1),
+        ["MISMATCH:OWNER_DUPLICATE_COMPLETIONS"],
+      ],
+      ["more pongs matched", OR, (o) => (out(o).pongsMatched = 3), ["MISMATCH:OWNER_PONG_MATCHES"]],
+      [
+        "subscribe acknowledged though the collector says not",
+        COL,
+        (o) => ((get(o, "epochReport", "value") as Row).subscription = "PENDING"),
+        ["MISMATCH:OWNER_ACKNOWLEDGEMENT"],
+      ],
+      [
+        "wrapper completion failed",
+        TD,
+        (o) => ((diagnostics(o).completions as Row).failed = 1),
+        ["MISMATCH:WRAPPER_COMPLETIONS"],
+      ],
+      [
+        "wrapper send threw",
+        TD,
+        (o) => ((diagnostics(o).callsThrew as Row).send = 1),
+        ["MISMATCH:WRAPPER_CALLS_THREW"],
+      ],
+      [
+        "completion inside its call",
+        TR,
+        (o) => (records(o).find((x) => x.kind === "COMPLETION")!.afterCallEnded = false),
+        ["MISMATCH:TRANSPORT_COMPLETION_RECORD"],
+      ],
+      [
+        "pongs answering a later ping",
+        TR,
+        (o) => {
+          // Payloads swapped consistently: the first pong now carries the second ping's bytes.
+          const [a, b] = records(o).filter((x) => x.kind === "EVENT" && x.event === "pong");
+          [a!.payload, b!.payload] = [b!.payload, a!.payload];
+        },
+        ["MISMATCH:OWNER_PONG_MATCHES"],
+      ],
+    ];
+    cases.push(
+      [
+        "subscribe completion time missing",
+        OR,
+        (o) => ((out(o).subscribe as Row).localAtMs = null),
+        ["MISMATCH:OWNER_APPLICATION_ATTEMPT"],
+      ],
+      [
+        "subscribe rejected without its frame",
+        OR,
+        (o) => ((out(o).subscribe as Row).observed = "REJECTED"),
+        ["MISMATCH:OWNER_ACKNOWLEDGEMENT"],
+      ],
+      [
+        "unsubscribe acknowledged before its send",
+        COL,
+        (o) => {
+          // The two acknowledgement frames (same length) swapped: the unsubscribe's is now first.
+          const frames = get(o, "frameRecords", "value") as Row[];
+          const [a, d] = [frames[0]!, frames[3]!];
+          [a.disposition, d.disposition] = [d.disposition, a.disposition];
+        },
+        ["MISMATCH:OWNER_ACKNOWLEDGEMENT"],
+      ],
+      [
+        "transport not started",
+        OR,
+        (o) => ((report(o).transport as Row).started = false),
+        ["MISMATCH:OWNER_TRANSPORT"],
+      ],
+    );
+    for (const [label, file, mutate, findings] of cases)
+      contradicted(rewrite(dir, file, mutate), label, findings);
+    // A failed pong reply, recorded consistently by the decorator, the wrapper and the owner.
+    const failedReply = rewrite(dir, TR, (o) => {
+      const reply = records(o).find((x) => x.kind === "COMPLETION" && x.method === "pong")!;
+      reply.failedArgument = true;
+    });
+    reseal(failedReply, TD, (o) =>
+      Object.assign(diagnostics(o).completions as Row, { completed: 4, failed: 1 }),
+    );
+    reseal(failedReply, OR, (o) =>
+      Object.assign(out(o).pongReplies as Row, { completed: 0, failed: 1 }),
+    );
+    consistent(failedReply, "failed pong reply");
+  });
+
+  it("W7: delivery labels, counts, ordinals and times are checked against the records and the report", async () => {
+    const { dir } = await shared;
+    const message = (o: Row, i: number) =>
+      records(o).filter((x) => x.kind === "EVENT" && x.event === "message")[i]!;
+    const deadlines = (o: Row) => report(o).deadlines as Row;
+    const cases: [string, string, (o: Row) => void, string[]][] = [
+      [
+        "wrapper delivered fewer",
+        TD,
+        (o) => ((diagnostics(o).messages as Row).delivered = 3),
+        ["MISMATCH:WRAPPER_DELIVERY_COUNTS", "MISMATCH:OWNER_EXCEEDS_WRAPPER"],
+      ],
+      [
+        "wrapper pongs",
+        TD,
+        (o) => ((diagnostics(o).control as Row).pongsDelivered = 3),
+        ["MISMATCH:WRAPPER_DELIVERY_COUNTS"],
+      ],
+      [
+        "a delivery label",
+        TR,
+        (o) => (message(o, 1).delivery = "WRAPPER_ONLY_NO_OWNER_LISTENER"),
+        ["MISMATCH:TRANSPORT_EVENT_RECORD"],
+      ],
+      [
+        "registrations at dispatch",
+        TR,
+        (o) => (message(o, 1).ownerRegistrationsAtDispatch = 2),
+        ["MISMATCH:TRANSPORT_EVENT_RECORD"],
+      ],
+      [
+        "a message relabelled wrapper-only",
+        TR,
+        (o) => Object.assign(message(o, 3), { ownerDeliveries: 0 }),
+        [
+          "MISMATCH:OWNER_MESSAGE_COUNTS",
+          // The unsubscribe acknowledgement's message is then no longer handed over.
+          "MISSING_EVIDENCE:ACKNOWLEDGEMENT_FRAME_UNAVAILABLE",
+        ],
+      ],
+      [
+        "an event index",
+        TR,
+        (o) => (message(o, 1).eventIndex = 3),
+        ["MISMATCH:TRANSPORT_EVENT_RECORD"],
+      ],
+      [
+        "owner messages not accounted",
+        OR,
+        (o) => ((report(o).incoming as Row).messageEvents = 5),
+        ["MISMATCH:OWNER_INCOMING_ACCOUNTING", "MISMATCH:OWNER_MESSAGE_COUNTS"],
+      ],
+      [
+        "control frames not received",
+        OR,
+        (o) => Object.assign(report(o).incoming as Row, { pingsReceived: 2, controlFrames: 4 }),
+        ["MISMATCH:OWNER_CONTROL_COUNTS"],
+      ],
+      [
+        "deadlines out of order",
+        OR,
+        (o) => (deadlines(o).nominalEndMs = (deadlines(o).intakeEndMs as number) + 1),
+        ["MISMATCH:OWNER_TIMING"],
+      ],
+      [
+        "cleanup ended after settlement",
+        OR,
+        (o) =>
+          ((report(o).cleanup as Row).endedAtMs = (report(o).settledAtMs as unknown as number) + 1),
+        ["MISMATCH:OWNER_TIMING"],
+      ],
+      [
+        "a receipt after the intake stop",
+        OR,
+        (o) => ((report(o).intake as Row).stoppedAtMs = RECEIVED_AT - 1),
+        ["MISMATCH:OBSERVATION_TIMING"],
+      ],
+      [
+        "an account call after settlement",
+        LEDGER,
+        (o) => {
+          const call = (o.calls as Row[]).find((c) => c.kind === "ACCOUNT_CALL")!;
+          call.ordinal = 48;
+        },
+        ["MISMATCH:ACCOUNT_CALL_AFTER_SETTLEMENT"],
+      ],
+      [
+        "an account call before its notification",
+        LEDGER,
+        (o) => {
+          const call = (o.calls as Row[]).find((c) => c.kind === "ACCOUNT_CALL")!;
+          call.ordinal = 21;
+        },
+        ["MISMATCH:DISPATCH_ORDER"],
+      ],
+      [
+        "wrapper delivered more",
+        TD,
+        (o) => ((diagnostics(o).messages as Row).delivered = 5),
+        ["MISMATCH:WRAPPER_DELIVERY_COUNTS"],
+      ],
+      [
+        "a ping event index skipped",
+        TR,
+        (o) => (records(o).find((x) => x.kind === "EVENT" && x.event === "ping")!.eventIndex = 2),
+        ["MISMATCH:TRANSPORT_EVENT_RECORD"],
+      ],
+      [
+        "more deliveries than registrations",
+        TR,
+        (o) =>
+          (records(o).find((x) => x.kind === "EVENT" && x.event === "open")!.ownerDeliveries = 2),
+        ["MISMATCH:TRANSPORT_EVENT_RECORD"],
+      ],
+      [
+        "control frames after intake claimed",
+        OR,
+        (o) => ((report(o).intake as Row).controlFramesAfterIntake = 1),
+        ["MISMATCH:OWNER_CONTROL_COUNTS"],
+      ],
+    ];
+    for (const [label, file, mutate, findings] of cases)
+      contradicted(rewrite(dir, file, mutate), label, findings);
   });
 });
