@@ -809,7 +809,17 @@ const CONSISTENT_LEDGER = {
   ledgerReplayed: false,
   ingestionReplayed: false,
   findings: [],
-  coverage: { epochTotals: true, callTotals: true, duplicateDetails: true },
+  coverage: { epochTotals: true, callTotals: true, duplicateDetails: true, eventMetadata: true },
+};
+/**
+ * A clean ingested swap's ledger without a matched analysis (no credentials): consistent as far as
+ * checked, but its event-derived verified metadata is uncorroborated, explicitly.
+ */
+const UNCORROBORATED_LEDGER = {
+  ...CONSISTENT_LEDGER,
+  status: "MISSING_EVIDENCE",
+  findings: ["MISSING_EVIDENCE:LEDGER_EVENT_METADATA_UNCORROBORATED"],
+  coverage: { ...CONSISTENT_LEDGER.coverage, eventMetadata: false },
 };
 
 /**
@@ -991,7 +1001,7 @@ describe("CPMM observation evidence: sealing", () => {
     const v = verifyCpmmObservationEvidence(result.outDir);
     expect(v.integrity).toEqual({ ok: true, problems: [] });
     expect(v.retention).toEqual({ status: "COMPLETE", reasons: [] });
-    expectReproduced(v);
+    expectReproduced(v, UNCREDENTIALED, UNCORROBORATED_LEDGER);
     expectReproduced(verifyCpmmObservationEvidence(result.outDir, ANALYSIS), MATCHED_SWAP);
     expect(v.sealedClaims).toMatchObject({ rederivation: { status: "NOT_IMPLEMENTED" } });
     expect(v.poolContextProvenance).toBe("SUPPLIED_UNVERIFIED");
@@ -4318,13 +4328,15 @@ describe("Ledger structure (item G, partial): recorded ledger cross-checks", () 
         settlements: 2,
         duplicateDetails: 1,
         eventTotalsCorroborated: 1,
+        verifiedMetadataCorroborated: 1,
       },
     });
     expect(clean.v.rederivation.implementedComponents).toBe("REPRODUCED");
-    // Without analysis credentials the structure is the same; no total is corroborated.
+    // Without analysis credentials the structure is the same, but nothing decoded corroborates
+    // the swap's total or its event-derived metadata, and that is explicit.
     expect(ledgerOf(dir, false).ledger).toMatchObject({
-      ...CONSISTENT_LEDGER,
-      checked: { eventTotalsCorroborated: 0 },
+      ...UNCORROBORATED_LEDGER,
+      checked: { eventTotalsCorroborated: 0, verifiedMetadataCorroborated: 0 },
     });
 
     // Two signatures: two first occurrences, each settled once, each total corroborated.
@@ -4344,6 +4356,7 @@ describe("Ledger structure (item G, partial): recorded ledger cross-checks", () 
         settlements: 2,
         duplicateDetails: 0,
         eventTotalsCorroborated: 2,
+        verifiedMetadataCorroborated: 2,
       },
     });
 
@@ -4378,10 +4391,12 @@ describe("Ledger structure (item G, partial): recorded ledger cross-checks", () 
         settlements: 2,
         duplicateDetails: 1,
         eventTotalsCorroborated: 1,
+        verifiedMetadataCorroborated: 1,
       },
     });
     // The history is still checked: a receipt-time disposition the record never had contradicts
-    // the single PENDING-to-terminal transition. PENDING at receipt is always possible.
+    // the single PENDING-to-terminal transition. PENDING at receipt is possible only where the
+    // recorded order allows it (L9): here the duplicate call precedes the RECORDED settlement.
     contradicted(
       rewrite(pending, (l) => {
         recs(l)[0]!.duplicateDetails[0]!.firstDispositionAtReceipt = "UNRESOLVED";
@@ -4389,11 +4404,12 @@ describe("Ledger structure (item G, partial): recorded ledger cross-checks", () 
       "never had",
       ["MISMATCH:LEDGER_DUPLICATE_TIMING"],
     );
-    consistent(
+    contradicted(
       rewrite(dir, (l) => {
         recs(l)[0]!.duplicateDetails[0]!.firstDispositionAtReceipt = "PENDING";
       }),
-      "pending at receipt",
+      "pending after the settlement",
+      ["MISMATCH:LEDGER_DUPLICATE_CAUSALITY"],
     );
   });
 
@@ -4631,7 +4647,10 @@ describe("Ledger structure (item G, partial): recorded ledger cross-checks", () 
     // contradict it, and the decoded count never proves what the tracker accepted.
     const twoEvents = ingestion("INGESTED", null, { total: 2, accepted: 2 });
     contradicted(twoEvents, "event total", ["MISMATCH:LEDGER_EVENT_TOTAL"]);
-    expect(consistent(twoEvents, "uncredentialed", false).checked.eventTotalsCorroborated).toBe(0);
+    expect(ledgerOf(twoEvents, false).ledger).toMatchObject({
+      ...UNCORROBORATED_LEDGER,
+      checked: { eventTotalsCorroborated: 0 },
+    });
   });
 
   it("L4: pending settlements and records, dropped and unrecorded calls are missing evidence; a missing settlement with nothing pending is not", async () => {
@@ -4678,6 +4697,8 @@ describe("Ledger structure (item G, partial): recorded ledger cross-checks", () 
     contradicted(pendingRecord(true), "settled yet pending", [
       "MISSING_EVIDENCE:LEDGER_RECORD_PENDING",
       "MISMATCH:LEDGER_SETTLEMENT_STATE",
+      // The duplicate call was recorded after that settlement, so it cannot have seen PENDING.
+      "MISMATCH:LEDGER_DUPLICATE_CAUSALITY",
     ]);
     // A settlement missing while nothing was pending, dropped or in progress.
     contradicted(
@@ -4685,7 +4706,12 @@ describe("Ledger structure (item G, partial): recorded ledger cross-checks", () 
         l.calls = callsOf(l).filter((c) => !(c.kind === "ACCOUNT_SETTLEMENT" && c.call === 1));
       }),
       "settlement missing",
-      ["MISMATCH:LEDGER_RECORD_REFERENCE", "MISMATCH:LEDGER_CALL_TOTALS"],
+      // The transaction binding is contradicted too, so nothing corroborates the swap's metadata.
+      [
+        "MISSING_EVIDENCE:LEDGER_EVENT_METADATA_UNCORROBORATED",
+        "MISMATCH:LEDGER_RECORD_REFERENCE",
+        "MISMATCH:LEDGER_CALL_TOTALS",
+      ],
     );
     // A ledger whose calls were never recorded: every call check is out of scope.
     const unrecorded = rewrite(dir, (l) => (l.calls = []));
@@ -4870,6 +4896,8 @@ describe("Ledger structure (item G, partial): recorded ledger cross-checks", () 
         (l) => (recs(l)[0]!.epoch = 2),
         [
           "MISMATCH:LEDGER_RECORD_EPOCH",
+          // The contradicted binding leaves no matched analysis to corroborate the metadata.
+          "MISSING_EVIDENCE:LEDGER_EVENT_METADATA_UNCORROBORATED",
           "MISMATCH:LEDGER_EPOCH_TOTALS",
           "MISMATCH:LEDGER_RECORD_REFERENCE",
         ],
@@ -5085,6 +5113,7 @@ describe("Ledger structure (item G, partial): recorded ledger cross-checks", () 
         (l) => (recs(l)[0]!.verifiedSlot = SLOT + 1),
         [
           "MISMATCH:LEDGER_VERIFIED_METADATA",
+          "MISMATCH:LEDGER_EVENT_METADATA",
           "MISMATCH:LEDGER_DUPLICATE_AGREEMENT",
           "MISMATCH:LEDGER_METADATA_CONFLICT",
         ],
@@ -5152,7 +5181,11 @@ describe("Ledger structure (item G, partial): recorded ledger cross-checks", () 
       [
         "call outcome outside the enum",
         (l) => (callOf(l, 2).outcome = "DONE"),
-        ["MISMATCH:ACCOUNT_CALL_MALFORMED", "MISMATCH:ACCOUNT_SETTLEMENT_ORPHANED"],
+        [
+          "MISSING_EVIDENCE:LEDGER_EVENT_METADATA_UNCORROBORATED",
+          "MISMATCH:ACCOUNT_CALL_MALFORMED",
+          "MISMATCH:ACCOUNT_SETTLEMENT_ORPHANED",
+        ],
       ],
       [
         "settlement for a call that threw",
@@ -5180,6 +5213,8 @@ describe("Ledger structure (item G, partial): recorded ledger cross-checks", () 
           }),
         [
           "MISMATCH:LEDGER_RECORD_AMBIGUOUS",
+          // The ambiguous binding leaves no matched analysis to corroborate either record.
+          "MISSING_EVIDENCE:LEDGER_EVENT_METADATA_UNCORROBORATED",
           // A further first occurrence the epoch never counted and no call settled.
           "MISMATCH:LEDGER_EPOCH_TOTALS",
           "MISMATCH:LEDGER_RECORD_REFERENCE",
@@ -5229,5 +5264,149 @@ describe("Ledger structure (item G, partial): recorded ledger cross-checks", () 
       findings: ["MISSING_EVIDENCE:LEDGER_LIMITS_UNAVAILABLE"],
       coverage: { epochTotals: true, callTotals: true, duplicateDetails: true },
     });
+  });
+  it("L9: a duplicate recorded after its first occurrence's RECORDED settlement saw the final state; the converse is not inferred", async () => {
+    const { dir } = await shared;
+    // The clean capture's order: the RECORDED settlement, then the duplicate's call.
+    const l0 = readJson(dir, LEDGER);
+    expect(settlementOf(l0, 1)).toMatchObject({ status: "RECORDED", ordinal: 26 });
+    expect(callOf(l0, 2)).toMatchObject({ ordinal: 28 });
+    // The review's reproduction: only the retained detail's receipt-time state rewritten.
+    contradicted(
+      rewrite(dir, (l) => {
+        recs(l)[0]!.duplicateDetails[0]!.firstDispositionAtReceipt = "PENDING";
+      }),
+      "pending after the settlement",
+      ["MISMATCH:LEDGER_DUPLICATE_CAUSALITY"],
+    );
+    // A call of another signature is not this duplicate's: its contradiction is reported, but
+    // its order proves nothing about what the detail saw.
+    contradicted(
+      rewrite(dir, (l) => {
+        recs(l)[0]!.duplicateDetails[0]!.firstDispositionAtReceipt = "PENDING";
+        callOf(l, 2).signature = signatureOf(2);
+      }),
+      "another signature's call",
+      ["MISMATCH:LEDGER_RECORD_REFERENCE"],
+    );
+    // Without the settlement's place in the order (still pending at finish), nothing is
+    // inferred: only the pending settlement is reported.
+    const unordered = rewrite(dir, (l) => {
+      recs(l)[0]!.duplicateDetails[0]!.firstDispositionAtReceipt = "PENDING";
+      l.calls = callsOf(l).filter((c) => !(c.kind === "ACCOUNT_SETTLEMENT" && c.call === 1));
+    });
+    reseal(unordered, REC, (r) => ((r.pending as Row).accountSettlementsPending = 1));
+    expect(ledgerOf(unordered).ledger).toMatchObject({
+      status: "MISSING_EVIDENCE",
+      findings: ["MISSING_EVIDENCE:LEDGER_SETTLEMENTS_PENDING"],
+    });
+
+    // The genuine held response: the duplicate's call precedes the RECORDED settlement, and its
+    // detail genuinely says PENDING (consistent). Had it seen the final state instead, that is
+    // consistent too: a call before the settlement proves nothing about what it saw.
+    let release!: () => void;
+    const held = new Promise<void>((r) => (release = r));
+    const pending = sealRun(
+      await genuineRun({
+        responder: async (req) => {
+          await held;
+          return okTx(1)(req);
+        },
+        afterSecond: () => release(),
+      }),
+    );
+    const l1 = readJson(pending, LEDGER);
+    expect(callOf(l1, 2).ordinal as number).toBeLessThan(settlementOf(l1, 1).ordinal as number);
+    expect(recs(l1)[0]!.duplicateDetails[0]!.firstDispositionAtReceipt).toBe("PENDING");
+    consistent(pending, "genuine pending duplicate");
+    consistent(
+      rewrite(pending, (l) => {
+        recs(l)[0]!.duplicateDetails[0]!.firstDispositionAtReceipt = "INGESTED";
+      }),
+      "final state before the settlement",
+    );
+  });
+
+  it("L10: verified metadata the ledger derives from a bound swap's events is corroborated by the matched analysis", async () => {
+    const { dir } = await shared;
+    // The review's reproduction: only the verified block time incremented. The response says
+    // BLOCK_TIME; the transaction itself still matches.
+    const later = rewrite(dir, (l) => {
+      const r = recs(l)[0]!;
+      expect(r.verifiedBlockTimeSec).toBe(BLOCK_TIME);
+      r.verifiedBlockTimeSec = BLOCK_TIME + 1;
+    });
+    expect(ledgerOf(later).v.rederivation.components!.transactionAnalysis).toMatchObject(
+      MATCHED_SWAP,
+    );
+    contradicted(later, "block time", ["MISMATCH:LEDGER_EVENT_METADATA"]);
+    // Without a matched analysis it cannot be corroborated, and that stays explicit...
+    expect(ledgerOf(later, false).ledger).toMatchObject(UNCORROBORATED_LEDGER);
+    // ...while a contradiction found independently stays visible beside it.
+    contradicted(
+      rewrite(dir, (l) => (recs(l)[0]!.verifiedSlot = SLOT + 1)),
+      "slot, uncredentialed",
+      [
+        "MISMATCH:LEDGER_VERIFIED_METADATA",
+        "MISSING_EVIDENCE:LEDGER_EVENT_METADATA_UNCORROBORATED",
+        "MISMATCH:LEDGER_DUPLICATE_AGREEMENT",
+        "MISMATCH:LEDGER_METADATA_CONFLICT",
+      ],
+      false,
+    );
+    // Incomplete ingestion of a bound swap carries the events' metadata too.
+    const incomplete = (verified: Row) =>
+      rewrite(dir, (l) => {
+        setDisposition(l, "INGESTION_INCOMPLETE");
+        Object.assign(recs(l)[0]!, {
+          blockingClass: "INGEST_REJECTED",
+          ingestion: { ...ZERO, status: "NONE_ACCEPTED", total: 1, rejected: 1 },
+          ...verified,
+        });
+      });
+    expect(consistent(incomplete({}), "rejected").checked).toMatchObject({
+      verifiedMetadataCorroborated: 1,
+    });
+    contradicted(incomplete({ verifiedBlockTimeSec: BLOCK_TIME - 1 }), "rejected, other time", [
+      "MISMATCH:LEDGER_EVENT_METADATA",
+    ]);
+    // An accounting exception keeps no verified metadata: nothing to corroborate or require.
+    const exception = rewrite(dir, (l) => {
+      setDisposition(l, "INGESTION_INCOMPLETE");
+      Object.assign(recs(l)[0]!, {
+        blockingClass: "ACCOUNTING_EXCEPTION",
+        ingestion: { ...ZERO, status: "EXCEPTION", total: 1, indeterminate: 1 },
+        verifiedSlot: null,
+        verifiedBlockTimeSec: null,
+      });
+    });
+    expect(consistent(exception, "exception").checked).toMatchObject({
+      eventTotalsCorroborated: 1,
+      verifiedMetadataCorroborated: 0,
+    });
+    expect(ledgerOf(exception, false).ledger).toMatchObject(CONSISTENT_LEDGER);
+
+    // Positioned outcomes use the notification's metadata (no block time here), never the
+    // response's: a genuine no-target transaction is consistent with a null verified time.
+    const memo = (): Ix => ({ program: MEMO, accounts: [], data: Uint8Array.from([1]) });
+    const noTarget = sealRun(
+      await genuineRun({
+        responder: async ({ id }) =>
+          new Response(
+            JSON.stringify({ jsonrpc: "2.0", id, result: txResult(signatureOf(1), [memo()]) }),
+            { status: 200 },
+          ),
+      }),
+    );
+    expect(recs(readJson(noTarget, LEDGER))[0]).toMatchObject({
+      disposition: "POLICY_PENDING",
+      verifiedSlot: SLOT,
+      verifiedBlockTimeSec: null,
+    });
+    expect(consistent(noTarget, "no target").checked.verifiedMetadataCorroborated).toBe(0);
+    // A genuinely omitted response body: credentials supplied, nothing to corroborate with.
+    const omitted = sealRun(await genuineRun({ limits: { maxExchangeBodyBytes: 64 } }));
+    expect(recs(readJson(omitted, LEDGER))[0]!.disposition).toBe("INGESTED");
+    expect(ledgerOf(omitted).ledger).toMatchObject(UNCORROBORATED_LEDGER);
   });
 });

@@ -1271,6 +1271,11 @@ export interface CpmmLedgerStructuralCheck {
      * the recorded total only; acceptance by the tracker is the runtime's report, never proven.
      */
     readonly eventTotalsCorroborated: number;
+    /**
+     * Records whose verified slot and block time the ledger derived from a bound swap's events,
+     * equal to the slot and block time of the events decoded from the matched response.
+     */
+    readonly verifiedMetadataCorroborated: number;
   };
   /** Which exact cross-checks the recorded scope supported (false: a finding says why not). */
   readonly coverage: {
@@ -1280,7 +1285,19 @@ export interface CpmmLedgerStructuralCheck {
     readonly callTotals: boolean;
     /** Every duplicate occurrence's detail retained. */
     readonly duplicateDetails: boolean;
+    /** Every event-derived verified slot and block time corroborated by a matched analysis. */
+    readonly eventMetadata: boolean;
   };
+}
+
+/**
+ * Bounded metadata of the events decoded from one matched `RESOLVED_SWAPS` response: their count,
+ * and their slot and block time when every event agrees (null otherwise).
+ */
+interface DecodedSwapEvents {
+  readonly count: number;
+  readonly slot: number | null;
+  readonly blockTimeSec: number | null;
 }
 
 export interface CpmmRederivation {
@@ -2971,7 +2988,7 @@ function rederive(
   }
   let transactionAnalysis: CpmmTransactionRederivation;
   // Event counts decoded from matched swap responses, by signature (for the ledger's totals).
-  const decodedEvents = new Map<string, number>();
+  const decodedEvents = new Map<string, DecodedSwapEvents>();
   try {
     transactionAnalysis = analyzeTransactions(docs, pool, credentials, decodedEvents);
   } catch {
@@ -3171,7 +3188,7 @@ function analyzeTransactions(
   docs: Map<string, Record<string, unknown>>,
   pool: unknown,
   credentials: AnalysisCredentials,
-  decodedEvents: Map<string, number>,
+  decodedEvents: Map<string, DecodedSwapEvents>,
 ): CpmmTransactionRederivation {
   const f = new Findings();
   const plan = get(docs.get(CPMM_EVIDENCE_FILES.plan), "plan");
@@ -3436,7 +3453,7 @@ function analyzeTransactions(
     // The analysis of those bytes.
     let notAnalysed: string | null = material ?? unavailable;
     let decoded: CpmmTransactionExchangeResult["decoded"] = null;
-    let decodedEventCount = 0;
+    let decodedSwapEvents: DecodedSwapEvents | null = null;
     if (notAnalysed !== null || "missing" in body) {
       // Not analysable: the material or the analysis is unavailable (above).
     } else if (note === undefined || signature === null || !isInt(id)) {
@@ -3468,7 +3485,17 @@ function analyzeTransactions(
           bodyState: get(a, "body", "state") as string,
         };
         const events = get(a, "events");
-        decodedEventCount = Array.isArray(events) ? events.length : 0;
+        const list = Array.isArray(events) ? (events as unknown[]) : [];
+        const single = (key: string, valid: (v: unknown) => boolean): number | null => {
+          const values = new Set(list.map((e) => get(e, key)));
+          const [only] = values;
+          return values.size === 1 && valid(only) ? (only as number) : null;
+        };
+        decodedSwapEvents = {
+          count: list.length,
+          slot: single("slot", isInt),
+          blockTimeSec: single("blockTimeSec", positiveInt),
+        };
       }
     }
 
@@ -3487,7 +3514,7 @@ function analyzeTransactions(
       comparison = same ? "MATCHED" : "MISMATCH";
       if (!same) f.add("MISMATCH", "FACT_MISMATCH");
       else if (decoded.kind === "RESOLVED_SWAPS" && signature !== null) {
-        decodedEvents.set(signature, decodedEventCount);
+        decodedEvents.set(signature, decodedSwapEvents!);
       }
     } else if (material === "BODY_REDACTED") {
       comparison = "NOT_COMPARED_LIMITED_BY_REDACTION";
@@ -3963,11 +3990,13 @@ const EMPTY_LEDGER_CHECKED: CpmmLedgerStructuralCheck["checked"] = Object.freeze
   settlements: 0,
   duplicateDetails: 0,
   eventTotalsCorroborated: 0,
+  verifiedMetadataCorroborated: 0,
 });
 const NO_LEDGER_COVERAGE: CpmmLedgerStructuralCheck["coverage"] = Object.freeze({
   epochTotals: false,
   callTotals: false,
   duplicateDetails: false,
+  eventMetadata: false,
 });
 
 function ledgerResult(
@@ -4010,7 +4039,7 @@ function ledgerResult(
  */
 function checkLedgerStructure(
   docs: Map<string, Record<string, unknown>>,
-  decodedEvents: ReadonlyMap<string, number>,
+  decodedEvents: ReadonlyMap<string, DecodedSwapEvents>,
 ): CpmmLedgerStructuralCheck {
   const f = new Findings();
   const doc = docs.get(CPMM_EVIDENCE_FILES.ledger);
@@ -4152,6 +4181,8 @@ function checkLedgerStructure(
 
   let detailsSeen = 0;
   let corroborated = 0;
+  let metadataCorroborated = 0;
+  let metadataUncorroborated = false;
   let anyTruncated = false;
   const detailOwner = new Map<number, LedgerRecord>();
   const retainedSame = new Map<number, number>();
@@ -4172,16 +4203,34 @@ function checkLedgerStructure(
     if (!ingestionValid(r)) f.add("MISMATCH", "LEDGER_INGESTION_ACCOUNTING");
     if (r.disposition === "PENDING") f.add("MISSING_EVIDENCE", "LEDGER_RECORD_PENDING");
     // Decoded event counts: the recorded total only (acceptance is never proven here).
-    const decodedCount = decodedEvents.get(r.signature);
+    const decoded = r.factKind === "RESOLVED_SWAPS" ? decodedEvents.get(r.signature) : undefined;
     if (
-      decodedCount !== undefined &&
-      r.factKind === "RESOLVED_SWAPS" &&
+      decoded !== undefined &&
       (r.ingestion.total !== 0 ||
         r.disposition === "INGESTED" ||
         r.disposition === "INGESTION_INCOMPLETE")
     ) {
-      if (r.ingestion.total === decodedCount) corroborated++;
+      if (r.ingestion.total === decoded.count) corroborated++;
       else f.add("MISMATCH", "LEDGER_EVENT_TOTAL");
+    }
+    // Verified metadata the ledger took from a bound swap's events (positioned outcomes use the
+    // notification, exceptions and other outcomes null): it must be the decoded events' own.
+    if (
+      r.factKind === "RESOLVED_SWAPS" &&
+      (r.disposition === "INGESTED" ||
+        (r.disposition === "INGESTION_INCOMPLETE" && r.blockingClass !== "ACCOUNTING_EXCEPTION"))
+    ) {
+      if (decoded === undefined) {
+        metadataUncorroborated = true;
+        f.add("MISSING_EVIDENCE", "LEDGER_EVENT_METADATA_UNCORROBORATED");
+      } else if (
+        (r.verifiedSlot !== null && r.verifiedSlot !== decoded.slot) ||
+        (r.verifiedBlockTimeSec !== null && r.verifiedBlockTimeSec !== decoded.blockTimeSec)
+      ) {
+        f.add("MISMATCH", "LEDGER_EVENT_METADATA");
+      } else if (r.verifiedSlot !== null && r.verifiedBlockTimeSec !== null) {
+        metadataCorroborated++;
+      }
     }
 
     // Duplicates: exact counts, the first details only, and their receipt-time view.
@@ -4303,6 +4352,8 @@ function checkLedgerStructure(
     callByNumber.set(c.call, c);
   }
   const settled = new Set<unknown>();
+  /** Each record's RECORDED settlement ordinal (the recorder's single, global order). */
+  const recordedOrdinal = new Map<number, unknown>();
   const statusCount = new Map<unknown, number>();
   const codeCount = new Map<unknown, number>();
   const recordedFor = new Map<number, number>();
@@ -4340,6 +4391,7 @@ function checkLedgerStructure(
         continue;
       }
       recordedFor.set(r.sequence, (recordedFor.get(r.sequence) ?? 0) + 1);
+      recordedOrdinal.set(r.sequence, s.ordinal);
       if (
         s.signature !== r.signature ||
         (call !== undefined &&
@@ -4405,6 +4457,28 @@ function checkLedgerStructure(
     f.add("MISMATCH", "LEDGER_CALL_TOTALS");
   }
   if ([...recordedFor.values()].some((n) => n > 1)) f.add("MISMATCH", "LEDGER_RECORD_REFERENCE");
+  // Receipt-state causality, in the recorder's order: the terminal state is written before the
+  // RECORDED settlement is observed, and a duplicate's detail during its own account() call. So a
+  // duplicate call recorded after that settlement saw the final state, never PENDING. The
+  // converse is not inferred: a call before the settlement may still have seen either.
+  if (ledgerRecorded) {
+    for (const r of records) {
+      const settledAt = recordedFor.get(r.sequence) === 1 ? recordedOrdinal.get(r.sequence) : null;
+      if (!isInt(settledAt)) continue;
+      for (const d of r.duplicateDetails) {
+        const call = ambiguousCalls.has(d.occurrence) ? undefined : callByNumber.get(d.occurrence);
+        if (
+          d.firstDispositionAtReceipt === "PENDING" &&
+          call !== undefined &&
+          call.signature === r.signature &&
+          isInt(call.ordinal) &&
+          call.ordinal > settledAt
+        ) {
+          f.add("MISMATCH", "LEDGER_DUPLICATE_CAUSALITY");
+        }
+      }
+    }
+  }
   if (settlementsComplete && recordsComplete) {
     // Each record settled once as RECORDED; each retained duplicate detail as a DUPLICATE.
     if (
@@ -4460,11 +4534,13 @@ function checkLedgerStructure(
       settlements: settlementRecords.length,
       duplicateDetails: detailsSeen,
       eventTotalsCorroborated: corroborated,
+      verifiedMetadataCorroborated: metadataCorroborated,
     },
     {
       epochTotals,
       callTotals,
       duplicateDetails: recordsComplete && !anyTruncated,
+      eventMetadata: recordsComplete && !metadataUncorroborated,
     },
   );
 }
