@@ -6250,3 +6250,91 @@ describe("Owner and wrapper structure (item G, partial): recorded cross-checks b
     });
   });
 });
+
+describe("Collector replay: application sends placed by the owner's attempts (review of aaf4e47)", () => {
+  type Row = Record<string, unknown>;
+  const OR = CPMM_EVIDENCE_FILES.ownerReport;
+  const REPLAYED = {
+    status: "REPRODUCED",
+    findings: [],
+    handedOverMessages: 4,
+    replayedFrames: 4,
+    structurallyCheckedFrames: 0,
+    epochReportCompared: true,
+    countersCompared: true,
+  };
+  const seal = (run: Awaited<ReturnType<typeof genuineRun>>) => {
+    const r = sealCpmmObservationEvidence(
+      sealInput(run.snapshot, run.recorder, {}, run.recorderLimits, run.collectorLimits),
+    );
+    if (!r.ok) throw new Error(`seal failed: ${r.code}`);
+    return r.outDir;
+  };
+  const collectorOf = (dir: string) => {
+    const v = verifyCpmmObservationEvidence(dir, ANALYSIS);
+    expect(v.integrity, "integrity").toEqual({ ok: true, problems: [] });
+    expect(v.flags).toEqual(CPMM_EVIDENCE_FALSE_FLAGS);
+    return v.rederivation.components!.collector;
+  };
+  const rewrite = (dir: string, mutate: (o: Row) => void) => {
+    const d = copyOf(dir);
+    reseal(d, OR, mutate);
+    return d;
+  };
+  const subscribe = (o: Row) => get(o, "report", "value", "outgoing", "subscribe") as Row;
+  const unread = (o: Row) => (o.report = { status: "READ_FAILED", code: "TEST_READ_FAILED" });
+
+  it("O6: a subscribe answered before the socket opened replays with the unsubscribe as the only send", async () => {
+    // The genuine run: acknowledged with no subscribe sent; the unsubscribe is the only send.
+    const run = await genuineRun({ subscribeBeforeOpen: true });
+    expect(run.report.outgoing.subscribe).toMatchObject({
+      local: "NOT_ATTEMPTED",
+      observed: "ACKNOWLEDGED",
+    });
+    expect(run.report.outgoing.applicationFramesReserved).toBe(1);
+    expect(run.snapshot.outgoing.filter((r) => r.kind === "CALL")).toHaveLength(1);
+    const early = seal(run);
+    // Before the correction: SUBSCRIBE_FRAME (the unsubscribe compared with the subscribe frame),
+    // and FRAME_RECORDS and EPOCH_REPORT (the unsubscribe never built, so its response replayed
+    // as MISMATCHED_RESPONSE_ID with the unsubscribe NOT_BUILT).
+    expect(collectorOf(early)).toEqual(REPLAYED);
+    // Without the owner's report, the lone send is attributed by its digest: missing counts only.
+    expect(collectorOf(rewrite(early, unread))).toMatchObject({
+      status: "MISSING_EVIDENCE",
+      findings: ["MISSING_EVIDENCE:OWNER_COUNTS_UNAVAILABLE"],
+      replayedFrames: 4,
+    });
+    // A subscribe claimed as sent places that send as the subscribe: its bytes contradict.
+    const claimed = rewrite(early, (o) =>
+      Object.assign(subscribe(o), {
+        local: "COMPLETED",
+        reservedAtMs: OBS_START,
+        localAtMs: OBS_START,
+      }),
+    );
+    expect(collectorOf(claimed).findings).toContain("MISMATCH:SUBSCRIBE_FRAME");
+
+    // The normal two-send run is unchanged. Its sent subscribe claimed unattempted places the
+    // first send as the unsubscribe, before any acknowledgement: the accepted collector refuses to
+    // build an unsubscribe there, and the replay then diverges from the recorded frames.
+    const { dir } = await shared;
+    expect(collectorOf(dir)).toEqual(REPLAYED);
+    const unattempted = rewrite(dir, (o) =>
+      Object.assign(subscribe(o), { local: "NOT_ATTEMPTED", reservedAtMs: null, localAtMs: null }),
+    );
+    expect(collectorOf(unattempted).findings).toEqual([
+      "MISMATCH:UNSUBSCRIBE_NOT_BUILDABLE",
+      "MISMATCH:FRAME_RECORDS",
+      "MISMATCH:EPOCH_REPORT",
+    ]);
+    expect(collectorOf(rewrite(dir, unread))).toMatchObject({
+      status: "MISSING_EVIDENCE",
+      findings: ["MISSING_EVIDENCE:OWNER_COUNTS_UNAVAILABLE"],
+    });
+    // A cancelled run still replays as recorded.
+    const ac = new AbortController();
+    const cancelled = await genuineRun({ signal: ac.signal, afterSecond: () => ac.abort() });
+    expect(cancelled.report.terminal.cause).toBe("CANCELLED");
+    expect(collectorOf(seal(cancelled))).toMatchObject({ status: "REPRODUCED", findings: [] });
+  });
+});

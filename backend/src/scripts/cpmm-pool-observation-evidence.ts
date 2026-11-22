@@ -2735,8 +2735,27 @@ function replayCollector(docs: Map<string, Record<string, unknown>>): CpmmCollec
       f.add("MISMATCH", code);
     }
   };
-  if (sends[0] !== undefined) sameAsSent(opened.subscribeFrame, sends[0], "SUBSCRIBE_FRAME");
-  const unsubscribeSend = sends[1];
+  // The owner's own attempts place its sends: the subscribe first when it was attempted, then
+  // the unsubscribe. A peer can answer the subscribe id before the socket opens, and the owner then
+  // sends no subscribe, so the only send is the unsubscribe. Without a readable report, a lone send
+  // is the subscribe only if its digest is the subscribe frame's. Either way each attributed send
+  // is compared with the frame the collector builds.
+  const isSubscribeFrame = (sent: unknown): boolean => {
+    const p = get(sent, "payload");
+    return (
+      get(p, "originalBytes") === opened.subscribeFrame.length &&
+      get(p, "originalSha256") === sha256(opened.subscribeFrame)
+    );
+  };
+  const sendFor = isRec(report)
+    ? applicationSends(report, sends as TransportRecord[])
+    : sends.length === 1 && !isSubscribeFrame(sends[0])
+      ? { subscribe: undefined, unsubscribe: sends[0] }
+      : { subscribe: sends[0], unsubscribe: sends[1] };
+  if (sendFor.subscribe !== undefined) {
+    sameAsSent(opened.subscribeFrame, sendFor.subscribe, "SUBSCRIBE_FRAME");
+  }
+  const unsubscribeSend = sendFor.unsubscribe;
   let unsubscribeBuilt = false;
   const buildUnsubscribe = (): void => {
     unsubscribeBuilt = true;
