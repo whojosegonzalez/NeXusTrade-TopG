@@ -4655,6 +4655,63 @@ const DEADLINE_KEYS = [
   "sessionDeadlineMs",
 ] as const;
 
+/**
+ * The owner's `observed` value for each response frame the accepted collector classifies, and the
+ * collector states consistent with each value.
+ */
+const RESPONSE_OBSERVATIONS: readonly [
+  "subscribe" | "unsubscribe",
+  "SUBSCRIBE" | "UNSUBSCRIBE",
+  Readonly<Record<string, readonly string[]>>,
+][] = [
+  [
+    "subscribe",
+    "SUBSCRIBE",
+    {
+      ACKNOWLEDGED: ["ACKNOWLEDGED"],
+      REJECTED: ["REJECTED"],
+      MALFORMED: ["MALFORMED_RESPONSE"],
+      NOT_OBSERVED: ["AWAITING_ACK"],
+    },
+  ],
+  [
+    "unsubscribe",
+    "UNSUBSCRIBE",
+    {
+      ACKNOWLEDGED: ["ACKNOWLEDGED"],
+      REJECTED: ["REJECTED"],
+      MALFORMED: ["BUILT_UNOBSERVED"],
+      NOT_OBSERVED: ["NOT_BUILT", "BUILT_UNOBSERVED"],
+    },
+  ],
+];
+
+/**
+ * The owner's application sends in order: the subscribe first when it was attempted, then the
+ * unsubscribe. A subscribe never attempted (answered before the socket opened) has no send.
+ */
+function applicationSends(
+  report: Record<string, unknown>,
+  sends: readonly TransportRecord[],
+): { subscribe: TransportRecord | undefined; unsubscribe: TransportRecord | undefined } {
+  const subscribed = get(report, "outgoing", "subscribe", "local") !== "NOT_ATTEMPTED";
+  return {
+    subscribe: subscribed ? sends[0] : undefined,
+    unsubscribe: sends[subscribed ? 1 : 0],
+  };
+}
+
+/** The observation a collector frame establishes for one request, or null. */
+function observationOf(prefix: "SUBSCRIBE" | "UNSUBSCRIBE", fr: unknown): string | null {
+  const disposition = get(fr, "disposition");
+  if (disposition === `${prefix}_ACKNOWLEDGED`) return "ACKNOWLEDGED";
+  if (disposition === `${prefix}_REJECTED`) return "REJECTED";
+  if (disposition === "MALFORMED_MESSAGE" && get(fr, "code") === `${prefix}_RESPONSE_SHAPE`) {
+    return "MALFORMED";
+  }
+  return null;
+}
+
 const intOrNull = (v: unknown): boolean => v === null || isInt(v);
 const allInts = (o: unknown, keys: readonly string[]): boolean =>
   isRec(o) && keys.every((k) => isInt(o[k]));
@@ -5048,6 +5105,26 @@ function checkOwnerWrapperStructure(
     ) {
       f.add("MISMATCH", "OWNER_INCOMING_ACCOUNTING");
     }
+    // Every received pong is classified as matched or unmatched, except where the owner returned
+    // at the control-frame limit (counted, never classified): at most controlFrames - limit.
+    const out = r.outgoing as Record<string, number>;
+    const classified = out.pongsMatched! + out.pongsUnmatched!;
+    const limit = get(
+      docs.get(CPMM_EVIDENCE_FILES.plan),
+      "plan",
+      "limits",
+      "owner",
+      "maxControlFrames",
+    );
+    const overLimit = isInt(limit) && limit >= 1 ? Math.max(0, inc.controlFrames! - limit) : null;
+    if (
+      classified > inc.pongsReceived! ||
+      (overLimit !== null && classified < inc.pongsReceived! - overLimit)
+    ) {
+      f.add("MISMATCH", "OWNER_PONG_ACCOUNTING");
+    } else if (overLimit === null && classified < inc.pongsReceived!) {
+      f.add("MISSING_EVIDENCE", "OWNER_CONTROL_LIMIT_UNAVAILABLE");
+    }
   }
   if (ownerIncoming) {
     const r = report!;
@@ -5115,11 +5192,17 @@ function checkOwnerWrapperStructure(
       return state === "PENDING" ? "UNRESOLVED" : state;
     };
     const sends = calls.filter((c) => c.method === "send" && before(c));
-    if (sends.length !== out.applicationFramesReserved)
+    // Each attempt reserves one frame and makes one send.
+    const attempted = (["subscribe", "unsubscribe"] as const).filter(
+      (w) => get(out, w, "local") !== "NOT_ATTEMPTED",
+    ).length;
+    if (sends.length !== out.applicationFramesReserved || sends.length !== attempted) {
       f.add("MISMATCH", "OWNER_APPLICATION_FRAMES");
-    (["subscribe", "unsubscribe"] as const).forEach((which, i) => {
+    }
+    const sendFor = applicationSends(r, sends);
+    (["subscribe", "unsubscribe"] as const).forEach((which) => {
       const a = out[which] as Record<string, unknown>;
-      const call = sends[i];
+      const call = sendFor[which];
       const local = call === undefined ? "NOT_ATTEMPTED" : outcome(call);
       if (
         a.local !== local ||
@@ -5165,25 +5248,29 @@ function checkOwnerWrapperStructure(
             p.digest === get(e, "payload", "originalSha256"),
         ),
     ).length;
-    const inc = r.incoming as Record<string, number>;
     if (
       (out.pongsMatched as number) > matchable ||
-      (out.pongsMatched as number) > (get(out, "pings", "reserved") as number) ||
-      (out.pongsMatched as number) + (out.pongsUnmatched as number) > inc.pongsReceived!
+      (out.pongsMatched as number) > (get(out, "pings", "reserved") as number)
     ) {
       f.add("MISMATCH", "OWNER_PONG_MATCHES");
     }
   }
 
-  // Remote acknowledgement is the collector's alone: an acknowledged attempt needs the frame,
-  // received after its own send. Sending or completing locally establishes nothing remote.
+  // Remote observation is the collector's alone. The accepted collector classifies each subscribe
+  // and unsubscribe response once, and the owner records `observed` from that frame:
+  // acknowledged, rejected, or malformed (MALFORMED_MESSAGE with the response-shape code). So a
+  // retained response frame proves what the owner recorded, and a recorded observation needs its
+  // frame; the collector's own state agrees either way. A local completion establishes nothing.
   const collector = docs.get(CPMM_EVIDENCE_FILES.collector);
   const frames = read(collector, "frameRecords") as Record<string, unknown>[] | undefined;
   const epochReportValue = read(collector, "epochReport");
   const epochReport = isRec(epochReportValue) ? epochReportValue : undefined;
   if (report !== undefined) {
     const out = report.outgoing as Record<string, Record<string, unknown>>;
-    const sends = calls.filter((c) => c.method === "send");
+    const sendFor = applicationSends(
+      report,
+      calls.filter((c) => c.method === "send"),
+    );
     const handed =
       startCall === undefined
         ? []
@@ -5193,49 +5280,40 @@ function checkOwnerWrapperStructure(
               e.ordinal > startCall.ordinal &&
               (boundary === null || e.ordinal < boundary),
           );
-    // By the frame's own sequence: the k-th frame is the k-th message handed over.
     const framesDropped =
       get(read(collector, "counters"), "metadataRetention", "frameRecordsDropped") !== 0;
-    const frameAfter = (disposition: string, send: TransportRecord | undefined): boolean | null => {
-      if (frames === undefined || !complete.incoming) return null;
-      const fr = frames.find((x) => get(x, "disposition") === disposition);
-      if (fr === undefined) return framesDropped ? null : false;
-      const seq = get(fr, "sequence");
-      const msg = isInt(seq) && seq >= 1 ? handed[seq - 1] : undefined;
-      if (msg === undefined) return null;
-      return send !== undefined && msg.ordinal > send.ordinal;
-    };
-    const ack: [string, number, string, string, unknown][] = [
-      [
-        "subscribe",
-        0,
-        "SUBSCRIBE_ACKNOWLEDGED",
-        "SUBSCRIBE_REJECTED",
-        get(epochReport, "subscription"),
-      ],
-      [
-        "unsubscribe",
-        1,
-        "UNSUBSCRIBE_ACKNOWLEDGED",
-        "UNSUBSCRIBE_REJECTED",
-        get(epochReport, "unsubscribe", "status"),
-      ],
-    ];
-    for (const [which, i, acked, rejected, collectorState] of ack) {
-      const observed = out[which]!.observed;
-      if (observed === "NOT_OBSERVED") continue;
-      const disposition = observed === "ACKNOWLEDGED" ? acked : rejected;
-      const placed = frameAfter(disposition, sends[i]);
+    for (const [which, prefix, states] of RESPONSE_OBSERVATIONS) {
+      const observed = out[which]!.observed as string;
+      const responses = (frames ?? []).filter((fr) => observationOf(prefix, fr) !== null);
+      const fromFrame = responses.length === 1 ? observationOf(prefix, responses[0]!) : null;
+      const collectorState = get(
+        epochReport,
+        ...(which === "subscribe" ? ["subscription"] : ["unsubscribe", "status"]),
+      );
       if (
-        out[which]!.local === "NOT_ATTEMPTED" ||
-        placed === false ||
-        (observed === "ACKNOWLEDGED" &&
-          epochReport !== undefined &&
-          collectorState !== "ACKNOWLEDGED")
+        responses.length > 1 ||
+        (fromFrame !== null && observed !== fromFrame) ||
+        (fromFrame === null &&
+          frames !== undefined &&
+          !framesDropped &&
+          observed !== "NOT_OBSERVED") ||
+        (epochReport !== undefined && !states[observed]!.includes(collectorState as string))
       ) {
-        f.add("MISMATCH", "OWNER_ACKNOWLEDGEMENT");
-      } else if (placed === null) {
-        f.add("MISSING_EVIDENCE", "ACKNOWLEDGEMENT_FRAME_UNAVAILABLE");
+        f.add("MISMATCH", "OWNER_OBSERVATION");
+      } else if (fromFrame === null && observed !== "NOT_OBSERVED") {
+        f.add("MISSING_EVIDENCE", "RESPONSE_FRAME_UNAVAILABLE");
+      }
+      // The unsubscribe request id exists only once the owner built that frame, and the send
+      // follows the build synchronously: its response is classified after the send. (A peer can
+      // answer the subscribe id before any send, so no such order holds for subscribe.)
+      if (which === "unsubscribe" && responses.length === 1) {
+        const seq = get(responses[0], "sequence");
+        const msg = isInt(seq) && seq >= 1 ? handed[seq - 1] : undefined;
+        if (out[which]!.local === "NOT_ATTEMPTED") f.add("MISMATCH", "OWNER_OBSERVATION");
+        else if (!complete.incoming || msg === undefined || sendFor.unsubscribe === undefined) {
+          f.add("MISSING_EVIDENCE", "RESPONSE_ORDER_UNVERIFIABLE");
+        } else if (msg.ordinal < sendFor.unsubscribe.ordinal)
+          f.add("MISMATCH", "OWNER_OBSERVATION");
       }
     }
   }

@@ -509,6 +509,7 @@ function env(
     onExchange?: ((clock: { now: number }) => void) | undefined;
     /** The owner's cancellation signal. */
     signal?: AbortSignal | undefined;
+    ownerLimits?: Partial<CpmmConnectionOwnerLimits> | undefined;
   } = {},
   ledgerLimits: typeof LEDGER_LIMITS = LEDGER_LIMITS,
 ) {
@@ -600,7 +601,7 @@ function env(
     epoch: 1,
     subscribeRequestId: SUB_REQ,
     unsubscribeRequestId: UNSUB_REQ,
-    limits: OWNER_LIMITS,
+    limits: { ...OWNER_LIMITS, ...transport.ownerLimits },
   });
   const to = async (t: number) => {
     for (;;) {
@@ -669,6 +670,11 @@ async function genuineRun(
     /** Runs after the owner settled and before finish() (later wrapper activity). */
     afterSettlement?: (client: FakeClient) => void;
     signal?: AbortSignal;
+    /** The subscribe and unsubscribe responses delivered (default: valid acknowledgements). */
+    subscribeResponse?: Buffer;
+    unsubscribeResponse?: Buffer;
+    ownerLimits?: Partial<CpmmConnectionOwnerLimits>;
+    subscribeBeforeOpen?: boolean;
   } = {},
 ) {
   const ledgerLimits = o.ledgerLimits ?? LEDGER_LIMITS;
@@ -680,13 +686,20 @@ async function genuineRun(
       wrapTransport: o.wrapTransport,
       onExchange: o.onExchange,
       signal: o.signal,
+      ownerLimits: o.ownerLimits,
     },
     ledgerLimits,
   );
   const p = e.owner.run();
+  if (o.subscribeBeforeOpen) {
+    // The peer answers the subscribe request id before the socket opens (nothing sent yet).
+    await flush();
+    e.c.message(o.subscribeResponse ?? ackFrame());
+    await flush();
+  }
   e.c.open();
   await e.to(OBS_START + 10);
-  e.c.message(ackFrame());
+  if (!o.subscribeBeforeOpen) e.c.message(o.subscribeResponse ?? ackFrame());
   await flush();
   await e.to(RECEIVED_AT);
   e.script.push(o.responder ?? okTx(1));
@@ -701,7 +714,7 @@ async function genuineRun(
   await flush();
   o.afterSecond?.();
   await e.to(NOMINAL_END);
-  if (!o.noUnsubscribeAck) e.c.message(unsubAck());
+  if (!o.noUnsubscribeAck) e.c.message(o.unsubscribeResponse ?? unsubAck());
   await flush();
   if (o.afterIntake) e.c.message(o.afterIntake);
   await e.to(
@@ -723,6 +736,7 @@ async function genuineRun(
     recorderLimits: e.recorderLimits,
     collectorLimits: { ...COLLECTOR_LIMITS, ...o.collectorLimits },
     ledgerLimits,
+    ownerLimits: { ...OWNER_LIMITS, ...o.ownerLimits },
   };
 }
 
@@ -5465,9 +5479,17 @@ describe("Owner and wrapper structure (item G, partial): recorded cross-checks b
   const COL = CPMM_EVIDENCE_FILES.collector;
   const LEDGER = CPMM_EVIDENCE_FILES.ledger;
 
+  /** Seals a run with the plan stating the owner limits it ran with. */
   const sealRun = (run: Run) => {
+    const p = plan(run.recorderLimits, run.collectorLimits);
     const r = sealCpmmObservationEvidence(
-      sealInput(run.snapshot, run.recorder, {}, run.recorderLimits, run.collectorLimits),
+      sealInput(
+        run.snapshot,
+        run.recorder,
+        { plan: { ...p, limits: { ...p.limits, owner: { ...run.ownerLimits } } } },
+        run.recorderLimits,
+        run.collectorLimits,
+      ),
     );
     if (!r.ok) throw new Error(`seal failed: ${r.code}`);
     return r.outDir;
@@ -5560,7 +5582,7 @@ describe("Owner and wrapper structure (item G, partial): recorded cross-checks b
         (o) => ((get(report(o), "outgoing", "unsubscribe") as Row).observed = "ACKNOWLEDGED"),
       ),
       "acknowledged without its frame",
-      ["MISMATCH:OWNER_ACKNOWLEDGEMENT"],
+      ["MISMATCH:OWNER_OBSERVATION"],
     );
   });
 
@@ -5698,7 +5720,7 @@ describe("Owner and wrapper structure (item G, partial): recorded cross-checks b
         { maxIncomingRecords: 2 },
         [
           "MISSING_EVIDENCE:TRANSPORT_RECORDS_DROPPED:incoming",
-          "MISSING_EVIDENCE:ACKNOWLEDGEMENT_FRAME_UNAVAILABLE",
+          "MISSING_EVIDENCE:RESPONSE_ORDER_UNVERIFIABLE",
         ],
         { wrapper: false, ownerIncoming: false, ownerOutgoing: true, cleanup: true },
       ],
@@ -5726,17 +5748,17 @@ describe("Owner and wrapper structure (item G, partial): recorded cross-checks b
       [
         "MISSING_EVIDENCE:TRANSPORT_RECORDS_DROPPED:incoming",
         "MISMATCH:WRAPPER_CLOSE",
-        "MISSING_EVIDENCE:ACKNOWLEDGEMENT_FRAME_UNAVAILABLE",
+        "MISSING_EVIDENCE:RESPONSE_ORDER_UNVERIFIABLE",
       ],
     );
-    // Collector frame records genuinely dropped: the acknowledgement frame is missing, never a
-    // contradiction.
+    // Collector frame records genuinely dropped: the unsubscribe response frame is missing, never
+    // a contradiction (the collector's own state still agrees).
     const frameLoss = sealRun(
       await genuineRun({ collectorLimits: { maxRetainedFrameRecords: 1 } }),
     );
     expect(owOf(frameLoss).ow).toMatchObject({
       status: "MISSING_EVIDENCE",
-      findings: ["MISSING_EVIDENCE:ACKNOWLEDGEMENT_FRAME_UNAVAILABLE"],
+      findings: ["MISSING_EVIDENCE:RESPONSE_FRAME_UNAVAILABLE"],
     });
     // Pending at finish: an owner delivery not yet credited, a call still running.
     const { dir } = await shared;
@@ -5821,12 +5843,17 @@ describe("Owner and wrapper structure (item G, partial): recorded cross-checks b
         (o) => (out(o).duplicateCompletions = 1),
         ["MISMATCH:OWNER_DUPLICATE_COMPLETIONS"],
       ],
-      ["more pongs matched", OR, (o) => (out(o).pongsMatched = 3), ["MISMATCH:OWNER_PONG_MATCHES"]],
+      [
+        "more pongs matched",
+        OR,
+        (o) => (out(o).pongsMatched = 3),
+        ["MISMATCH:OWNER_PONG_ACCOUNTING", "MISMATCH:OWNER_PONG_MATCHES"],
+      ],
       [
         "subscribe acknowledged though the collector says not",
         COL,
         (o) => ((get(o, "epochReport", "value") as Row).subscription = "PENDING"),
-        ["MISMATCH:OWNER_ACKNOWLEDGEMENT"],
+        ["MISMATCH:OWNER_OBSERVATION"],
       ],
       [
         "wrapper completion failed",
@@ -5868,7 +5895,7 @@ describe("Owner and wrapper structure (item G, partial): recorded cross-checks b
         "subscribe rejected without its frame",
         OR,
         (o) => ((out(o).subscribe as Row).observed = "REJECTED"),
-        ["MISMATCH:OWNER_ACKNOWLEDGEMENT"],
+        ["MISMATCH:OWNER_OBSERVATION"],
       ],
       [
         "unsubscribe acknowledged before its send",
@@ -5879,7 +5906,18 @@ describe("Owner and wrapper structure (item G, partial): recorded cross-checks b
           const [a, d] = [frames[0]!, frames[3]!];
           [a.disposition, d.disposition] = [d.disposition, a.disposition];
         },
-        ["MISMATCH:OWNER_ACKNOWLEDGEMENT"],
+        ["MISMATCH:OWNER_OBSERVATION"],
+      ],
+      [
+        "a sent subscribe claimed unattempted",
+        OR,
+        (o) =>
+          Object.assign(out(o).subscribe as Row, {
+            local: "NOT_ATTEMPTED",
+            reservedAtMs: null,
+            localAtMs: null,
+          }),
+        ["MISMATCH:OWNER_APPLICATION_FRAMES"],
       ],
       [
         "transport not started",
@@ -5940,8 +5978,8 @@ describe("Owner and wrapper structure (item G, partial): recorded cross-checks b
         (o) => Object.assign(message(o, 3), { ownerDeliveries: 0 }),
         [
           "MISMATCH:OWNER_MESSAGE_COUNTS",
-          // The unsubscribe acknowledgement's message is then no longer handed over.
-          "MISSING_EVIDENCE:ACKNOWLEDGEMENT_FRAME_UNAVAILABLE",
+          // The unsubscribe response's message is then no longer handed over: its order is unknown.
+          "MISSING_EVIDENCE:RESPONSE_ORDER_UNVERIFIABLE",
         ],
       ],
       [
@@ -6027,5 +6065,188 @@ describe("Owner and wrapper structure (item G, partial): recorded cross-checks b
     ];
     for (const [label, file, mutate, findings] of cases)
       contradicted(rewrite(dir, file, mutate), label, findings);
+  });
+
+  it("W8: subscribe and unsubscribe observations equal the collector's classified responses, in both directions", async () => {
+    const { dir } = await shared;
+    const out = (o: Row) => report(o).outgoing as Record<string, Row>;
+    const observed = (d: string) =>
+      ["subscribe", "unsubscribe"].map((w) =>
+        get(report(readJson(d, OR)), "outgoing", w, "observed"),
+      );
+    const respond = (id: number, body: Record<string, unknown>) =>
+      enc({ jsonrpc: "2.0", id, ...body });
+    // Controls, each faithfully recorded and consistent: valid acknowledgements; explicit
+    // rejections; malformed responses (the collector's MALFORMED_MESSAGE with the response-shape
+    // code), which the owner records as MALFORMED and which stay abnormal, never contradictions.
+    expect(observed(dir)).toEqual(["ACKNOWLEDGED", "ACKNOWLEDGED"]);
+    consistent(dir, "acknowledged");
+    const runs: [string, Parameters<typeof genuineRun>[0], unknown[], string][] = [
+      [
+        "subscribe rejected",
+        { subscribeResponse: respond(SUB_REQ, { error: { code: -32_000, message: "no" } }) },
+        ["REJECTED", "NOT_OBSERVED"],
+        "SUBSCRIBE_REJECTED",
+      ],
+      [
+        "unsubscribe rejected",
+        { unsubscribeResponse: respond(UNSUB_REQ, { result: false }) },
+        ["ACKNOWLEDGED", "REJECTED"],
+        "OBSERVATION_COMPLETED",
+      ],
+      [
+        "subscribe malformed",
+        { subscribeResponse: respond(SUB_REQ, { result: "bad" }) },
+        ["MALFORMED", "NOT_OBSERVED"],
+        "SUBSCRIBE_REJECTED",
+      ],
+      [
+        "unsubscribe malformed",
+        { unsubscribeResponse: respond(UNSUB_REQ, { result: "bad" }) },
+        ["ACKNOWLEDGED", "MALFORMED"],
+        "COLLECTION_DIRTY",
+      ],
+    ];
+    const sealed = new Map<string, string>();
+    for (const [label, options, expected, cause] of runs) {
+      const d = sealRun(await genuineRun(options));
+      expect(observed(d), label).toEqual(expected);
+      expect(get(report(readJson(d, OR)), "terminal", "cause"), label).toBe(cause);
+      const { ow, v } = owOf(d);
+      expect(ow, label).toMatchObject(CONSISTENT_OWNER_WRAPPER);
+      expect(v.rederivation.components!.collector.status, label).toBe("REPRODUCED");
+      sealed.set(label, d);
+    }
+    // Contradictions: an observation erased, or recorded as something its frame does not say.
+    const cases: [string, string, (o: Row) => void][] = [
+      [
+        "subscribe acknowledgement erased",
+        dir,
+        (o) => (out(o).subscribe!.observed = "NOT_OBSERVED"),
+      ],
+      [
+        "unsubscribe acknowledgement erased",
+        dir,
+        (o) => (out(o).unsubscribe!.observed = "NOT_OBSERVED"),
+      ],
+      [
+        "malformed subscribe erased",
+        sealed.get("subscribe malformed")!,
+        (o) => (out(o).subscribe!.observed = "NOT_OBSERVED"),
+      ],
+      [
+        "malformed subscribe as rejected",
+        sealed.get("subscribe malformed")!,
+        (o) => (out(o).subscribe!.observed = "REJECTED"),
+      ],
+      [
+        "malformed unsubscribe as acknowledged",
+        sealed.get("unsubscribe malformed")!,
+        (o) => (out(o).unsubscribe!.observed = "ACKNOWLEDGED"),
+      ],
+      [
+        "rejected unsubscribe as malformed",
+        sealed.get("unsubscribe rejected")!,
+        (o) => (out(o).unsubscribe!.observed = "MALFORMED"),
+      ],
+    ];
+    for (const [label, base, mutate] of cases) {
+      contradicted(rewrite(base, OR, mutate), label, ["MISMATCH:OWNER_OBSERVATION"]);
+    }
+    // Each direction on its own, with the collector's state rewritten to agree: a recorded
+    // observation its frame contradicts, and one with no frame at all.
+    const agreeing = rewrite(dir, OR, (o) => (out(o).subscribe!.observed = "REJECTED"));
+    reseal(
+      agreeing,
+      COL,
+      (o) => ((get(o, "epochReport", "value") as Row).subscription = "REJECTED"),
+    );
+    contradicted(agreeing, "frame says acknowledged", ["MISMATCH:OWNER_OBSERVATION"]);
+    const noAck = sealRun(await genuineRun({ noUnsubscribeAck: true }));
+    contradicted(
+      rewrite(noAck, OR, (o) => (out(o).unsubscribe!.observed = "MALFORMED")),
+      "malformed without its frame",
+      ["MISMATCH:OWNER_OBSERVATION"],
+    );
+    // Two classified responses for one request (the collector classifies one), with its state
+    // unread and the owner claiming none.
+    const twice = rewrite(dir, COL, (o) => {
+      (get(o, "frameRecords", "value") as Row[])[1]!.disposition = "SUBSCRIBE_ACKNOWLEDGED";
+      o.epochReport = { status: "READ_FAILED", code: "TEST_READ_FAILED" };
+    });
+    reseal(twice, OR, (o) => (out(o).subscribe!.observed = "NOT_OBSERVED"));
+    expect(owOf(twice).ow.findings).toContain("MISMATCH:OWNER_OBSERVATION");
+    // The peer answers the subscribe before the socket opens: acknowledged with nothing sent,
+    // faithfully recorded and consistent (no send order is required for subscribe).
+    const early = sealRun(await genuineRun({ subscribeBeforeOpen: true }));
+    expect(get(report(readJson(early, OR)), "outgoing", "subscribe")).toMatchObject({
+      local: "NOT_ATTEMPTED",
+      observed: "ACKNOWLEDGED",
+    });
+    consistent(early, "answered before any send");
+    // Frame records genuinely dropped: the unretained response frame is missing evidence, while
+    // the collector's own state still contradicts an erased observation; with that state unread
+    // too, the absence is only missing.
+    const frameLoss = sealRun(
+      await genuineRun({ collectorLimits: { maxRetainedFrameRecords: 1 } }),
+    );
+    contradicted(
+      rewrite(frameLoss, OR, (o) => (out(o).unsubscribe!.observed = "NOT_OBSERVED")),
+      "erased, frame not retained",
+      ["MISMATCH:OWNER_OBSERVATION"],
+    );
+    const unread = rewrite(
+      frameLoss,
+      COL,
+      (o) => (o.epochReport = { status: "READ_FAILED", code: "TEST_READ_FAILED" }),
+    );
+    expect(owOf(unread).ow).toMatchObject({
+      status: "MISSING_EVIDENCE",
+      findings: ["MISSING_EVIDENCE:RESPONSE_FRAME_UNAVAILABLE"],
+    });
+  });
+
+  it("W9: every received pong is classified, except at the owner's control-frame limit", async () => {
+    const { dir } = await shared;
+    const out = (o: Row) => report(o).outgoing as Row;
+    expect(report(readJson(dir, OR)).incoming).toMatchObject({ pongsReceived: 2 });
+    expect(out(readJson(dir, OR))).toMatchObject({ pongsMatched: 2, pongsUnmatched: 0 });
+    // The review's reproduction, and one pong left out.
+    contradicted(
+      rewrite(dir, OR, (o) => Object.assign(out(o), { pongsMatched: 0, pongsUnmatched: 0 })),
+      "pongs unaccounted",
+      ["MISMATCH:OWNER_PONG_ACCOUNTING"],
+    );
+    contradicted(
+      rewrite(dir, OR, (o) => (out(o).pongsMatched = 1)),
+      "a pong left out",
+      ["MISMATCH:OWNER_PONG_ACCOUNTING"],
+    );
+    // A matching payload counted unmatched (its pong deadline is never recorded): not inferred.
+    consistent(
+      rewrite(dir, OR, (o) => Object.assign(out(o), { pongsMatched: 1, pongsUnmatched: 1 })),
+      "deadline not inferred",
+    );
+    // A genuine control-frame-limit exit: the second pong is counted, then the owner returns
+    // without classifying it.
+    const limited = sealRun(await genuineRun({ ownerLimits: { maxControlFrames: 1 } }));
+    const r = report(readJson(limited, OR));
+    expect(r.terminal).toMatchObject({ cause: "CONTROL_FRAME_LIMIT" });
+    expect(r.incoming).toMatchObject({ pongsReceived: 2, controlFrames: 2 });
+    expect(r.outgoing).toMatchObject({ pongsMatched: 1, pongsUnmatched: 0 });
+    consistent(limited, "control-frame limit");
+    contradicted(
+      rewrite(limited, OR, (o) => (out(o).pongsMatched = 0)),
+      "below the limit's allowance",
+      ["MISMATCH:OWNER_PONG_ACCOUNTING"],
+    );
+    // Without the plan's limit, an unclassified pong cannot be decided: missing, not consistent.
+    const noLimit = rewrite(limited, CPMM_EVIDENCE_FILES.plan, (p) => {
+      delete (get(p, "plan", "limits", "owner") as Row).maxControlFrames;
+    });
+    expect(owOf(noLimit).ow).toMatchObject({
+      status: "MISSING_EVIDENCE",
+      findings: ["MISSING_EVIDENCE:OWNER_CONTROL_LIMIT_UNAVAILABLE"],
+    });
   });
 });
