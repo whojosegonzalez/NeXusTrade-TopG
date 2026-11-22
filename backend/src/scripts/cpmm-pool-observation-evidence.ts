@@ -31,6 +31,19 @@ import {
   CpmmPoolNotificationCollector,
 } from "../candidate-scanner/CpmmPoolNotificationCollector.js";
 import { adaptRaydiumCpmmPoolState } from "../candidate-scanner/RaydiumCpmmPoolStateAdapter.js";
+import {
+  CPMM_INVALID_CODES,
+  type CpmmAccountResult,
+  type CpmmAccountingDisposition,
+  type CpmmBlockingClass,
+  type CpmmDuplicateOccurrence,
+  type CpmmEpochAccounting,
+  type CpmmIngestionAccounting,
+  type CpmmLedgerCounters,
+  type CpmmLedgerLimits,
+  type CpmmPolicyPending,
+  type CpmmSignatureAccountingRecord,
+} from "../candidate-scanner/CpmmResolutionAccountingLedger.js";
 import { isValidSolanaSignature } from "../candidate-scanner/ExactPoolHistoryEnumerator.js";
 import {
   CPMM_GET_TRANSACTION_CONFIG,
@@ -1236,15 +1249,52 @@ export interface CpmmEvidenceVerificationOptions {
   readonly analysisSecrets?: readonly string[];
 }
 
+/**
+ * Item G (partial): structural cross-checks of the recorded ledger, its epochs, counters, account
+ * calls and settlements, over the validated documents. The ledger is never re-executed and
+ * ingestion is never repeated: consistency here is structural only, within `scope`.
+ */
+export interface CpmmLedgerStructuralCheck {
+  readonly status: "STRUCTURALLY_CONSISTENT" | "MISSING_EVIDENCE" | "MISMATCH";
+  readonly scope: "RECORDED_LEDGER_STRUCTURE_ONLY";
+  readonly ledgerReplayed: false;
+  readonly ingestionReplayed: false;
+  readonly findings: readonly string[];
+  readonly checked: {
+    readonly records: number;
+    readonly epochs: number;
+    readonly accountCalls: number;
+    readonly settlements: number;
+    readonly duplicateDetails: number;
+    /**
+     * Ingestion totals equal to the event count decoded from the matched response. Corroborates
+     * the recorded total only; acceptance by the tracker is the runtime's report, never proven.
+     */
+    readonly eventTotalsCorroborated: number;
+  };
+  /** Which exact cross-checks the recorded scope supported (false: a finding says why not). */
+  readonly coverage: {
+    /** Ledger-wide counters against the per-epoch totals and the records. */
+    readonly epochTotals: boolean;
+    /** Account calls and settlements against the ledger's counts, exactly. */
+    readonly callTotals: boolean;
+    /** Every duplicate occurrence's detail retained. */
+    readonly duplicateDetails: boolean;
+  };
+}
+
 export interface CpmmRederivation {
   readonly status: "PARTIAL" | "NOT_ATTEMPTED";
-  /** The worst result among the implemented components only; never a whole-run claim. */
+  /**
+   * The worst result among the implemented components only; never a whole-run claim. A
+   * structurally consistent ledger does not lower it, and is never called reproduced.
+   */
   readonly implementedComponents: CpmmRederivationStatus | null;
   readonly components: {
     readonly poolContext: CpmmComponentRederivation;
     readonly collector: CpmmCollectorRederivation;
     readonly transactionAnalysis: CpmmTransactionRederivation;
-    readonly ledger: { readonly status: "NOT_IMPLEMENTED" };
+    readonly ledger: CpmmLedgerStructuralCheck;
     readonly ownerWrapperCrossChecks: { readonly status: "NOT_IMPLEMENTED" };
     readonly runtimeAccounting: { readonly status: "RUNTIME_ACCOUNTING_NOT_REPRODUCED" };
   } | null;
@@ -2920,9 +2970,12 @@ function rederive(
     };
   }
   let transactionAnalysis: CpmmTransactionRederivation;
+  // Event counts decoded from matched swap responses, by signature (for the ledger's totals).
+  const decodedEvents = new Map<string, number>();
   try {
-    transactionAnalysis = analyzeTransactions(docs, pool, credentials);
+    transactionAnalysis = analyzeTransactions(docs, pool, credentials, decodedEvents);
   } catch {
+    decodedEvents.clear();
     const f = failed();
     transactionAnalysis = {
       status: f.status,
@@ -2934,17 +2987,25 @@ function rederive(
       runtimeOutcomesNotCompared: 0,
     };
   }
+  let ledger: CpmmLedgerStructuralCheck;
+  try {
+    ledger = checkLedgerStructure(docs, decodedEvents);
+  } catch {
+    ledger = ledgerResult(failed(), EMPTY_LEDGER_CHECKED, NO_LEDGER_COVERAGE);
+  }
+  const ledgerRank: CpmmRederivationStatus =
+    ledger.status === "STRUCTURALLY_CONSISTENT" ? "REPRODUCED" : ledger.status;
   return {
     status: "PARTIAL",
     implementedComponents: worstOf(
-      worstOf(poolContext.status, collector.status),
-      transactionAnalysis.status,
+      worstOf(worstOf(poolContext.status, collector.status), transactionAnalysis.status),
+      ledgerRank,
     ),
     components: {
       poolContext,
       collector,
       transactionAnalysis,
-      ledger: { status: "NOT_IMPLEMENTED" },
+      ledger,
       ownerWrapperCrossChecks: { status: "NOT_IMPLEMENTED" },
       runtimeAccounting: { status: "RUNTIME_ACCOUNTING_NOT_REPRODUCED" },
     },
@@ -3110,6 +3171,7 @@ function analyzeTransactions(
   docs: Map<string, Record<string, unknown>>,
   pool: unknown,
   credentials: AnalysisCredentials,
+  decodedEvents: Map<string, number>,
 ): CpmmTransactionRederivation {
   const f = new Findings();
   const plan = get(docs.get(CPMM_EVIDENCE_FILES.plan), "plan");
@@ -3374,6 +3436,7 @@ function analyzeTransactions(
     // The analysis of those bytes.
     let notAnalysed: string | null = material ?? unavailable;
     let decoded: CpmmTransactionExchangeResult["decoded"] = null;
+    let decodedEventCount = 0;
     if (notAnalysed !== null || "missing" in body) {
       // Not analysable: the material or the analysis is unavailable (above).
     } else if (note === undefined || signature === null || !isInt(id)) {
@@ -3404,6 +3467,8 @@ function analyzeTransactions(
           decoderStatus: (get(a, "decoder", "status") as string | undefined) ?? null,
           bodyState: get(a, "body", "state") as string,
         };
+        const events = get(a, "events");
+        decodedEventCount = Array.isArray(events) ? events.length : 0;
       }
     }
 
@@ -3421,6 +3486,9 @@ function analyzeTransactions(
       const same = decoded.kind === recorded.factKind && decoded.code === recorded.factCode;
       comparison = same ? "MATCHED" : "MISMATCH";
       if (!same) f.add("MISMATCH", "FACT_MISMATCH");
+      else if (decoded.kind === "RESOLVED_SWAPS" && signature !== null) {
+        decodedEvents.set(signature, decodedEventCount);
+      }
     } else if (material === "BODY_REDACTED") {
       comparison = "NOT_COMPARED_LIMITED_BY_REDACTION";
     } else if (material !== null) {
@@ -3448,4 +3516,955 @@ function analyzeTransactions(
     comparedExchanges: compared,
     runtimeOutcomesNotCompared: runtimeOnly,
   };
+}
+
+// ---------------------------------------------------------------------------------------------
+// Ledger structure (item G, partial): records, epochs, counters, account calls and settlements
+// ---------------------------------------------------------------------------------------------
+
+/** The keys of `K` exactly (the compiler refuses a missing or extra key). */
+const keysOf = <K extends string>(o: Readonly<Record<K, true>>): readonly K[] =>
+  Object.freeze(Object.keys(o) as K[]);
+
+const LEDGER_LIMIT_KEYS = keysOf<keyof CpmmLedgerLimits>({
+  maxSignatureRecords: true,
+  maxDuplicateDetailsPerRecord: true,
+  maxEpochs: true,
+});
+const LEDGER_RECORD_KEYS = keysOf<keyof CpmmSignatureAccountingRecord>({
+  sequence: true,
+  signature: true,
+  epoch: true,
+  hostReceivedAtMs: true,
+  notifiedSlot: true,
+  notifiedBlockTimeSec: true,
+  verifiedSlot: true,
+  verifiedBlockTimeSec: true,
+  disposition: true,
+  blockingClass: true,
+  policyPending: true,
+  factKind: true,
+  factCode: true,
+  ingestion: true,
+  metadataConflict: true,
+  duplicateOccurrences: true,
+  duplicateDetails: true,
+  duplicateDetailsDropped: true,
+});
+const LEDGER_INGESTION_KEYS = keysOf<keyof CpmmIngestionAccounting>({
+  status: true,
+  total: true,
+  accepted: true,
+  rejected: true,
+  unattempted: true,
+  indeterminate: true,
+});
+const LEDGER_DETAIL_KEYS = keysOf<keyof CpmmDuplicateOccurrence>({
+  occurrence: true,
+  epoch: true,
+  hostReceivedAtMs: true,
+  notifiedSlot: true,
+  notifiedBlockTimeSec: true,
+  agreement: true,
+  firstDispositionAtReceipt: true,
+});
+const LEDGER_EPOCH_KEYS = keysOf<keyof CpmmEpochAccounting>({
+  epoch: true,
+  observationStartMs: true,
+  state: true,
+  occurrences: true,
+  firstOccurrences: true,
+  duplicates: true,
+  invalid: true,
+  capacityRefused: true,
+});
+const LEDGER_COUNTER_KEYS = keysOf<keyof CpmmLedgerCounters>({
+  occurrences: true,
+  unattributedOccurrences: true,
+  recordCapacityRefused: true,
+  epochCapacityRefused: true,
+  openEpochRefused: true,
+  saturated: true,
+});
+const LEDGER_DISPOSITIONS: ReadonlySet<unknown> = new Set(
+  keysOf<CpmmAccountingDisposition>({
+    PENDING: true,
+    INGESTED: true,
+    INGESTION_INCOMPLETE: true,
+    POLICY_PENDING: true,
+    UNRESOLVED: true,
+  }),
+);
+const AGREEMENTS: ReadonlySet<unknown> = new Set(
+  keysOf<CpmmDuplicateOccurrence["agreement"]>({
+    AGREES: true,
+    SLOT_CONFLICT: true,
+    BLOCK_TIME_CONFLICT: true,
+  }),
+);
+const EPOCH_STATES: ReadonlySet<unknown> = new Set(
+  keysOf<CpmmEpochAccounting["state"]>({ OPEN: true, CLOSED: true }),
+);
+const INGESTION_STATUSES: ReadonlySet<unknown> = new Set(
+  keysOf<CpmmIngestionAccounting["status"]>({
+    NOT_CALLED: true,
+    EXCEPTION: true,
+    COMPLETE: true,
+    PARTIAL: true,
+    NONE_ACCEPTED: true,
+    REFUSED_BEFORE_START: true,
+    NOT_INGESTIBLE: true,
+  }),
+);
+/** Statuses the adapter's `ingest()` itself returns (the ledger adds NOT_CALLED and EXCEPTION). */
+const INGEST_RESULT_STATUSES: ReadonlySet<unknown> = new Set([
+  "COMPLETE",
+  "PARTIAL",
+  "NONE_ACCEPTED",
+  "REFUSED_BEFORE_START",
+  "NOT_INGESTIBLE",
+]);
+const ACCOUNT_RESULT_STATUSES: ReadonlySet<unknown> = new Set(
+  keysOf<CpmmAccountResult["status"]>({
+    RECORDED: true,
+    DUPLICATE: true,
+    INVALID: true,
+    CAPACITY_REFUSED: true,
+  }),
+);
+const CAPACITY_CODES: ReadonlySet<unknown> = new Set(
+  keysOf<Extract<CpmmAccountResult, { status: "CAPACITY_REFUSED" }>["code"]>({
+    RECORD_CAPACITY: true,
+    EPOCH_CAPACITY: true,
+  }),
+);
+const INVALID_CODES: ReadonlySet<unknown> = new Set(CPMM_INVALID_CODES);
+/** INVALID codes the ledger can return without an epoch (counted as unattributed). */
+const UNATTRIBUTABLE_INVALID_CODES: ReadonlySet<unknown> = new Set([
+  "ENVELOPE_INVALID",
+  "STALE_EPOCH",
+  "EPOCH_NOT_OPEN",
+]);
+/** INVALID codes the ledger never attributes to an epoch (no retained epoch is known then). */
+const NEVER_ATTRIBUTED_INVALID_CODES = ["ENVELOPE_INVALID", "EPOCH_NOT_OPEN"] as const;
+/** The accepted ledger's partition of blocking classes by terminal disposition. */
+const BLOCKING_CLASS_SCOPE: Readonly<
+  Record<CpmmBlockingClass, "UNRESOLVED" | "INGESTION_INCOMPLETE" | "EITHER">
+> = {
+  TRANSACTION_UNAVAILABLE: "UNRESOLVED",
+  RESPONSE_CONTRADICTED: "UNRESOLVED",
+  DECODER_UNRESOLVED: "UNRESOLVED",
+  EVIDENCE_UNVERIFIED: "UNRESOLVED",
+  EVIDENCE_WITHHELD: "UNRESOLVED",
+  CANCELLED: "UNRESOLVED",
+  SESSION_ENDED: "UNRESOLVED",
+  REQUEST_REFUSED: "UNRESOLVED",
+  ADAPTER_CAPACITY_REFUSED: "UNRESOLVED",
+  DUPLICATE_WITHOUT_ORIGINAL: "UNRESOLVED",
+  VALIDATION_DISAGREEMENT: "UNRESOLVED",
+  INGEST_STOPPED: "INGESTION_INCOMPLETE",
+  INGEST_REJECTED: "INGESTION_INCOMPLETE",
+  NOT_INGESTIBLE: "INGESTION_INCOMPLETE",
+  EPOCH_CLOSED: "EITHER",
+  BINDING_CONFLICT: "EITHER",
+  ACCOUNTING_EXCEPTION: "EITHER",
+  UNRECOGNIZED_OUTCOME: "EITHER",
+};
+const BLOCKING_CLASSES: ReadonlySet<unknown> = new Set(Object.keys(BLOCKING_CLASS_SCOPE));
+/** Policy-pending outcomes and the only fact kind each follows from (no new policy). */
+const POLICY_FACT_KIND: Readonly<Record<CpmmPolicyPending, string>> = {
+  NO_TARGET_SWAP_POLICY_UNREVIEWED: "RESOLVED_NO_TARGET_SWAP",
+  FAILED_TRANSACTION_POLICY_UNREVIEWED: "RECORDED_FAILED_TRANSACTION",
+};
+const POLICY_PENDING_VALUES: ReadonlySet<unknown> = new Set(Object.keys(POLICY_FACT_KIND));
+/** The accepted ledger's UNRESOLVED class for each fact kind it maps directly. */
+const UNRESOLVED_CLASS_BY_KIND: ReadonlyMap<unknown, CpmmBlockingClass> = new Map<
+  string,
+  CpmmBlockingClass
+>([
+  ["INVALID_NOTIFICATION", "VALIDATION_DISAGREEMENT"],
+  ["INVALID_GATE", "VALIDATION_DISAGREEMENT"],
+  ["UNRESOLVED", "DECODER_UNRESOLVED"],
+  ["TRANSACTION_NOT_FOUND", "TRANSACTION_UNAVAILABLE"],
+  ["RPC_ERROR", "TRANSACTION_UNAVAILABLE"],
+  ["HTTP_ERROR", "TRANSACTION_UNAVAILABLE"],
+  ["TRANSPORT_FAILED", "TRANSACTION_UNAVAILABLE"],
+  ["MALFORMED_RESPONSE", "RESPONSE_CONTRADICTED"],
+  ["SIGNATURE_MISMATCH", "RESPONSE_CONTRADICTED"],
+  ["METADATA_CONTRADICTION", "RESPONSE_CONTRADICTED"],
+  ["EVIDENCE_MISSING", "EVIDENCE_UNVERIFIED"],
+  ["EVIDENCE_MISMATCH", "EVIDENCE_UNVERIFIED"],
+  ["EVIDENCE_NOT_REPLAYABLE", "EVIDENCE_WITHHELD"],
+  ["CANCELLED_IN_FLIGHT", "CANCELLED"],
+  ["SESSION_STOPPED_IN_FLIGHT", "SESSION_ENDED"],
+  ["TRACKING_CAPACITY_REACHED", "ADAPTER_CAPACITY_REFUSED"],
+  ["DUPLICATE_NOTIFICATION", "DUPLICATE_WITHOUT_ORIGINAL"],
+]);
+/** REQUEST_REFUSED and LATE_RESPONSE by code; a lifecycle refusal may be the epoch's closing. */
+const UNRESOLVED_CLASS_BY_CODE: Readonly<
+  Record<"REQUEST_REFUSED" | "LATE_RESPONSE", ReadonlyMap<unknown, readonly CpmmBlockingClass[]>>
+> = {
+  REQUEST_REFUSED: new Map<string, readonly CpmmBlockingClass[]>([
+    ["CALLER_REFUSAL", ["CANCELLED", "EPOCH_CLOSED"]],
+    ["CALLER_CANCELLED", ["CANCELLED"]],
+    ["LIFETIME_EXPIRED", ["SESSION_ENDED"]],
+    ["REQUEST_SESSION_STOPPED", ["SESSION_ENDED"]],
+    ["HTTP_ATTEMPT_CEILING_REACHED", ["REQUEST_REFUSED"]],
+    ["SOLANA_RPC_ATTEMPT_CEILING_REACHED", ["REQUEST_REFUSED"]],
+    ["BUDGET_MANAGER_DENIED", ["REQUEST_REFUSED"]],
+    ["REQUEST_SESSION_NOT_OPEN", ["REQUEST_REFUSED"]],
+    ["UNRECOGNIZED_SESSION_CODE", ["REQUEST_REFUSED"]],
+  ]),
+  LATE_RESPONSE: new Map<string, readonly CpmmBlockingClass[]>([
+    ["LIFECYCLE_REFUSED", ["CANCELLED", "EPOCH_CLOSED"]],
+    ["CALLER_CANCELLED", ["CANCELLED"]],
+    ["SESSION_STOPPED", ["SESSION_ENDED"]],
+    ["ABSOLUTE_DEADLINE", ["SESSION_ENDED"]],
+    ["SESSION_NOT_OPEN", ["SESSION_ENDED"]],
+    ["LIFECYCLE_CHECK_FAILED", ["SESSION_ENDED"]],
+  ]),
+};
+/** INGESTION_INCOMPLETE classes a bound swap fact can take. */
+const SWAP_INCOMPLETE_CLASSES: ReadonlySet<unknown> = new Set([
+  "NOT_INGESTIBLE",
+  "UNRECOGNIZED_OUTCOME",
+  "INGEST_STOPPED",
+  "EPOCH_CLOSED",
+  "INGEST_REJECTED",
+  "ACCOUNTING_EXCEPTION",
+]);
+
+type LedgerRecord = CpmmSignatureAccountingRecord;
+
+const nullOrInt = (v: unknown): boolean => v === null || isInt(v);
+const nullOrPositive = (v: unknown): boolean => v === null || positiveInt(v);
+
+function duplicateDetailValid(d: unknown): d is CpmmDuplicateOccurrence {
+  return (
+    isRec(d) &&
+    sameKeys(d, LEDGER_DETAIL_KEYS) &&
+    positiveInt(d.occurrence) &&
+    isInt(d.epoch) &&
+    positiveInt(d.hostReceivedAtMs) &&
+    isInt(d.notifiedSlot) &&
+    nullOrPositive(d.notifiedBlockTimeSec) &&
+    AGREEMENTS.has(d.agreement) &&
+    LEDGER_DISPOSITIONS.has(d.firstDispositionAtReceipt)
+  );
+}
+
+/** Every field of a record in the accepted ledger's domains (details apart). */
+function ledgerRecordSchemaValid(r: unknown): r is LedgerRecord {
+  if (!isRec(r) || !sameKeys(r, LEDGER_RECORD_KEYS)) return false;
+  const g = r.ingestion;
+  return (
+    positiveInt(r.sequence) &&
+    isValidSolanaSignature(r.signature) &&
+    isInt(r.epoch) &&
+    positiveInt(r.hostReceivedAtMs) &&
+    isInt(r.notifiedSlot) &&
+    nullOrPositive(r.notifiedBlockTimeSec) &&
+    nullOrInt(r.verifiedSlot) &&
+    nullOrPositive(r.verifiedBlockTimeSec) &&
+    LEDGER_DISPOSITIONS.has(r.disposition) &&
+    (r.blockingClass === null || BLOCKING_CLASSES.has(r.blockingClass)) &&
+    (r.policyPending === null || POLICY_PENDING_VALUES.has(r.policyPending)) &&
+    codeOrNull(r.factKind) &&
+    codeOrNull(r.factCode) &&
+    isRec(g) &&
+    sameKeys(g, LEDGER_INGESTION_KEYS) &&
+    INGESTION_STATUSES.has(g.status) &&
+    LEDGER_INGESTION_KEYS.every((k) => k === "status" || isInt(g[k])) &&
+    typeof r.metadataConflict === "boolean" &&
+    isInt(r.duplicateOccurrences) &&
+    Array.isArray(r.duplicateDetails) &&
+    isInt(r.duplicateDetailsDropped)
+  );
+}
+
+/** Disposition, blocking class and policy against the recorded fact, as the ledger maps them. */
+function classificationValid(r: LedgerRecord): boolean {
+  const d = r.disposition;
+  const bc = r.blockingClass;
+  const kind = r.factKind;
+  if (d === "PENDING") {
+    return bc === null && r.policyPending === null && kind === null && r.factCode === null;
+  }
+  if ((d === "POLICY_PENDING") !== (r.policyPending !== null)) return false;
+  if ((bc === null) !== (d === "INGESTED" || d === "POLICY_PENDING")) return false;
+  if (bc !== null) {
+    const scope = BLOCKING_CLASS_SCOPE[bc];
+    if (scope !== "EITHER" && scope !== d) return false;
+  }
+  // Outcomes of the ledger itself, whatever the fact.
+  if (d === "UNRESOLVED" && bc === "ACCOUNTING_EXCEPTION") return true;
+  if (kind === null) return d === "UNRESOLVED" && bc === "UNRECOGNIZED_OUTCOME";
+  if (kind === "RESOLVED_SWAPS") {
+    if (d === "INGESTED") return true;
+    if (d === "INGESTION_INCOMPLETE") return SWAP_INCOMPLETE_CLASSES.has(bc);
+    return d === "UNRESOLVED" && bc === "BINDING_CONFLICT";
+  }
+  if (d === "POLICY_PENDING") return POLICY_FACT_KIND[r.policyPending!] === kind;
+  if (d !== "UNRESOLVED") return false;
+  // A fact naming another notification is a binding conflict (validation kinds return first).
+  if (bc === "BINDING_CONFLICT") return kind !== "INVALID_NOTIFICATION" && kind !== "INVALID_GATE";
+  const direct = UNRESOLVED_CLASS_BY_KIND.get(kind);
+  if (direct !== undefined) return bc === direct;
+  if (kind === "REQUEST_REFUSED" || kind === "LATE_RESPONSE") {
+    const byCode = UNRESOLVED_CLASS_BY_CODE[kind].get(r.factCode);
+    return byCode === undefined ? bc === "UNRECOGNIZED_OUTCOME" : byCode.includes(bc!);
+  }
+  return bc === "UNRECOGNIZED_OUTCOME";
+}
+
+/** Verified slot and block time: written once, at the terminal transition, as the ledger does. */
+function verifiedMetadataValid(r: LedgerRecord): boolean {
+  const vs = r.verifiedSlot;
+  const vb = r.verifiedBlockTimeSec;
+  if (vs !== null && vs !== r.notifiedSlot) return false;
+  if (vb !== null && vs === null) return false;
+  if (vb !== null && r.notifiedBlockTimeSec !== null && vb !== r.notifiedBlockTimeSec) return false;
+  const d = r.disposition;
+  const bc = r.blockingClass;
+  // A bound swap fact: slot and on-chain time from its events.
+  if (d === "INGESTED" || (d === "INGESTION_INCOMPLETE" && bc !== "ACCOUNTING_EXCEPTION")) {
+    return vs !== null && vb !== null;
+  }
+  // Positioned outcomes: verified only past the decoding preconditions, from the notification.
+  if (d === "POLICY_PENDING" || (d === "UNRESOLVED" && bc === "DECODER_UNRESOLVED")) {
+    return vb === (vs === null ? null : r.notifiedBlockTimeSec);
+  }
+  return vs === null && vb === null;
+}
+
+/** The ingestion accounting by the ledger's rules, indeterminate counts included. */
+function ingestionValid(r: LedgerRecord): boolean {
+  const { status, total, accepted, rejected, unattempted, indeterminate } = r.ingestion;
+  if (accepted + rejected + unattempted + indeterminate !== total) return false;
+  if (status === "EXCEPTION") {
+    if (total < 1 || indeterminate !== total) return false;
+  } else if (indeterminate !== 0) return false;
+  if ((status === "NOT_CALLED" || status === "NOT_INGESTIBLE") && unattempted !== total) {
+    return false;
+  }
+  const zero = status === "NOT_CALLED" && total === 0;
+  const d = r.disposition;
+  const bc = r.blockingClass;
+  if (d === "PENDING" || d === "POLICY_PENDING" || r.factKind !== "RESOLVED_SWAPS") return zero;
+  if (d === "INGESTED") return status === "COMPLETE" && total >= 1 && accepted === total;
+  if (d === "UNRESOLVED") {
+    // Before any ingest, or a foreign fact or tracker identity refused by the ingest itself.
+    return zero || (bc === "BINDING_CONFLICT" && total >= 1 && INGEST_RESULT_STATUSES.has(status));
+  }
+  // INGESTION_INCOMPLETE: a bound, non-empty swap fact.
+  if (total < 1) return false;
+  switch (bc) {
+    case "NOT_INGESTIBLE":
+      return status === "NOT_CALLED" || status === "NOT_INGESTIBLE";
+    case "ACCOUNTING_EXCEPTION":
+      return status === "EXCEPTION";
+    case "UNRECOGNIZED_OUTCOME":
+      return status !== "NOT_CALLED";
+    case "INGEST_REJECTED":
+      return status === "PARTIAL" || status === "NONE_ACCEPTED";
+    default:
+      return INGEST_RESULT_STATUSES.has(status) && status !== "NOT_INGESTIBLE";
+  }
+}
+
+/** The receipt-time agreement, against the reference values the first record had then. */
+function expectedAgreement(r: LedgerRecord, d: CpmmDuplicateOccurrence): string {
+  // While PENDING nothing is verified yet; after the transition the verified values are final.
+  const pending = d.firstDispositionAtReceipt === "PENDING";
+  const refSlot = pending ? r.notifiedSlot : (r.verifiedSlot ?? r.notifiedSlot);
+  const refBt = pending
+    ? r.notifiedBlockTimeSec
+    : (r.verifiedBlockTimeSec ?? r.notifiedBlockTimeSec);
+  if (d.notifiedSlot !== refSlot) return "SLOT_CONFLICT";
+  if (d.notifiedBlockTimeSec !== null && refBt !== null && d.notifiedBlockTimeSec !== refBt) {
+    return "BLOCK_TIME_CONFLICT";
+  }
+  return "AGREES";
+}
+
+/** The ledger's per-receiving-epoch aggregate conflict, over the given details. */
+function detailsConflict(r: LedgerRecord, details: readonly CpmmDuplicateOccurrence[]): boolean {
+  const refSlot = r.verifiedSlot ?? r.notifiedSlot;
+  const refBt = r.verifiedBlockTimeSec ?? r.notifiedBlockTimeSec;
+  const byEpoch = new Map<number, CpmmDuplicateOccurrence[]>();
+  for (const d of details) byEpoch.set(d.epoch, [...(byEpoch.get(d.epoch) ?? []), d]);
+  for (const group of byEpoch.values()) {
+    if (group.some((d) => d.notifiedSlot !== refSlot)) return true;
+    const bts = group.map((d) => d.notifiedBlockTimeSec).filter((b): b is number => b !== null);
+    if (bts.length === 0) continue;
+    if (bts.some((b) => b !== bts[0])) return true;
+    if (refBt !== null && bts[0] !== refBt) return true;
+  }
+  return false;
+}
+
+/** A settlement in its status-specific shape (the recorder's fields; absent ones null). */
+function settlementShapeValid(s: Record<string, unknown>): boolean {
+  if (!positiveInt(s.call)) return false;
+  const nulls = (...keys: string[]) => keys.every((k) => s[k] === null);
+  if (s.outcome === "REJECTED") {
+    return nulls(
+      "status",
+      "occurrence",
+      "recordSequence",
+      "signature",
+      "disposition",
+      "factKind",
+      "factCode",
+      "firstSequence",
+      "code",
+    );
+  }
+  if (s.outcome !== "FULFILLED" || !ACCOUNT_RESULT_STATUSES.has(s.status)) return false;
+  if (!positiveInt(s.occurrence)) return false;
+  switch (s.status) {
+    case "RECORDED":
+      return (
+        positiveInt(s.recordSequence) &&
+        isValidSolanaSignature(s.signature) &&
+        LEDGER_DISPOSITIONS.has(s.disposition) &&
+        s.disposition !== "PENDING" &&
+        codeOrNull(s.factKind) &&
+        codeOrNull(s.factCode) &&
+        nulls("firstSequence", "code")
+      );
+    case "DUPLICATE":
+      return (
+        positiveInt(s.firstSequence) &&
+        nulls("recordSequence", "signature", "disposition", "factKind", "factCode", "code")
+      );
+    default:
+      return (
+        (s.status === "INVALID" ? INVALID_CODES : CAPACITY_CODES).has(s.code) &&
+        nulls("recordSequence", "signature", "disposition", "factKind", "factCode", "firstSequence")
+      );
+  }
+}
+
+/** A recorded account() call: fields in the recorder's domains (envelope fields may be null). */
+const ledgerCallShapeValid = (c: Record<string, unknown>): boolean =>
+  positiveInt(c.call) &&
+  (c.signature === null || typeof c.signature === "string") &&
+  nullOrInt(c.epoch) &&
+  (c.hostReceivedAtMs === null ||
+    (typeof c.hostReceivedAtMs === "number" && Number.isFinite(c.hostReceivedAtMs))) &&
+  (c.outcome === "RETURNED" || c.outcome === "THREW" || c.outcome === "IN_PROGRESS") &&
+  (c.outcome === "IN_PROGRESS" ? c.endOrdinal === null : isInt(c.endOrdinal));
+
+const EMPTY_LEDGER_CHECKED: CpmmLedgerStructuralCheck["checked"] = Object.freeze({
+  records: 0,
+  epochs: 0,
+  accountCalls: 0,
+  settlements: 0,
+  duplicateDetails: 0,
+  eventTotalsCorroborated: 0,
+});
+const NO_LEDGER_COVERAGE: CpmmLedgerStructuralCheck["coverage"] = Object.freeze({
+  epochTotals: false,
+  callTotals: false,
+  duplicateDetails: false,
+});
+
+function ledgerResult(
+  f: Findings,
+  checked: CpmmLedgerStructuralCheck["checked"],
+  coverage: CpmmLedgerStructuralCheck["coverage"],
+): CpmmLedgerStructuralCheck {
+  return {
+    status:
+      f.status === "REPRODUCED"
+        ? "STRUCTURALLY_CONSISTENT"
+        : f.status === "MISMATCH"
+          ? "MISMATCH"
+          : "MISSING_EVIDENCE",
+    scope: "RECORDED_LEDGER_STRUCTURE_ONLY",
+    ledgerReplayed: false,
+    ingestionReplayed: false,
+    findings: f.list,
+    checked: { ...checked },
+    coverage: { ...coverage },
+  };
+}
+
+/**
+ * Structural cross-checks of the recorded ledger (item G, partial), over the validated documents
+ * only: no ledger, session, adapter or tracker is constructed, and nothing is ingested.
+ * - records, epochs and counters in the accepted ledger's schemas, domains and enums; dense
+ *   sequences, unique signatures and epochs; the classification each fact maps to; verified
+ *   metadata; ingestion accounting (indeterminate counts included); per-epoch identities and the
+ *   ledger-wide counters against them and the records;
+ * - account calls and settlements in their status-specific shapes (RECORDED, DUPLICATE, INVALID,
+ *   CAPACITY_REFUSED), each referencing the occurrence, record and duplicate detail it names, with
+ *   settlement and record agreeing on the terminal state they both describe;
+ * - duplicate details against the state at their receipt (a first occurrence then PENDING may be
+ *   final now), never blindly against the final state; truncated details never prove an absence;
+ * - ingestion totals against independently decoded event counts where a matched analysis exists
+ *   (corroboration of the recorded total only, never of tracker acceptance).
+ * Pending work, dropped or unrecorded calls, saturation and unavailable sections are missing
+ * evidence and narrow the exact checks (`coverage`); what is still known is still checked.
+ */
+function checkLedgerStructure(
+  docs: Map<string, Record<string, unknown>>,
+  decodedEvents: ReadonlyMap<string, number>,
+): CpmmLedgerStructuralCheck {
+  const f = new Findings();
+  const doc = docs.get(CPMM_EVIDENCE_FILES.ledger);
+  const section = (name: string): unknown =>
+    get(doc, name, "status") === "READ" ? get(doc, name, "value") : undefined;
+  const recordsIn = section("records") as unknown[] | undefined;
+  const epochsIn = section("epochs") as unknown[] | undefined;
+  const countersIn = section("counters");
+  if (recordsIn === undefined) f.add("MISSING_EVIDENCE", "LEDGER_RECORDS_UNAVAILABLE");
+  if (epochsIn === undefined) f.add("MISSING_EVIDENCE", "LEDGER_EPOCHS_UNAVAILABLE");
+  if (countersIn === undefined) f.add("MISSING_EVIDENCE", "LEDGER_COUNTERS_UNAVAILABLE");
+  const calls = (get(doc, "calls") ?? []) as Record<string, unknown>[];
+  const recording = docs.get(CPMM_EVIDENCE_FILES.recording);
+  const plan = get(docs.get(CPMM_EVIDENCE_FILES.plan), "plan");
+  const sum = (xs: readonly number[]): number => xs.reduce((a, b) => a + b, 0);
+
+  // The plan's ledger limits (asserted by the plan; a ledger exceeding them contradicts it).
+  const limitsIn = get(plan, "limits", "ledger");
+  const limits =
+    isRec(limitsIn) &&
+    sameKeys(limitsIn, LEDGER_LIMIT_KEYS) &&
+    LEDGER_LIMIT_KEYS.every((k) => positiveInt(limitsIn[k]))
+      ? (limitsIn as unknown as CpmmLedgerLimits)
+      : null;
+  if (limits === null) f.add("MISSING_EVIDENCE", "LEDGER_LIMITS_UNAVAILABLE");
+
+  // Counters. Saturated counts are no longer exact: equalities are then not checked.
+  let counters: CpmmLedgerCounters | null = null;
+  if (countersIn !== undefined) {
+    if (
+      isRec(countersIn) &&
+      sameKeys(countersIn, LEDGER_COUNTER_KEYS) &&
+      LEDGER_COUNTER_KEYS.every((k) =>
+        k === "saturated" ? typeof countersIn[k] === "boolean" : isInt(countersIn[k]),
+      )
+    ) {
+      counters = countersIn as unknown as CpmmLedgerCounters;
+    } else f.add("MISMATCH", "LEDGER_COUNTERS_MALFORMED");
+  }
+  if (counters?.saturated === true) f.add("MISSING_EVIDENCE", "LEDGER_COUNTERS_SATURATED");
+  const exact = counters !== null && !counters.saturated;
+  if (
+    counters !== null &&
+    (counters.epochCapacityRefused > counters.unattributedOccurrences ||
+      (counters.epochCapacityRefused > 0 && counters.openEpochRefused === 0))
+  ) {
+    f.add("MISMATCH", "LEDGER_COUNTER_TOTALS");
+  }
+
+  // Epochs: opened in strictly increasing order; only the newest can still be open.
+  const epochs: CpmmEpochAccounting[] = [];
+  let epochsUsable = epochsIn !== undefined;
+  for (const e of epochsIn ?? []) {
+    const dup = get(e, "duplicates");
+    const inv = get(e, "invalid");
+    if (
+      isRec(e) &&
+      sameKeys(e, LEDGER_EPOCH_KEYS) &&
+      isInt(e.epoch) &&
+      positiveInt(e.observationStartMs) &&
+      EPOCH_STATES.has(e.state) &&
+      isInt(e.occurrences) &&
+      isInt(e.firstOccurrences) &&
+      isInt(e.capacityRefused) &&
+      isRec(dup) &&
+      sameKeys(dup, ["sameEpoch", "crossEpoch"]) &&
+      isInt(dup.sameEpoch) &&
+      isInt(dup.crossEpoch) &&
+      isRec(inv) &&
+      sameKeys(inv, CPMM_INVALID_CODES) &&
+      CPMM_INVALID_CODES.every((c) => isInt(inv[c]))
+    ) {
+      epochs.push(e as unknown as CpmmEpochAccounting);
+    } else {
+      f.add("MISMATCH", "LEDGER_EPOCH_MALFORMED");
+      epochsUsable = false;
+    }
+  }
+  if (epochs.some((e, i) => i > 0 && e.epoch <= epochs[i - 1]!.epoch)) {
+    f.add("MISMATCH", "LEDGER_EPOCH_ORDER");
+    epochsUsable = false;
+  }
+  if (epochs.some((e, i) => i < epochs.length - 1 && e.state === "OPEN")) {
+    f.add("MISMATCH", "LEDGER_EPOCH_STATE");
+  }
+  if (limits !== null && (epochsIn?.length ?? 0) > limits.maxEpochs) {
+    f.add("MISMATCH", "LEDGER_LIMIT_EXCEEDED");
+  }
+  const invalidOf = (e: CpmmEpochAccounting, codes: readonly string[]): number =>
+    sum(codes.map((c) => e.invalid[c as keyof CpmmEpochAccounting["invalid"]]));
+  if (exact) {
+    for (const e of epochs) {
+      const parts =
+        e.firstOccurrences +
+        e.duplicates.sameEpoch +
+        e.duplicates.crossEpoch +
+        invalidOf(e, CPMM_INVALID_CODES) +
+        e.capacityRefused;
+      if (e.occurrences !== parts) f.add("MISMATCH", "LEDGER_EPOCH_TOTALS");
+    }
+  }
+  if (epochs.some((e) => invalidOf(e, NEVER_ATTRIBUTED_INVALID_CODES) !== 0)) {
+    f.add("MISMATCH", "LEDGER_EPOCH_TOTALS");
+  }
+  const epochByNumber = new Map(epochs.map((e) => [e.epoch, e]));
+
+  // Records: dense sequences in creation order, unique signatures, known epochs.
+  const records: LedgerRecord[] = [];
+  let recordsUsable = recordsIn !== undefined;
+  for (const [i, r] of (recordsIn ?? []).entries()) {
+    if (!ledgerRecordSchemaValid(r)) {
+      f.add("MISMATCH", "LEDGER_RECORD_MALFORMED");
+      recordsUsable = false;
+      continue;
+    }
+    if (!r.duplicateDetails.every(duplicateDetailValid)) {
+      f.add("MISMATCH", "LEDGER_DUPLICATE_DETAIL_MALFORMED");
+      recordsUsable = false;
+      continue;
+    }
+    if (r.sequence !== i + 1) f.add("MISMATCH", "LEDGER_RECORD_SEQUENCE");
+    records.push(r);
+  }
+  const perSignature = new Map<string, number>();
+  for (const r of records) perSignature.set(r.signature, (perSignature.get(r.signature) ?? 0) + 1);
+  if ([...perSignature.values()].some((n) => n > 1)) f.add("MISMATCH", "LEDGER_RECORD_AMBIGUOUS");
+  const perSequence = new Map<number, LedgerRecord[]>();
+  for (const r of records) perSequence.set(r.sequence, [...(perSequence.get(r.sequence) ?? []), r]);
+  /** The single record of a sequence, or undefined (absent or ambiguous). */
+  const recordAt = (seq: unknown): LedgerRecord | undefined => {
+    const list = perSequence.get(seq as number);
+    return list?.length === 1 ? list[0] : undefined;
+  };
+  // An unresolvable reference is a contradiction only when every record is present and valid.
+  const recordsComplete = recordsIn !== undefined && recordsUsable;
+  if (limits !== null && (recordsIn?.length ?? 0) > limits.maxSignatureRecords) {
+    f.add("MISMATCH", "LEDGER_LIMIT_EXCEEDED");
+  }
+
+  let detailsSeen = 0;
+  let corroborated = 0;
+  let anyTruncated = false;
+  const detailOwner = new Map<number, LedgerRecord>();
+  const retainedSame = new Map<number, number>();
+  const retainedCross = new Map<number, number>();
+  let previousEpoch = -1;
+  for (const r of records) {
+    if (epochsUsable) {
+      const ep = epochByNumber.get(r.epoch);
+      if (ep === undefined || r.hostReceivedAtMs < ep.observationStartMs) {
+        f.add("MISMATCH", "LEDGER_RECORD_EPOCH");
+      }
+    }
+    // A record is created only in the open epoch, and epochs only increase.
+    if (r.epoch < previousEpoch) f.add("MISMATCH", "LEDGER_RECORD_EPOCH");
+    previousEpoch = Math.max(previousEpoch, r.epoch);
+    if (!classificationValid(r)) f.add("MISMATCH", "LEDGER_CLASSIFICATION");
+    if (!verifiedMetadataValid(r)) f.add("MISMATCH", "LEDGER_VERIFIED_METADATA");
+    if (!ingestionValid(r)) f.add("MISMATCH", "LEDGER_INGESTION_ACCOUNTING");
+    if (r.disposition === "PENDING") f.add("MISSING_EVIDENCE", "LEDGER_RECORD_PENDING");
+    // Decoded event counts: the recorded total only (acceptance is never proven here).
+    const decodedCount = decodedEvents.get(r.signature);
+    if (
+      decodedCount !== undefined &&
+      r.factKind === "RESOLVED_SWAPS" &&
+      (r.ingestion.total !== 0 ||
+        r.disposition === "INGESTED" ||
+        r.disposition === "INGESTION_INCOMPLETE")
+    ) {
+      if (r.ingestion.total === decodedCount) corroborated++;
+      else f.add("MISMATCH", "LEDGER_EVENT_TOTAL");
+    }
+
+    // Duplicates: exact counts, the first details only, and their receipt-time view.
+    const details = r.duplicateDetails;
+    detailsSeen += details.length;
+    if (
+      details.length > r.duplicateOccurrences ||
+      r.duplicateDetailsDropped !== r.duplicateOccurrences - details.length ||
+      (limits !== null &&
+        (details.length > limits.maxDuplicateDetailsPerRecord ||
+          (r.duplicateDetailsDropped > 0 &&
+            details.length !== limits.maxDuplicateDetailsPerRecord)))
+    ) {
+      f.add("MISMATCH", "LEDGER_DUPLICATE_RETENTION");
+    }
+    const truncated = r.duplicateDetailsDropped > 0;
+    if (truncated) {
+      anyTruncated = true;
+      f.add("MISSING_EVIDENCE", "LEDGER_DUPLICATE_DETAILS_TRUNCATED");
+    }
+    let terminalSeen = false;
+    let previousOccurrence = 0;
+    for (const d of details) {
+      if (detailOwner.has(d.occurrence)) f.add("MISMATCH", "LEDGER_OCCURRENCE_REFERENCE");
+      detailOwner.set(d.occurrence, r);
+      const ep = epochsUsable ? epochByNumber.get(d.epoch) : undefined;
+      if (
+        d.occurrence <= previousOccurrence ||
+        d.epoch < r.epoch ||
+        (epochsUsable && (ep === undefined || d.hostReceivedAtMs < ep.observationStartMs))
+      ) {
+        f.add("MISMATCH", "LEDGER_DUPLICATE_DETAIL");
+      }
+      previousOccurrence = d.occurrence;
+      // The single PENDING-to-terminal transition: PENDING, then only the final disposition.
+      const atReceipt = d.firstDispositionAtReceipt;
+      if (
+        (atReceipt !== "PENDING" && atReceipt !== r.disposition) ||
+        (atReceipt === "PENDING" && terminalSeen)
+      ) {
+        f.add("MISMATCH", "LEDGER_DUPLICATE_TIMING");
+      }
+      if (atReceipt !== "PENDING") terminalSeen = true;
+      if (d.agreement !== expectedAgreement(r, d)) f.add("MISMATCH", "LEDGER_DUPLICATE_AGREEMENT");
+      const tally = d.epoch === r.epoch ? retainedSame : retainedCross;
+      tally.set(d.epoch, (tally.get(d.epoch) ?? 0) + 1);
+    }
+    // The conflict flag comes from exact aggregates: retained details can prove a conflict, and
+    // complete details decide it; truncated details never prove its absence.
+    const visible = detailsConflict(r, details);
+    if (truncated ? visible && !r.metadataConflict : visible !== r.metadataConflict) {
+      f.add("MISMATCH", "LEDGER_METADATA_CONFLICT");
+    }
+  }
+
+  // Ledger-wide and per-epoch totals, exact where nothing is saturated.
+  const epochTotals = exact && epochsUsable && recordsComplete;
+  if (exact && epochsUsable) {
+    const c = counters!;
+    if (
+      c.occurrences !== sum(epochs.map((e) => e.occurrences)) + c.unattributedOccurrences ||
+      c.recordCapacityRefused !== sum(epochs.map((e) => e.capacityRefused))
+    ) {
+      f.add("MISMATCH", "LEDGER_COUNTER_TOTALS");
+    }
+  }
+  if (epochTotals) {
+    const duplicatesTotal = sum(records.map((r) => r.duplicateOccurrences));
+    if (
+      sum(epochs.map((e) => e.firstOccurrences)) !== records.length ||
+      sum(epochs.map((e) => e.duplicates.sameEpoch + e.duplicates.crossEpoch)) !== duplicatesTotal
+    ) {
+      f.add("MISMATCH", "LEDGER_EPOCH_TOTALS");
+    }
+    const fitsRetained = (retained: number, total: number) =>
+      anyTruncated ? retained <= total : retained === total;
+    for (const e of epochs) {
+      if (
+        e.firstOccurrences !== records.filter((r) => r.epoch === e.epoch).length ||
+        !fitsRetained(retainedSame.get(e.epoch) ?? 0, e.duplicates.sameEpoch) ||
+        !fitsRetained(retainedCross.get(e.epoch) ?? 0, e.duplicates.crossEpoch) ||
+        (e.duplicates.crossEpoch > 0 && !records.some((r) => r.epoch < e.epoch))
+      ) {
+        f.add("MISMATCH", "LEDGER_EPOCH_TOTALS");
+      }
+    }
+  }
+
+  // Account calls and settlements. Absent or incomplete recording narrows the exact checks.
+  const ledgerRecorded = get(recording, "ledgerRecorded") === true;
+  const dropped = get(recording, "retention", "ledgerCalls", "dropped") !== 0;
+  const failures = get(recording, "instrumentation", "retainedFailures");
+  const instrumentationGap =
+    get(recording, "instrumentation", "droppedFailureRecords") !== 0 ||
+    !Array.isArray(failures) ||
+    failures.some((x) => get(x, "layer") === "LEDGER");
+  const inProgress = get(recording, "pending", "accountCallsInProgress") !== 0;
+  const settlementsPending = get(recording, "pending", "accountSettlementsPending") !== 0;
+  if (!ledgerRecorded) f.add("MISSING_EVIDENCE", "LEDGER_CALLS_NOT_RECORDED");
+  else {
+    if (dropped) f.add("MISSING_EVIDENCE", "LEDGER_CALLS_DROPPED");
+    if (instrumentationGap) f.add("MISSING_EVIDENCE", "LEDGER_INSTRUMENTATION_INCOMPLETE");
+    if (inProgress) f.add("MISSING_EVIDENCE", "ACCOUNT_CALL_IN_PROGRESS");
+    if (settlementsPending) f.add("MISSING_EVIDENCE", "LEDGER_SETTLEMENTS_PENDING");
+  }
+  const callsComplete = ledgerRecorded && !dropped && !instrumentationGap;
+  const settlementsComplete = callsComplete && !inProgress && !settlementsPending;
+
+  const callRecords = calls.filter((c) => c.kind === "ACCOUNT_CALL");
+  const settlementRecords = calls.filter((c) => c.kind === "ACCOUNT_SETTLEMENT");
+  const callByNumber = new Map<unknown, Record<string, unknown>>();
+  const ambiguousCalls = new Set<unknown>();
+  for (const c of callRecords) {
+    if (!ledgerCallShapeValid(c)) f.add("MISMATCH", "ACCOUNT_CALL_MALFORMED");
+    if (callByNumber.has(c.call)) {
+      f.add("MISMATCH", "ACCOUNT_CALL_AMBIGUOUS");
+      ambiguousCalls.add(c.call);
+    }
+    callByNumber.set(c.call, c);
+  }
+  const settled = new Set<unknown>();
+  const statusCount = new Map<unknown, number>();
+  const codeCount = new Map<unknown, number>();
+  const recordedFor = new Map<number, number>();
+  const duplicateFor = new Map<number, number>();
+  const matchedDetails = new Set<number>();
+  for (const s of settlementRecords) {
+    if (!settlementShapeValid(s)) {
+      f.add("MISMATCH", "ACCOUNT_SETTLEMENT_MALFORMED");
+      continue;
+    }
+    // The accepted ledger's account() never rejects.
+    if (s.outcome === "REJECTED") {
+      f.add("MISMATCH", "ACCOUNT_SETTLEMENT_REJECTED");
+      continue;
+    }
+    if (settled.has(s.call)) {
+      f.add("MISMATCH", "ACCOUNT_SETTLEMENT_AMBIGUOUS");
+      continue;
+    }
+    settled.add(s.call);
+    statusCount.set(s.status, (statusCount.get(s.status) ?? 0) + 1);
+    if (s.code !== null) codeCount.set(s.code, (codeCount.get(s.code) ?? 0) + 1);
+    // A settlement belongs to a single call that returned its promise.
+    const ambiguousCall = ambiguousCalls.has(s.call);
+    const call = ambiguousCall ? undefined : callByNumber.get(s.call);
+    if (call === undefined ? callsComplete && !ambiguousCall : call.outcome !== "RETURNED") {
+      f.add("MISMATCH", "ACCOUNT_SETTLEMENT_ORPHANED");
+    }
+    // Every account() call is one ledger occurrence, numbered alike.
+    if (ledgerRecorded && s.occurrence !== s.call) f.add("MISMATCH", "LEDGER_OCCURRENCE_REFERENCE");
+    if (s.status === "RECORDED") {
+      const r = recordAt(s.recordSequence);
+      if (r === undefined) {
+        if (recordsComplete) f.add("MISMATCH", "LEDGER_RECORD_REFERENCE");
+        continue;
+      }
+      recordedFor.set(r.sequence, (recordedFor.get(r.sequence) ?? 0) + 1);
+      if (
+        s.signature !== r.signature ||
+        (call !== undefined &&
+          (call.signature !== r.signature ||
+            call.epoch !== r.epoch ||
+            call.hostReceivedAtMs !== r.hostReceivedAtMs))
+      ) {
+        f.add("MISMATCH", "LEDGER_RECORD_REFERENCE");
+      }
+      // Both describe the terminal state, which never changes after the transition.
+      if (
+        s.disposition !== r.disposition ||
+        s.factKind !== r.factKind ||
+        s.factCode !== r.factCode
+      ) {
+        f.add("MISMATCH", "LEDGER_SETTLEMENT_STATE");
+      }
+      if (r.duplicateDetails.some((d) => d.occurrence <= (s.occurrence as number))) {
+        f.add("MISMATCH", "LEDGER_DUPLICATE_DETAIL");
+      }
+    } else if (s.status === "DUPLICATE") {
+      const r = recordAt(s.firstSequence);
+      if (r === undefined) {
+        if (recordsComplete) f.add("MISMATCH", "LEDGER_RECORD_REFERENCE");
+        continue;
+      }
+      duplicateFor.set(r.sequence, (duplicateFor.get(r.sequence) ?? 0) + 1);
+      if (
+        call !== undefined &&
+        (call.signature !== r.signature || (isInt(call.epoch) && call.epoch < r.epoch))
+      ) {
+        f.add("MISMATCH", "LEDGER_RECORD_REFERENCE");
+      }
+      const detail = r.duplicateDetails.find((d) => d.occurrence === s.occurrence);
+      if (detail !== undefined) {
+        matchedDetails.add(detail.occurrence);
+        if (
+          call !== undefined &&
+          (detail.epoch !== call.epoch || detail.hostReceivedAtMs !== call.hostReceivedAtMs)
+        ) {
+          f.add("MISMATCH", "LEDGER_DUPLICATE_DETAIL");
+        }
+      } else {
+        // The first details are retained: an earlier occurrence missing from them is not dropped.
+        const last = r.duplicateDetails[r.duplicateDetails.length - 1]?.occurrence ?? 0;
+        if (r.duplicateDetailsDropped === 0 || (s.occurrence as number) < last) {
+          f.add("MISMATCH", "LEDGER_DUPLICATE_DETAIL");
+        }
+      }
+    } else if (s.status === "CAPACITY_REFUSED") {
+      // Record capacity refuses a new signature only, once the record list is full; epoch
+      // capacity follows a refused openEpoch() with every retained epoch in use.
+      const contradicted =
+        s.code === "RECORD_CAPACITY"
+          ? (call !== undefined && perSignature.has(call.signature as string)) ||
+            (limits !== null && recordsComplete && records.length !== limits.maxSignatureRecords)
+          : (limits !== null && epochsUsable && epochs.length !== limits.maxEpochs) ||
+            (counters !== null && counters.openEpochRefused === 0);
+      if (contradicted) f.add("MISMATCH", "LEDGER_CAPACITY");
+    }
+  }
+  if (records.some((r) => (duplicateFor.get(r.sequence) ?? 0) > r.duplicateOccurrences)) {
+    f.add("MISMATCH", "LEDGER_CALL_TOTALS");
+  }
+  if ([...recordedFor.values()].some((n) => n > 1)) f.add("MISMATCH", "LEDGER_RECORD_REFERENCE");
+  if (settlementsComplete && recordsComplete) {
+    // Each record settled once as RECORDED; each retained duplicate detail as a DUPLICATE.
+    if (
+      records.some((r) => !recordedFor.has(r.sequence)) ||
+      [...detailOwner.keys()].some((o) => !matchedDetails.has(o))
+    ) {
+      f.add("MISMATCH", "LEDGER_RECORD_REFERENCE");
+    }
+  }
+
+  // Calls and settlements against the ledger's counts: never more than counted, and exactly as
+  // many when nothing was dropped, pending, in progress or unrecorded.
+  const callTotals = settlementsComplete && exact && epochsUsable && recordsComplete;
+  if (exact && epochsUsable && ledgerRecorded) {
+    const c = counters!;
+    const fits = (n: number, total: number, complete: boolean) =>
+      complete ? n === total : n <= total;
+    const n = (key: string, from: Map<unknown, number>) => from.get(key) ?? 0;
+    const attributedOnly = CPMM_INVALID_CODES.filter((k) => !UNATTRIBUTABLE_INVALID_CODES.has(k));
+    const attributable = CPMM_INVALID_CODES.filter((k) => UNATTRIBUTABLE_INVALID_CODES.has(k));
+    const epochInvalid = (codes: readonly string[]) => sum(epochs.map((e) => invalidOf(e, codes)));
+    const ok =
+      fits(callRecords.length, c.occurrences, callsComplete) &&
+      // Every record present counts, a malformed one too; unread records bound nothing.
+      (recordsIn === undefined ||
+        fits(
+          n("RECORDED", statusCount),
+          recordsIn.length,
+          settlementsComplete && recordsComplete,
+        )) &&
+      fits(
+        n("DUPLICATE", statusCount),
+        sum(epochs.map((e) => e.duplicates.sameEpoch + e.duplicates.crossEpoch)),
+        settlementsComplete,
+      ) &&
+      attributedOnly.every((k) => fits(n(k, codeCount), epochInvalid([k]), settlementsComplete)) &&
+      fits(
+        sum(attributable.map((k) => n(k, codeCount))),
+        epochInvalid(attributable) + c.unattributedOccurrences - c.epochCapacityRefused,
+        settlementsComplete,
+      ) &&
+      fits(n("RECORD_CAPACITY", codeCount), c.recordCapacityRefused, settlementsComplete) &&
+      fits(n("EPOCH_CAPACITY", codeCount), c.epochCapacityRefused, settlementsComplete);
+    if (!ok) f.add("MISMATCH", "LEDGER_CALL_TOTALS");
+  }
+
+  return ledgerResult(
+    f,
+    {
+      records: records.length,
+      epochs: epochs.length,
+      accountCalls: callRecords.length,
+      settlements: settlementRecords.length,
+      duplicateDetails: detailsSeen,
+      eventTotalsCorroborated: corroborated,
+    },
+    {
+      epochTotals,
+      callTotals,
+      duplicateDetails: recordsComplete && !anyTruncated,
+    },
+  );
 }

@@ -93,6 +93,7 @@ import {
   CPMM_EVIDENCE_VERIFIER_LIMITS,
   sealCpmmObservationEvidence,
   verifyCpmmObservationEvidence,
+  type CpmmLedgerStructuralCheck,
   type SealCpmmObservationInput,
 } from "./cpmm-pool-observation-evidence.js";
 
@@ -506,6 +507,7 @@ function env(
     /** A further fan-out observer, after the recorder (e.g. moving the clock at completion). */
     onExchange?: ((clock: { now: number }) => void) | undefined;
   } = {},
+  ledgerLimits: typeof LEDGER_LIMITS = LEDGER_LIMITS,
 ) {
   const state = { now: OBS_START };
   let nextTimer = 0;
@@ -567,7 +569,7 @@ function env(
       trackingStartedMs: OBS_START,
       clock: () => TRACKER_NOW,
     }),
-    limits: LEDGER_LIMITS,
+    limits: ledgerLimits,
   });
   const collector = new CpmmPoolNotificationCollector({
     binding: adapter.getBinding(),
@@ -655,13 +657,20 @@ async function genuineRun(
     /** The second notification carries this signature (default: the first one's, a duplicate). */
     secondSignature?: number;
     onExchange?: (clock: { now: number }) => void;
+    ledgerLimits?: typeof LEDGER_LIMITS;
+    /** How many times the second notification is delivered (default 1). */
+    secondDeliveries?: number;
+    /** Runs once the second notification and the ping have been handled. */
+    afterSecond?: () => void;
   } = {},
 ) {
-  const e = env(o.limits, o.collectorLimits, {
-    closeMode: o.closeMode,
-    wrapTransport: o.wrapTransport,
-    onExchange: o.onExchange,
-  });
+  const ledgerLimits = o.ledgerLimits ?? LEDGER_LIMITS;
+  const e = env(
+    o.limits,
+    o.collectorLimits,
+    { closeMode: o.closeMode, wrapTransport: o.wrapTransport, onExchange: o.onExchange },
+    ledgerLimits,
+  );
   const p = e.owner.run();
   e.c.open();
   await e.to(OBS_START + 10);
@@ -673,9 +682,12 @@ async function genuineRun(
   await flush();
   await e.to(RECEIVED_AT + 3_000);
   if (o.secondSignature !== undefined) e.script.push(okTx(o.secondSignature));
-  e.c.message(notif(o.secondSignature ?? 1, o.logs));
+  for (let i = 0; i < (o.secondDeliveries ?? 1); i++) {
+    e.c.message(notif(o.secondSignature ?? 1, o.logs));
+  }
   e.c.emit("ping", o.pingPayload ?? Buffer.from([9, 9]));
   await flush();
+  o.afterSecond?.();
   await e.to(NOMINAL_END);
   if (!o.noUnsubscribeAck) e.c.message(unsubAck());
   await flush();
@@ -694,6 +706,7 @@ async function genuineRun(
     report,
     recorderLimits: e.recorderLimits,
     collectorLimits: { ...COLLECTOR_LIMITS, ...o.collectorLimits },
+    ledgerLimits,
   };
 }
 
@@ -789,17 +802,35 @@ const MATCHED_SWAP = {
   ],
 };
 
+/** A clean run's recorded ledger: structurally consistent, every exact cross-check covered. */
+const CONSISTENT_LEDGER = {
+  status: "STRUCTURALLY_CONSISTENT",
+  scope: "RECORDED_LEDGER_STRUCTURE_ONLY",
+  ledgerReplayed: false,
+  ingestionReplayed: false,
+  findings: [],
+  coverage: { epochTotals: true, callTotals: true, duplicateDetails: true },
+};
+
 /**
- * Pool context and collector reproduced; the transaction analysis as expected; ledger accounting
- * and owner/wrapper cross-checks explicitly not implemented; runtime accounting not reproduced.
+ * Pool context and collector reproduced; the transaction analysis and the ledger's structure as
+ * expected; owner/wrapper cross-checks explicitly not implemented; runtime accounting not
+ * reproduced. A structurally consistent ledger never lowers the implemented components' result.
  */
 function expectReproduced(
   v: ReturnType<typeof verifyCpmmObservationEvidence>,
   transactionAnalysis: { status: string } & Record<string, unknown> = UNCREDENTIALED,
+  ledger: { status: string } & Record<string, unknown> = CONSISTENT_LEDGER,
 ): void {
+  const rank = ["REPRODUCED", "LIMITED_BY_REDACTION", "MISSING_EVIDENCE", "MISMATCH"];
+  const ledgerRank = ledger.status === "STRUCTURALLY_CONSISTENT" ? "REPRODUCED" : ledger.status;
+  expectLedgerScope(v.rederivation.components!.ledger);
   expect(v.rederivation).toMatchObject({
     status: "PARTIAL",
-    implementedComponents: transactionAnalysis.status,
+    implementedComponents:
+      rank.indexOf(ledgerRank) > rank.indexOf(transactionAnalysis.status)
+        ? ledgerRank
+        : transactionAnalysis.status,
     components: {
       poolContext: { status: "REPRODUCED", findings: [] },
       collector: {
@@ -810,7 +841,7 @@ function expectReproduced(
         countersCompared: true,
       },
       transactionAnalysis,
-      ledger: { status: "NOT_IMPLEMENTED" },
+      ledger,
       ownerWrapperCrossChecks: { status: "NOT_IMPLEMENTED" },
       runtimeAccounting: { status: "RUNTIME_ACCOUNTING_NOT_REPRODUCED" },
     },
@@ -818,6 +849,16 @@ function expectReproduced(
   expect(v.poolContextProvenance).toBe("SUPPLIED_UNVERIFIED");
   expect(v.acquisitionProvenance).toBe("OPEN_G3");
   expect(v.flags).toEqual(CPMM_EVIDENCE_FALSE_FLAGS);
+}
+
+/** The ledger component's fixed scope: structural checks only, never a replay. */
+function expectLedgerScope(ledger: CpmmLedgerStructuralCheck): void {
+  expect(ledger).toMatchObject({
+    scope: "RECORDED_LEDGER_STRUCTURE_ONLY",
+    ledgerReplayed: false,
+    ingestionReplayed: false,
+  });
+  expect(ledger.status).not.toBe("REPRODUCED");
 }
 
 const outDirOf = (root: string, runId = "run-1") =>
@@ -1607,6 +1648,8 @@ describe("CPMM observation evidence: verification", () => {
       "../candidate-scanner/CpmmPoolObservationRecorder.js",
       "../candidate-scanner/CpmmPoolNotificationCollector.js",
       "../candidate-scanner/RaydiumCpmmPoolStateAdapter.js",
+      // The accepted ledger's exported invalid codes and types only (no ledger is constructed).
+      "../candidate-scanner/CpmmResolutionAccountingLedger.js",
       "../candidate-scanner/ExactPoolHistoryEnumerator.js",
       "../candidate-scanner/RaydiumCpmmTransactionSourceAdapter.js",
       "./evidence-credential-sanitizer.js",
@@ -3220,13 +3263,14 @@ describe("Transaction analysis and binding (items C and G, partial)", () => {
     expect(v.rederivation.components!.runtimeAccounting).toEqual({
       status: "RUNTIME_ACCOUNTING_NOT_REPRODUCED",
     });
-    expect(v.rederivation.components!.ledger).toEqual({ status: "NOT_IMPLEMENTED" });
+    const ledger = v.rederivation.components!.ledger;
+    expectLedgerScope(ledger);
     expect(v.rederivation.components!.ownerWrapperCrossChecks).toEqual({
       status: "NOT_IMPLEMENTED",
     });
     // Credentials are used, never kept: nothing in the result carries one.
     expect(JSON.stringify(v).includes(SECRET)).toBe(false);
-    return { v, tx: v.rederivation.components!.transactionAnalysis };
+    return { v, tx: v.rederivation.components!.transactionAnalysis, ledger };
   };
   const exchangeFile = (dir: string, i = 0) =>
     (readJson(dir, CPMM_EVIDENCE_FILES.exchangeIndex).exchanges as { path: string }[])[i]!.path;
@@ -4118,21 +4162,30 @@ describe("Transaction analysis and binding (items C and G, partial)", () => {
       "DUPLICATE",
     ]);
     expect(txOf(dir).tx).toMatchObject(MATCHED_SWAP);
-    // A call still in progress, or a settlement still pending, is missing, not contradicted.
+    // A call still in progress (so not yet settled), or a settlement still pending, is missing,
+    // not contradicted.
     const inProgress = copyOf(dir);
     reseal(inProgress, LEDGER, (l) =>
       Object.assign(firstCallOf(l), { outcome: "IN_PROGRESS", endOrdinal: null }),
+    );
+    editCalls(inProgress, (c) =>
+      c.splice(
+        c.findIndex((x) => x.kind === "ACCOUNT_SETTLEMENT" && x.status === "RECORDED"),
+        1,
+      ),
     );
     reseal(
       inProgress,
       REC,
       (r) => ((r.pending as Record<string, unknown>).accountCallsInProgress = 1),
     );
-    expect(txOf(inProgress).tx).toMatchObject({
+    const inProgressV = txOf(inProgress);
+    expect(inProgressV.tx).toMatchObject({
       status: "MISSING_EVIDENCE",
       findings: ["MISSING_EVIDENCE:ACCOUNT_CALL_IN_PROGRESS"],
       exchanges: [{ comparison: "MATCHED" }],
     });
+    expect(inProgressV.ledger.findings).toEqual(["MISSING_EVIDENCE:ACCOUNT_CALL_IN_PROGRESS"]);
     const pendingSettlement = copyOf(dir);
     editCalls(pendingSettlement, (c) =>
       c.splice(
@@ -4145,10 +4198,1036 @@ describe("Transaction analysis and binding (items C and G, partial)", () => {
       REC,
       (r) => ((r.pending as Record<string, unknown>).accountSettlementsPending = 1),
     );
-    expect(txOf(pendingSettlement).tx).toMatchObject({
+    const pendingV = txOf(pendingSettlement);
+    expect(pendingV.tx).toMatchObject({
       status: "MISSING_EVIDENCE",
       findings: ["MISSING_EVIDENCE:ACCOUNT_SETTLEMENT_UNAVAILABLE"],
       exchanges: [{ comparison: "MATCHED" }],
+    });
+    expect(pendingV.ledger.findings).toEqual(["MISSING_EVIDENCE:LEDGER_SETTLEMENTS_PENDING"]);
+  });
+});
+
+describe("Ledger structure (item G, partial): recorded ledger cross-checks", () => {
+  type Run = Awaited<ReturnType<typeof genuineRun>>;
+  type Row = Record<string, unknown>;
+  type RecordRow = Row & { duplicateDetails: Row[]; ingestion: Row };
+  type EpochRow = Row & { duplicates: Record<string, number>; invalid: Record<string, number> };
+  const LEDGER = CPMM_EVIDENCE_FILES.ledger;
+  const REC = CPMM_EVIDENCE_FILES.recording;
+  const PLAN = CPMM_EVIDENCE_FILES.plan;
+  const MEMO = "MemoSq4gqABAXKb96qnH8TysNcWxMyWCqXgDLGmfcHr";
+  const ZERO = {
+    status: "NOT_CALLED",
+    total: 0,
+    accepted: 0,
+    rejected: 0,
+    unattempted: 0,
+    indeterminate: 0,
+  };
+
+  /** Seals a run with the plan stating the ledger limits it ran with (or `planLimits`). */
+  const sealRun = (run: Run, planLimits: typeof LEDGER_LIMITS = run.ledgerLimits) => {
+    const p = plan(run.recorderLimits, run.collectorLimits);
+    const r = sealCpmmObservationEvidence(
+      sealInput(
+        run.snapshot,
+        run.recorder,
+        { plan: { ...p, limits: { ...p.limits, ledger: { ...planLimits } } } },
+        run.recorderLimits,
+        run.collectorLimits,
+      ),
+    );
+    if (!r.ok) throw new Error(`seal failed: ${r.code}`);
+    return r.outDir;
+  };
+  /** Integrity holds and the fixed scope is kept; returns the ledger component. */
+  const ledgerOf = (dir: string, credentialed = true) => {
+    const v = credentialed
+      ? verifyCpmmObservationEvidence(dir, ANALYSIS)
+      : verifyCpmmObservationEvidence(dir);
+    expect(v.integrity, "integrity").toEqual({ ok: true, problems: [] });
+    expect(v.flags).toEqual(CPMM_EVIDENCE_FALSE_FLAGS);
+    expect(v.poolContextProvenance).toBe("SUPPLIED_UNVERIFIED");
+    expect(v.rederivation.components!.runtimeAccounting).toEqual({
+      status: "RUNTIME_ACCOUNTING_NOT_REPRODUCED",
+    });
+    expect(v.rederivation.components!.ownerWrapperCrossChecks).toEqual({
+      status: "NOT_IMPLEMENTED",
+    });
+    const ledger = v.rederivation.components!.ledger;
+    expectLedgerScope(ledger);
+    return { v, ledger };
+  };
+  const recs = (l: Row) => get(l, "records", "value") as RecordRow[];
+  const epochsOf = (l: Row) => get(l, "epochs", "value") as EpochRow[];
+  const countersOf = (l: Row) => get(l, "counters", "value") as Row;
+  const callsOf = (l: Row) => l.calls as Row[];
+  const callOf = (l: Row, call: number) =>
+    callsOf(l).find((c) => c.kind === "ACCOUNT_CALL" && c.call === call)!;
+  const settlementOf = (l: Row, call: number) =>
+    callsOf(l).find((c) => c.kind === "ACCOUNT_SETTLEMENT" && c.call === call)!;
+  /** A rewritten copy: digests, report and manifest re-sealed, ledger-call counts kept true. */
+  const rewrite = (dir: string, mutate: (l: Row) => void) => {
+    const d = copyOf(dir);
+    let delta = 0;
+    reseal(d, LEDGER, (l) => {
+      const before = callsOf(l).length;
+      mutate(l);
+      delta = callsOf(l).length - before;
+    });
+    if (delta !== 0) {
+      reseal(d, REC, (r) => {
+        const stats = get(r, "retention", "ledgerCalls") as Record<string, number>;
+        stats.observed! += delta;
+        stats.retained! += delta;
+      });
+    }
+    return d;
+  };
+  /** The terminal disposition, written alike in the record, its settlement and later details. */
+  const setDisposition = (l: Row, disposition: string) => {
+    const r = recs(l)[0]!;
+    r.disposition = disposition;
+    settlementOf(l, 1).disposition = disposition;
+    for (const d of r.duplicateDetails) {
+      if (d.firstDispositionAtReceipt !== "PENDING") d.firstDispositionAtReceipt = disposition;
+    }
+  };
+  const contradicted = (dir: string, label: string, findings: string[], credentialed = true) => {
+    const { ledger, v } = ledgerOf(dir, credentialed);
+    expect(ledger.findings, label).toEqual(findings);
+    expect(ledger.status, label).toBe("MISMATCH");
+    expect(v.rederivation.implementedComponents, label).toBe("MISMATCH");
+  };
+  const consistent = (dir: string, label: string, credentialed = true) => {
+    const { ledger } = ledgerOf(dir, credentialed);
+    expect(ledger, label).toMatchObject(CONSISTENT_LEDGER);
+    return ledger;
+  };
+
+  it("L1: matching records, several signatures and a duplicate received while the first occurrence was pending are structurally consistent", async () => {
+    const { dir } = await shared;
+    const clean = ledgerOf(dir);
+    expect(clean.ledger).toEqual({
+      ...CONSISTENT_LEDGER,
+      checked: {
+        records: 1,
+        epochs: 1,
+        accountCalls: 2,
+        settlements: 2,
+        duplicateDetails: 1,
+        eventTotalsCorroborated: 1,
+      },
+    });
+    expect(clean.v.rederivation.implementedComponents).toBe("REPRODUCED");
+    // Without analysis credentials the structure is the same; no total is corroborated.
+    expect(ledgerOf(dir, false).ledger).toMatchObject({
+      ...CONSISTENT_LEDGER,
+      checked: { eventTotalsCorroborated: 0 },
+    });
+
+    // Two signatures: two first occurrences, each settled once, each total corroborated.
+    const two = sealRun(await genuineRun({ secondSignature: 2 }));
+    expect(
+      recs(readJson(two, LEDGER)).map((r) => [r.sequence, r.signature, r.disposition]),
+    ).toEqual([
+      [1, signatureOf(1), "INGESTED"],
+      [2, signatureOf(2), "INGESTED"],
+    ]);
+    expect(ledgerOf(two).ledger).toEqual({
+      ...CONSISTENT_LEDGER,
+      checked: {
+        records: 2,
+        epochs: 1,
+        accountCalls: 2,
+        settlements: 2,
+        duplicateDetails: 0,
+        eventTotalsCorroborated: 2,
+      },
+    });
+
+    // The first response held until the duplicate was accounted: the duplicate saw PENDING and
+    // the record is INGESTED now. That history is not compared blindly with the final state.
+    let release!: () => void;
+    const held = new Promise<void>((r) => (release = r));
+    const pending = sealRun(
+      await genuineRun({
+        responder: async (req) => {
+          await held;
+          return okTx(1)(req);
+        },
+        afterSecond: () => release(),
+      }),
+    );
+    const record = recs(readJson(pending, LEDGER))[0]!;
+    expect(record.disposition).toBe("INGESTED");
+    expect(record.duplicateDetails).toEqual([
+      expect.objectContaining({
+        occurrence: 2,
+        agreement: "AGREES",
+        firstDispositionAtReceipt: "PENDING",
+      }),
+    ]);
+    expect(ledgerOf(pending).ledger).toEqual({
+      ...CONSISTENT_LEDGER,
+      checked: {
+        records: 1,
+        epochs: 1,
+        accountCalls: 2,
+        settlements: 2,
+        duplicateDetails: 1,
+        eventTotalsCorroborated: 1,
+      },
+    });
+    // The history is still checked: a receipt-time disposition the record never had contradicts
+    // the single PENDING-to-terminal transition. PENDING at receipt is always possible.
+    contradicted(
+      rewrite(pending, (l) => {
+        recs(l)[0]!.duplicateDetails[0]!.firstDispositionAtReceipt = "UNRESOLVED";
+      }),
+      "never had",
+      ["MISMATCH:LEDGER_DUPLICATE_TIMING"],
+    );
+    consistent(
+      rewrite(dir, (l) => {
+        recs(l)[0]!.duplicateDetails[0]!.firstDispositionAtReceipt = "PENDING";
+      }),
+      "pending at receipt",
+    );
+  });
+
+  it("L2: policy-pending and unresolved outcomes keep the accepted classification; another mapping is a contradiction", async () => {
+    const respond =
+      (result: (sig: string) => unknown): Responder =>
+      async ({ id }) =>
+        new Response(JSON.stringify({ jsonrpc: "2.0", id, result: result(signatureOf(1)) }), {
+          status: 200,
+        });
+    const failed = (sig: string) => {
+      const t = txResult(sig) as { meta: Record<string, unknown> };
+      t.meta.err = { InstructionError: [0, { Custom: 6005 }] };
+      return t;
+    };
+    const memo = (): Ix => ({ program: MEMO, accounts: [], data: Uint8Array.from([1]) });
+    const runs = new Map<string, string>();
+    const cases: [string, Parameters<typeof genuineRun>[0], Row][] = [
+      [
+        "no target",
+        { responder: respond((sig) => txResult(sig, [memo()])) },
+        {
+          disposition: "POLICY_PENDING",
+          blockingClass: null,
+          policyPending: "NO_TARGET_SWAP_POLICY_UNREVIEWED",
+          factKind: "RESOLVED_NO_TARGET_SWAP",
+        },
+      ],
+      [
+        "failed",
+        { responder: respond(failed) },
+        {
+          disposition: "POLICY_PENDING",
+          blockingClass: null,
+          policyPending: "FAILED_TRANSACTION_POLICY_UNREVIEWED",
+          factKind: "RECORDED_FAILED_TRANSACTION",
+        },
+      ],
+      [
+        "not found",
+        { responder: respond(() => null) },
+        {
+          disposition: "UNRESOLVED",
+          blockingClass: "TRANSACTION_UNAVAILABLE",
+          policyPending: null,
+          factKind: "TRANSACTION_NOT_FOUND",
+        },
+      ],
+      [
+        "late",
+        { onExchange: (clock) => (clock.now = OBS_START + 600_000) },
+        { disposition: "UNRESOLVED", policyPending: null, factKind: "LATE_RESPONSE" },
+      ],
+      [
+        "oversized",
+        { responder: async () => new Response("x".repeat(200_001), { status: 200 }) },
+        {
+          disposition: "UNRESOLVED",
+          blockingClass: "TRANSACTION_UNAVAILABLE",
+          policyPending: null,
+          factKind: "TRANSPORT_FAILED",
+        },
+      ],
+    ];
+    for (const [label, options, expected] of cases) {
+      const d = sealRun(await genuineRun(options));
+      expect(recs(readJson(d, LEDGER))[0], label).toMatchObject({ ...expected, ingestion: ZERO });
+      expect(consistent(d, label).checked.eventTotalsCorroborated, label).toBe(0);
+      runs.set(label, d);
+    }
+
+    // The other policy for the same fact; a failed transaction classed as unavailable; a
+    // no-target swap counted as ingested; another fact's blocking class.
+    contradicted(
+      rewrite(runs.get("no target")!, (l) => {
+        recs(l)[0]!.policyPending = "FAILED_TRANSACTION_POLICY_UNREVIEWED";
+      }),
+      "other policy",
+      ["MISMATCH:LEDGER_CLASSIFICATION"],
+    );
+    contradicted(
+      rewrite(runs.get("failed")!, (l) => {
+        setDisposition(l, "UNRESOLVED");
+        Object.assign(recs(l)[0]!, {
+          blockingClass: "TRANSACTION_UNAVAILABLE",
+          policyPending: null,
+          verifiedSlot: null,
+        });
+      }),
+      "failed as unavailable",
+      ["MISMATCH:LEDGER_CLASSIFICATION"],
+    );
+    contradicted(
+      rewrite(runs.get("no target")!, (l) => {
+        setDisposition(l, "INGESTED");
+        Object.assign(recs(l)[0]!, {
+          policyPending: null,
+          verifiedBlockTimeSec: BLOCK_TIME,
+          ingestion: { ...ZERO, status: "COMPLETE", total: 1, accepted: 1 },
+        });
+      }),
+      "no target ingested",
+      ["MISMATCH:LEDGER_CLASSIFICATION", "MISMATCH:LEDGER_INGESTION_ACCOUNTING"],
+    );
+    contradicted(
+      rewrite(runs.get("not found")!, (l) => {
+        recs(l)[0]!.blockingClass = "RESPONSE_CONTRADICTED";
+      }),
+      "other class",
+      ["MISMATCH:LEDGER_CLASSIFICATION"],
+    );
+    // A positioned outcome is verified from its notification, which carried no block time.
+    contradicted(
+      rewrite(runs.get("failed")!, (l) => {
+        recs(l)[0]!.verifiedBlockTimeSec = BLOCK_TIME;
+      }),
+      "verified time",
+      ["MISMATCH:LEDGER_VERIFIED_METADATA"],
+    );
+  });
+
+  it("L3: ingestion accounting follows the ledger's rules, indeterminate counts included; decoded counts corroborate totals only", async () => {
+    const { dir } = await shared;
+    const ingestion = (
+      disposition: string,
+      blockingClass: string | null,
+      counts: Row,
+      verified = true,
+    ) =>
+      rewrite(dir, (l) => {
+        setDisposition(l, disposition);
+        Object.assign(recs(l)[0]!, {
+          blockingClass,
+          ingestion: { ...ZERO, status: "COMPLETE", total: 1, accepted: 1, ...counts },
+          ...(verified ? {} : { verifiedSlot: null, verifiedBlockTimeSec: null }),
+        });
+      });
+    // Incomplete ingestion the ledger can record: each consistent, each total corroborated.
+    const incomplete: [string, string, Row, boolean][] = [
+      ["rejected", "INGEST_REJECTED", { status: "NONE_ACCEPTED", accepted: 0, rejected: 1 }, true],
+      [
+        "stopped",
+        "INGEST_STOPPED",
+        { status: "REFUSED_BEFORE_START", accepted: 0, unattempted: 1 },
+        true,
+      ],
+      [
+        "not ingestible",
+        "NOT_INGESTIBLE",
+        { status: "NOT_CALLED", accepted: 0, unattempted: 1 },
+        true,
+      ],
+      [
+        "unrecognized",
+        "UNRECOGNIZED_OUTCOME",
+        { status: "EXCEPTION", accepted: 0, indeterminate: 1 },
+        true,
+      ],
+      [
+        "exception",
+        "ACCOUNTING_EXCEPTION",
+        { status: "EXCEPTION", accepted: 0, indeterminate: 1 },
+        false,
+      ],
+    ];
+    for (const [label, cls, counts, verified] of incomplete) {
+      const d = ingestion("INGESTION_INCOMPLETE", cls, counts, verified);
+      expect(consistent(d, label).checked.eventTotalsCorroborated, label).toBe(1);
+    }
+
+    const cases: [string, string, string | null, Row, boolean, string[]][] = [
+      ["sum", "INGESTED", null, { rejected: 1 }, true, ["MISMATCH:LEDGER_INGESTION_ACCOUNTING"]],
+      [
+        "ingested short",
+        "INGESTED",
+        null,
+        { accepted: 0, unattempted: 1 },
+        true,
+        ["MISMATCH:LEDGER_INGESTION_ACCOUNTING"],
+      ],
+      [
+        "indeterminate without exception",
+        "INGESTION_INCOMPLETE",
+        "INGEST_STOPPED",
+        { status: "PARTIAL", accepted: 0, indeterminate: 1 },
+        true,
+        ["MISMATCH:LEDGER_INGESTION_ACCOUNTING"],
+      ],
+      [
+        "exception with counts",
+        "INGESTION_INCOMPLETE",
+        "ACCOUNTING_EXCEPTION",
+        { status: "EXCEPTION" },
+        false,
+        ["MISMATCH:LEDGER_INGESTION_ACCOUNTING"],
+      ],
+      [
+        "rejected yet complete",
+        "INGESTION_INCOMPLETE",
+        "INGEST_REJECTED",
+        {},
+        true,
+        ["MISMATCH:LEDGER_INGESTION_ACCOUNTING"],
+      ],
+      [
+        "incomplete unverified",
+        "INGESTION_INCOMPLETE",
+        "INGEST_REJECTED",
+        { status: "NONE_ACCEPTED", accepted: 0, rejected: 1 },
+        false,
+        ["MISMATCH:LEDGER_VERIFIED_METADATA"],
+      ],
+      [
+        "incomplete class on unresolved",
+        "UNRESOLVED",
+        "INGEST_REJECTED",
+        { status: "NONE_ACCEPTED", accepted: 0, rejected: 1 },
+        false,
+        ["MISMATCH:LEDGER_CLASSIFICATION", "MISMATCH:LEDGER_INGESTION_ACCOUNTING"],
+      ],
+      [
+        "swap fact classed unavailable",
+        "UNRESOLVED",
+        "TRANSACTION_UNAVAILABLE",
+        { status: "NOT_CALLED", total: 0, accepted: 0 },
+        false,
+        ["MISMATCH:LEDGER_CLASSIFICATION"],
+      ],
+    ];
+    for (const [label, disposition, cls, counts, verified, findings] of cases) {
+      contradicted(ingestion(disposition, cls, counts, verified), label, findings);
+    }
+
+    // A recorded total the decoded response contradicts; without a decoded count nothing can
+    // contradict it, and the decoded count never proves what the tracker accepted.
+    const twoEvents = ingestion("INGESTED", null, { total: 2, accepted: 2 });
+    contradicted(twoEvents, "event total", ["MISMATCH:LEDGER_EVENT_TOTAL"]);
+    expect(consistent(twoEvents, "uncredentialed", false).checked.eventTotalsCorroborated).toBe(0);
+  });
+
+  it("L4: pending settlements and records, dropped and unrecorded calls are missing evidence; a missing settlement with nothing pending is not", async () => {
+    const { dir } = await shared;
+    // Ledger-call records the recorder genuinely dropped (the last settlement, then all).
+    for (const max of [3, 0]) {
+      const d = sealRun(await genuineRun({ limits: { maxLedgerCallRecords: max } }));
+      expect(get(readJson(d, REC), "retention", "ledgerCalls", "dropped")).toBe(4 - max);
+      expect(ledgerOf(d).ledger, String(max)).toMatchObject({
+        status: "MISSING_EVIDENCE",
+        findings: ["MISSING_EVIDENCE:LEDGER_CALLS_DROPPED"],
+        coverage: { epochTotals: true, callTotals: false, duplicateDetails: true },
+      });
+    }
+    // A first occurrence still PENDING at finish, its settlement not yet observed (the duplicate
+    // saw it PENDING).
+    const pendingRecord = (keepSettlement: boolean) =>
+      rewrite(dir, (l) => {
+        const r = recs(l)[0]!;
+        Object.assign(r, {
+          disposition: "PENDING",
+          verifiedSlot: null,
+          verifiedBlockTimeSec: null,
+          factKind: null,
+          factCode: null,
+          ingestion: { ...ZERO },
+        });
+        r.duplicateDetails[0]!.firstDispositionAtReceipt = "PENDING";
+        if (!keepSettlement) {
+          l.calls = callsOf(l).filter((c) => !(c.kind === "ACCOUNT_SETTLEMENT" && c.call === 1));
+        }
+      });
+    const pending = pendingRecord(false);
+    reseal(pending, REC, (r) => ((r.pending as Row).accountSettlementsPending = 1));
+    expect(ledgerOf(pending).ledger).toMatchObject({
+      status: "MISSING_EVIDENCE",
+      findings: [
+        "MISSING_EVIDENCE:LEDGER_RECORD_PENDING",
+        "MISSING_EVIDENCE:LEDGER_SETTLEMENTS_PENDING",
+      ],
+      coverage: { epochTotals: true, callTotals: false },
+    });
+    // A settlement reporting a terminal state the record never reached.
+    contradicted(pendingRecord(true), "settled yet pending", [
+      "MISSING_EVIDENCE:LEDGER_RECORD_PENDING",
+      "MISMATCH:LEDGER_SETTLEMENT_STATE",
+    ]);
+    // A settlement missing while nothing was pending, dropped or in progress.
+    contradicted(
+      rewrite(dir, (l) => {
+        l.calls = callsOf(l).filter((c) => !(c.kind === "ACCOUNT_SETTLEMENT" && c.call === 1));
+      }),
+      "settlement missing",
+      ["MISMATCH:LEDGER_RECORD_REFERENCE", "MISMATCH:LEDGER_CALL_TOTALS"],
+    );
+    // A ledger whose calls were never recorded: every call check is out of scope.
+    const unrecorded = rewrite(dir, (l) => (l.calls = []));
+    reseal(unrecorded, REC, (r) => (r.ledgerRecorded = false));
+    expect(ledgerOf(unrecorded).ledger).toMatchObject({
+      status: "MISSING_EVIDENCE",
+      findings: ["MISSING_EVIDENCE:LEDGER_CALLS_NOT_RECORDED"],
+      coverage: { epochTotals: true, callTotals: false, duplicateDetails: true },
+    });
+  });
+
+  it("L5: invalid and capacity outcomes are accounted in their status-specific shapes and totals", async () => {
+    const { dir } = await shared;
+    // Genuine record capacity: the second signature is refused before any request.
+    const capRun = await genuineRun({
+      secondSignature: 2,
+      ledgerLimits: { ...LEDGER_LIMITS, maxSignatureRecords: 1 },
+    });
+    const cap = sealRun(capRun);
+    const capL = readJson(cap, LEDGER);
+    expect(settlementOf(capL, 2)).toMatchObject({
+      status: "CAPACITY_REFUSED",
+      code: "RECORD_CAPACITY",
+      occurrence: 2,
+    });
+    expect(countersOf(capL)).toMatchObject({ recordCapacityRefused: 1 });
+    expect(epochsOf(capL)[0]).toMatchObject({ occurrences: 2, capacityRefused: 1 });
+    expect(ledgerOf(cap).ledger).toMatchObject({
+      ...CONSISTENT_LEDGER,
+      checked: { records: 1, accountCalls: 2, settlements: 2 },
+    });
+    // The plan's stated capacity disagrees; the refused signature is the recorded one; the
+    // refusal is counted as a first occurrence instead.
+    contradicted(sealRun(capRun, { ...LEDGER_LIMITS, maxSignatureRecords: 2 }), "plan limit", [
+      "MISMATCH:LEDGER_CAPACITY",
+    ]);
+    contradicted(
+      sealRun(await genuineRun({ secondSignature: 2 }), {
+        ...LEDGER_LIMITS,
+        maxSignatureRecords: 1,
+      }),
+      "records beyond the plan's limit",
+      ["MISMATCH:LEDGER_LIMIT_EXCEEDED"],
+    );
+    contradicted(
+      rewrite(cap, (l) => (callOf(l, 2).signature = signatureOf(1))),
+      "known signature",
+      ["MISMATCH:LEDGER_CAPACITY"],
+    );
+    contradicted(
+      rewrite(cap, (l) =>
+        Object.assign(epochsOf(l)[0]!, { capacityRefused: 0, firstOccurrences: 2 }),
+      ),
+      "counted as first",
+      ["MISMATCH:LEDGER_COUNTER_TOTALS", "MISMATCH:LEDGER_EPOCH_TOTALS"],
+    );
+
+    // The clean run's duplicate re-expressed consistently as an INVALID occurrence, attributed
+    // to the epoch or not.
+    const toInvalid = (code: string, attributedTo: string | null, extra?: (l: Row) => void) =>
+      rewrite(dir, (l) => {
+        Object.assign(recs(l)[0]!, {
+          duplicateOccurrences: 0,
+          duplicateDetails: [],
+          duplicateDetailsDropped: 0,
+        });
+        const e = epochsOf(l)[0]!;
+        e.duplicates.sameEpoch = 0;
+        if (attributedTo !== null) e.invalid[attributedTo] = 1;
+        else {
+          e.occurrences = 1;
+          countersOf(l).unattributedOccurrences = 1;
+        }
+        Object.assign(settlementOf(l, 2), { status: "INVALID", firstSequence: null, code });
+        extra?.(l);
+      });
+    consistent(toInvalid("RECEIPT_TIME_DISAGREEMENT", "RECEIPT_TIME_DISAGREEMENT"), "attributed");
+    consistent(toInvalid("ENVELOPE_INVALID", null), "unattributed");
+    contradicted(toInvalid("RECEIPT_TIME_DISAGREEMENT", "GATE_INVALID"), "other code", [
+      "MISMATCH:LEDGER_CALL_TOTALS",
+    ]);
+    // A code that always has an epoch, counted as unattributed.
+    contradicted(toInvalid("RECEIPT_TIME_DISAGREEMENT", null), "never unattributed", [
+      "MISMATCH:LEDGER_CALL_TOTALS",
+    ]);
+    contradicted(
+      toInvalid("GATE_INVALID", "GATE_INVALID", (l) => (settlementOf(l, 2).firstSequence = 1)),
+      "duplicate's field",
+      ["MISMATCH:ACCOUNT_SETTLEMENT_MALFORMED", "MISMATCH:LEDGER_CALL_TOTALS"],
+    );
+    // An envelope refusal never has an epoch; an occurrence counted both ways.
+    contradicted(toInvalid("ENVELOPE_INVALID", "ENVELOPE_INVALID"), "envelope attributed", [
+      "MISMATCH:LEDGER_EPOCH_TOTALS",
+    ]);
+    contradicted(
+      toInvalid("STALE_EPOCH", "STALE_EPOCH", (l) => (countersOf(l).unattributedOccurrences = 1)),
+      "counted twice",
+      ["MISMATCH:LEDGER_COUNTER_TOTALS", "MISMATCH:LEDGER_CALL_TOTALS"],
+    );
+    consistent(toInvalid("STALE_EPOCH", null), "stale, unattributed");
+    contradicted(toInvalid("OTHER_CODE", "GATE_INVALID"), "unknown code", [
+      "MISMATCH:ACCOUNT_SETTLEMENT_MALFORMED",
+      "MISMATCH:LEDGER_CALL_TOTALS",
+    ]);
+
+    // Epoch capacity: unattributed, after a refused openEpoch() with every epoch in use.
+    const epochCapacity = (openEpochRefused: number, planEpochs: number) => {
+      const d = rewrite(dir, (l) => {
+        Object.assign(recs(l)[0]!, {
+          duplicateOccurrences: 0,
+          duplicateDetails: [],
+          duplicateDetailsDropped: 0,
+        });
+        Object.assign(epochsOf(l)[0]!, { occurrences: 1, state: "CLOSED" });
+        epochsOf(l)[0]!.duplicates.sameEpoch = 0;
+        Object.assign(countersOf(l), {
+          unattributedOccurrences: 1,
+          epochCapacityRefused: 1,
+          openEpochRefused,
+        });
+        Object.assign(settlementOf(l, 2), {
+          status: "CAPACITY_REFUSED",
+          firstSequence: null,
+          code: "EPOCH_CAPACITY",
+        });
+        callOf(l, 2).epoch = 2;
+      });
+      reseal(d, PLAN, (p) =>
+        Object.assign(get(p, "plan", "limits", "ledger") as Row, { maxEpochs: planEpochs }),
+      );
+      return d;
+    };
+    consistent(epochCapacity(1, 1), "epoch capacity");
+    contradicted(epochCapacity(0, 1), "no refused opening", [
+      "MISMATCH:LEDGER_COUNTER_TOTALS",
+      "MISMATCH:LEDGER_CAPACITY",
+    ]);
+    contradicted(epochCapacity(1, 4), "epochs to spare", ["MISMATCH:LEDGER_CAPACITY"]);
+  });
+
+  it("L6: per-epoch and ledger-wide totals agree across epochs; order, state, receipt and counts are checked", async () => {
+    const { dir } = await shared;
+    // The clean run's duplicate received in a later epoch (a cross-epoch reference).
+    const crossEpoch = (extra?: (l: Row) => void) =>
+      rewrite(dir, (l) => {
+        const e1 = epochsOf(l)[0]!;
+        Object.assign(e1, { state: "CLOSED", occurrences: 1 });
+        e1.duplicates = { sameEpoch: 0, crossEpoch: 0 };
+        epochsOf(l).push({
+          ...(JSON.parse(JSON.stringify(e1)) as EpochRow),
+          epoch: 2,
+          observationStartMs: RECEIVED_AT + 1_000,
+          state: "OPEN",
+          occurrences: 1,
+          firstOccurrences: 0,
+          duplicates: { sameEpoch: 0, crossEpoch: 1 },
+        });
+        recs(l)[0]!.duplicateDetails[0]!.epoch = 2;
+        callOf(l, 2).epoch = 2;
+        extra?.(l);
+      });
+    expect(consistent(crossEpoch(), "cross epoch").checked.epochs).toBe(2);
+    const cases: [string, (l: Row) => void, string[]][] = [
+      [
+        "counted as same-epoch",
+        (l) => (epochsOf(l)[1]!.duplicates = { sameEpoch: 1, crossEpoch: 0 }),
+        ["MISMATCH:LEDGER_EPOCH_TOTALS"],
+      ],
+      ["two open epochs", (l) => (epochsOf(l)[0]!.state = "OPEN"), ["MISMATCH:LEDGER_EPOCH_STATE"]],
+      [
+        "received before its epoch",
+        (l) => (epochsOf(l)[1]!.observationStartMs = RECEIVED_AT + 5_000),
+        ["MISMATCH:LEDGER_DUPLICATE_DETAIL"],
+      ],
+      [
+        "ledger-wide occurrences",
+        (l) => (countersOf(l).occurrences = 3),
+        ["MISMATCH:LEDGER_COUNTER_TOTALS", "MISMATCH:LEDGER_CALL_TOTALS"],
+      ],
+      [
+        "record in an epoch not yet open",
+        (l) => (recs(l)[0]!.epoch = 2),
+        [
+          "MISMATCH:LEDGER_RECORD_EPOCH",
+          "MISMATCH:LEDGER_EPOCH_TOTALS",
+          "MISMATCH:LEDGER_RECORD_REFERENCE",
+        ],
+      ],
+      [
+        "epochs out of order",
+        (l) => (l.epochs = { status: "READ", value: [...epochsOf(l)].reverse() }),
+        ["MISMATCH:LEDGER_EPOCH_ORDER", "MISMATCH:LEDGER_EPOCH_STATE"],
+      ],
+      [
+        "first occurrence counted in the later epoch",
+        (l) => {
+          Object.assign(epochsOf(l)[0]!, { firstOccurrences: 0, occurrences: 0 });
+          Object.assign(epochsOf(l)[1]!, { firstOccurrences: 1, occurrences: 2 });
+        },
+        ["MISMATCH:LEDGER_EPOCH_TOTALS"],
+      ],
+      [
+        "cross-epoch duplicate counted in a third epoch",
+        (l) => {
+          Object.assign(epochsOf(l)[1]!, { state: "CLOSED", occurrences: 0 });
+          epochsOf(l)[1]!.duplicates = { sameEpoch: 0, crossEpoch: 0 };
+          epochsOf(l).push({
+            ...(JSON.parse(JSON.stringify(epochsOf(l)[1]!)) as EpochRow),
+            epoch: 3,
+            observationStartMs: RECEIVED_AT + 2_000,
+            state: "OPEN",
+            occurrences: 1,
+            duplicates: { sameEpoch: 0, crossEpoch: 1 },
+          });
+        },
+        ["MISMATCH:LEDGER_EPOCH_TOTALS"],
+      ],
+    ];
+    for (const [label, mutate, findings] of cases) {
+      contradicted(crossEpoch(mutate), label, findings);
+    }
+    // More epochs than the plan allows.
+    const overLimit = crossEpoch();
+    reseal(overLimit, PLAN, (p) =>
+      Object.assign(get(p, "plan", "limits", "ledger") as Row, { maxEpochs: 1 }),
+    );
+    contradicted(overLimit, "epoch limit", ["MISMATCH:LEDGER_LIMIT_EXCEEDED"]);
+  });
+
+  it("L7: truncated duplicate details never prove an absence; known contradictions stay visible", async () => {
+    const { dir } = await shared;
+    // Genuine truncation: two duplicates, one detail retained.
+    const run = await genuineRun({
+      secondDeliveries: 2,
+      ledgerLimits: { ...LEDGER_LIMITS, maxDuplicateDetailsPerRecord: 1 },
+    });
+    const truncated = sealRun(run);
+    const record = recs(readJson(truncated, LEDGER))[0]!;
+    expect(record).toMatchObject({
+      duplicateOccurrences: 2,
+      duplicateDetailsDropped: 1,
+      metadataConflict: false,
+    });
+    expect(record.duplicateDetails.map((d) => d.occurrence)).toEqual([2]);
+    const missing = {
+      status: "MISSING_EVIDENCE",
+      findings: ["MISSING_EVIDENCE:LEDGER_DUPLICATE_DETAILS_TRUNCATED"],
+      coverage: { epochTotals: true, callTotals: true, duplicateDetails: false },
+    };
+    const tv = ledgerOf(truncated);
+    expect(tv.ledger).toMatchObject(missing);
+    expect(tv.v.retention.reasons).toContain("LEDGER_DUPLICATE_DETAILS_TRUNCATED");
+    // A conflict flag the retained details cannot show is not provable either way.
+    expect(
+      ledgerOf(rewrite(truncated, (l) => (recs(l)[0]!.metadataConflict = true))).ledger,
+    ).toMatchObject(missing);
+    // A conflict the retained details do show must be flagged, truncated or not.
+    const conflict = (l: Row) =>
+      Object.assign(recs(l)[0]!.duplicateDetails[0]!, {
+        notifiedSlot: SLOT + 1,
+        agreement: "SLOT_CONFLICT",
+      });
+    contradicted(rewrite(truncated, conflict), "unflagged visible conflict", [
+      "MISSING_EVIDENCE:LEDGER_DUPLICATE_DETAILS_TRUNCATED",
+      "MISMATCH:LEDGER_METADATA_CONFLICT",
+    ]);
+    // Dropped details hidden from the count; retention below the plan's stated limit.
+    contradicted(
+      rewrite(truncated, (l) => (recs(l)[0]!.duplicateDetailsDropped = 0)),
+      "hidden drop",
+      [
+        "MISMATCH:LEDGER_DUPLICATE_RETENTION",
+        // Claimed complete, the one retained detail no longer covers the epoch's count.
+        "MISMATCH:LEDGER_EPOCH_TOTALS",
+        "MISMATCH:LEDGER_DUPLICATE_DETAIL",
+      ],
+    );
+    contradicted(sealRun(run, LEDGER_LIMITS), "retained below limit", [
+      "MISMATCH:LEDGER_DUPLICATE_RETENTION",
+      "MISSING_EVIDENCE:LEDGER_DUPLICATE_DETAILS_TRUNCATED",
+    ]);
+
+    // Complete details decide the flag: a correctly flagged conflict is consistent; a flag with
+    // no conflict, or a conflict with no flag, is not.
+    consistent(
+      rewrite(dir, (l) => {
+        conflict(l);
+        recs(l)[0]!.metadataConflict = true;
+      }),
+      "flagged conflict",
+    );
+    contradicted(
+      rewrite(dir, (l) => (recs(l)[0]!.metadataConflict = true)),
+      "flag without conflict",
+      ["MISMATCH:LEDGER_METADATA_CONFLICT"],
+    );
+    contradicted(rewrite(dir, conflict), "conflict without flag", [
+      "MISMATCH:LEDGER_METADATA_CONFLICT",
+    ]);
+    // The agreement recorded at receipt is recomputed from the values known then.
+    contradicted(
+      rewrite(dir, (l) => (recs(l)[0]!.duplicateDetails[0]!.agreement = "SLOT_CONFLICT")),
+      "agreement",
+      ["MISMATCH:LEDGER_DUPLICATE_AGREEMENT"],
+    );
+  });
+
+  it("L8: altered counters, references and dispositions are contradictions; unavailable sections and saturation are not", async () => {
+    const { dir } = await shared;
+    // Semantic rewrites with digests, report and manifest kept consistent.
+    const cases: [string, (l: Row) => void, string[]][] = [
+      [
+        "epoch occurrences",
+        (l) => (epochsOf(l)[0]!.occurrences = 5),
+        ["MISMATCH:LEDGER_EPOCH_TOTALS", "MISMATCH:LEDGER_COUNTER_TOTALS"],
+      ],
+      [
+        "ledger-wide occurrences",
+        (l) => (countersOf(l).occurrences = 7),
+        ["MISMATCH:LEDGER_COUNTER_TOTALS", "MISMATCH:LEDGER_CALL_TOTALS"],
+      ],
+      [
+        "first occurrences",
+        (l) => (epochsOf(l)[0]!.firstOccurrences = 2),
+        ["MISMATCH:LEDGER_EPOCH_TOTALS"],
+      ],
+      [
+        "record capacity",
+        (l) => (countersOf(l).recordCapacityRefused = 2),
+        ["MISMATCH:LEDGER_COUNTER_TOTALS", "MISMATCH:LEDGER_CALL_TOTALS"],
+      ],
+      [
+        "disposition with its settlement",
+        (l) => setDisposition(l, "POLICY_PENDING"),
+        [
+          "MISMATCH:LEDGER_CLASSIFICATION",
+          "MISMATCH:LEDGER_VERIFIED_METADATA",
+          "MISMATCH:LEDGER_INGESTION_ACCOUNTING",
+        ],
+      ],
+      [
+        "disposition outside the enum",
+        (l) => setDisposition(l, "DONE"),
+        ["MISMATCH:LEDGER_RECORD_MALFORMED", "MISMATCH:ACCOUNT_SETTLEMENT_MALFORMED"],
+      ],
+      [
+        "settlement disposition alone",
+        (l) => (settlementOf(l, 1).disposition = "UNRESOLVED"),
+        ["MISMATCH:LEDGER_SETTLEMENT_STATE"],
+      ],
+      [
+        "blocking class on ingested",
+        (l) => (recs(l)[0]!.blockingClass = "CANCELLED"),
+        ["MISMATCH:LEDGER_CLASSIFICATION"],
+      ],
+      [
+        "policy on ingested",
+        (l) => (recs(l)[0]!.policyPending = "NO_TARGET_SWAP_POLICY_UNREVIEWED"),
+        ["MISMATCH:LEDGER_CLASSIFICATION"],
+      ],
+      [
+        "duplicate's first sequence",
+        (l) => (settlementOf(l, 2).firstSequence = 9),
+        ["MISMATCH:LEDGER_RECORD_REFERENCE"],
+      ],
+      [
+        "detail occurrence",
+        (l) => (recs(l)[0]!.duplicateDetails[0]!.occurrence = 9),
+        ["MISMATCH:LEDGER_DUPLICATE_DETAIL", "MISMATCH:LEDGER_RECORD_REFERENCE"],
+      ],
+      [
+        "detail receipt",
+        (l) => (recs(l)[0]!.duplicateDetails[0]!.hostReceivedAtMs = RECEIVED_AT + 1),
+        ["MISMATCH:LEDGER_DUPLICATE_DETAIL"],
+      ],
+      [
+        "duplicate count",
+        (l) => (recs(l)[0]!.duplicateOccurrences = 3),
+        ["MISMATCH:LEDGER_DUPLICATE_RETENTION", "MISMATCH:LEDGER_EPOCH_TOTALS"],
+      ],
+      [
+        "settlement occurrence",
+        (l) => (settlementOf(l, 1).occurrence = 4),
+        ["MISMATCH:LEDGER_OCCURRENCE_REFERENCE", "MISMATCH:LEDGER_DUPLICATE_DETAIL"],
+      ],
+      [
+        "record sequence",
+        (l) => {
+          recs(l)[0]!.sequence = 2;
+          settlementOf(l, 1).recordSequence = 2;
+          settlementOf(l, 2).firstSequence = 2;
+        },
+        ["MISMATCH:LEDGER_RECORD_SEQUENCE"],
+      ],
+      [
+        "verified slot",
+        (l) => (recs(l)[0]!.verifiedSlot = SLOT + 1),
+        [
+          "MISMATCH:LEDGER_VERIFIED_METADATA",
+          "MISMATCH:LEDGER_DUPLICATE_AGREEMENT",
+          "MISMATCH:LEDGER_METADATA_CONFLICT",
+        ],
+      ],
+      [
+        "rejected settlement",
+        (l) =>
+          Object.assign(settlementOf(l, 2), {
+            outcome: "REJECTED",
+            status: null,
+            occurrence: null,
+            firstSequence: null,
+          }),
+        [
+          "MISMATCH:ACCOUNT_SETTLEMENT_REJECTED",
+          "MISMATCH:LEDGER_RECORD_REFERENCE",
+          "MISMATCH:LEDGER_CALL_TOTALS",
+        ],
+      ],
+    ];
+    // Schemas, enums and unique identities of every recorded structure.
+    const pushCopy = (l: Row, kind: string, call: number) =>
+      callsOf(l).push({
+        ...callsOf(l).find((c) => c.kind === kind && c.call === call)!,
+      });
+    cases.push(
+      [
+        "a class of either kind on ingested",
+        (l) => (recs(l)[0]!.blockingClass = "EPOCH_CLOSED"),
+        ["MISMATCH:LEDGER_CLASSIFICATION"],
+      ],
+      [
+        "unknown fact counted incomplete",
+        (l) => {
+          setDisposition(l, "INGESTION_INCOMPLETE");
+          Object.assign(recs(l)[0]!, {
+            factKind: "OTHER_KIND",
+            blockingClass: "UNRECOGNIZED_OUTCOME",
+            ingestion: { ...ZERO },
+          });
+          settlementOf(l, 1).factKind = "OTHER_KIND";
+        },
+        ["MISMATCH:LEDGER_CLASSIFICATION"],
+      ],
+      [
+        "counter not an integer",
+        (l) => (countersOf(l).openEpochRefused = 0.5),
+        ["MISMATCH:LEDGER_COUNTERS_MALFORMED"],
+      ],
+      [
+        "epoch without an invalid code",
+        (l) => delete epochsOf(l)[0]!.invalid.STALE_EPOCH,
+        ["MISMATCH:LEDGER_EPOCH_MALFORMED"],
+      ],
+      [
+        "record with an extra field",
+        (l) => (recs(l)[0]!.note = "x"),
+        ["MISMATCH:LEDGER_RECORD_MALFORMED"],
+      ],
+      [
+        "detail agreement outside the enum",
+        (l) => (recs(l)[0]!.duplicateDetails[0]!.agreement = "MAYBE"),
+        ["MISMATCH:LEDGER_DUPLICATE_DETAIL_MALFORMED"],
+      ],
+      [
+        "call outcome outside the enum",
+        (l) => (callOf(l, 2).outcome = "DONE"),
+        ["MISMATCH:ACCOUNT_CALL_MALFORMED", "MISMATCH:ACCOUNT_SETTLEMENT_ORPHANED"],
+      ],
+      [
+        "settlement for a call that threw",
+        (l) => (callOf(l, 2).outcome = "THREW"),
+        ["MISMATCH:ACCOUNT_SETTLEMENT_ORPHANED"],
+      ],
+      [
+        "two calls, one number",
+        (l) => pushCopy(l, "ACCOUNT_CALL", 2),
+        ["MISMATCH:ACCOUNT_CALL_AMBIGUOUS", "MISMATCH:LEDGER_CALL_TOTALS"],
+      ],
+      [
+        "two settlements, one call",
+        (l) => pushCopy(l, "ACCOUNT_SETTLEMENT", 2),
+        ["MISMATCH:ACCOUNT_SETTLEMENT_AMBIGUOUS"],
+      ],
+      [
+        "two records, one signature",
+        (l) =>
+          recs(l).push({
+            ...recs(l)[0]!,
+            sequence: 2,
+            duplicateOccurrences: 0,
+            duplicateDetails: [],
+          }),
+        [
+          "MISMATCH:LEDGER_RECORD_AMBIGUOUS",
+          // A further first occurrence the epoch never counted and no call settled.
+          "MISMATCH:LEDGER_EPOCH_TOTALS",
+          "MISMATCH:LEDGER_RECORD_REFERENCE",
+          "MISMATCH:LEDGER_CALL_TOTALS",
+        ],
+      ],
+    );
+    for (const [label, mutate, findings] of cases) {
+      contradicted(rewrite(dir, mutate), label, findings);
+    }
+
+    // Sections the run could not read: missing, with the exact checks out of scope.
+    const failed = { status: "READ_FAILED", code: "TEST_READ_FAILED" };
+    for (const name of ["records", "epochs", "counters"]) {
+      const { ledger } = ledgerOf(rewrite(dir, (l) => (l[name] = failed)));
+      expect(ledger, name).toMatchObject({
+        status: "MISSING_EVIDENCE",
+        findings: [`MISSING_EVIDENCE:LEDGER_${name.toUpperCase()}_UNAVAILABLE`],
+        coverage: {
+          epochTotals: false,
+          callTotals: false,
+          duplicateDetails: name !== "records",
+        },
+      });
+    }
+    // Saturated counters are no longer exact: equalities are skipped, other contradictions kept.
+    const saturated = (l: Row) =>
+      Object.assign(countersOf(l), { saturated: true, occurrences: Number.MAX_SAFE_INTEGER });
+    expect(ledgerOf(rewrite(dir, saturated)).ledger).toMatchObject({
+      status: "MISSING_EVIDENCE",
+      findings: ["MISSING_EVIDENCE:LEDGER_COUNTERS_SATURATED"],
+      coverage: { epochTotals: false, callTotals: false, duplicateDetails: true },
+    });
+    contradicted(
+      rewrite(dir, (l) => {
+        saturated(l);
+        recs(l)[0]!.blockingClass = "CANCELLED";
+      }),
+      "saturated and misclassified",
+      ["MISSING_EVIDENCE:LEDGER_COUNTERS_SATURATED", "MISMATCH:LEDGER_CLASSIFICATION"],
+    );
+    // No usable ledger limits in the plan: the limit checks alone are out of scope.
+    const noLimits = copyOf(dir);
+    reseal(noLimits, PLAN, (p) => ((get(p, "plan", "limits") as Row).ledger = {}));
+    expect(ledgerOf(noLimits).ledger).toMatchObject({
+      status: "MISSING_EVIDENCE",
+      findings: ["MISSING_EVIDENCE:LEDGER_LIMITS_UNAVAILABLE"],
+      coverage: { epochTotals: true, callTotals: true, duplicateDetails: true },
     });
   });
 });
