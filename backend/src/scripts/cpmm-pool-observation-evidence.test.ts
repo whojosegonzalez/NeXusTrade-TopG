@@ -80,6 +80,8 @@ import {
   WSOL_MINT,
 } from "../candidate-scanner/RaydiumCpmmSwapDecoder.js";
 import {
+  CPMM_GET_TRANSACTION_CONFIG,
+  CPMM_TX_PURPOSE,
   RaydiumCpmmTransactionSourceAdapter,
   createCpmmExchangeEvidenceRecorder,
 } from "../candidate-scanner/RaydiumCpmmTransactionSourceAdapter.js";
@@ -409,8 +411,7 @@ const RECEIVED_AT = 1_794_829_421_500;
 const TRACKER_NOW = 1_794_829_422_000;
 const NOMINAL_END = OBS_START + 30_000;
 
-function txResult(sig: string): unknown {
-  const top = [swapBuy()];
+function txResult(sig: string, top: Ix[] = [swapBuy()]): unknown {
   const keys: string[] = [PAYER];
   const add = (k: string) => {
     if (!keys.includes(k)) keys.push(k);
@@ -456,10 +457,12 @@ function txResult(sig: string): unknown {
     meta: {
       err: null,
       fee: 5000,
-      innerInstructions: top.map((t, index) => ({
-        index,
-        instructions: (t.children ?? []).map((c) => compile(c, 2)),
-      })),
+      innerInstructions: top
+        .map((t, index) => ({
+          index,
+          instructions: (t.children ?? []).map((c) => compile(c, 2)),
+        }))
+        .filter((g) => g.instructions.length > 0),
       loadedAddresses: { writable: [], readonly: [] },
       logMessages: logs,
     },
@@ -500,6 +503,8 @@ function env(
   transport: {
     closeMode?: "sync" | "none" | undefined;
     wrapTransport?: ((t: CpmmOwnerTransport) => CpmmOwnerTransport) | undefined;
+    /** A further fan-out observer, after the recorder (e.g. moving the clock at completion). */
+    onExchange?: ((clock: { now: number }) => void) | undefined;
   } = {},
 ) {
   const state = { now: OBS_START };
@@ -528,6 +533,9 @@ function env(
     observers: [
       { label: "adapter-evidence", observe: (ev) => evidence.observe(ev) },
       { label: "observation-recorder", observe: (ev) => recorder.observeExchange(ev) },
+      ...(transport.onExchange
+        ? [{ label: "test-clock", observe: () => transport.onExchange!(state) }]
+        : []),
     ],
     maxRetainedFailures: 8,
   });
@@ -644,11 +652,15 @@ async function genuineRun(
     wrapTransport?: (t: CpmmOwnerTransport) => CpmmOwnerTransport;
     /** The unsubscribe acknowledgement never arrives (intake ends at its deadline). */
     noUnsubscribeAck?: boolean;
+    /** The second notification carries this signature (default: the first one's, a duplicate). */
+    secondSignature?: number;
+    onExchange?: (clock: { now: number }) => void;
   } = {},
 ) {
   const e = env(o.limits, o.collectorLimits, {
     closeMode: o.closeMode,
     wrapTransport: o.wrapTransport,
+    onExchange: o.onExchange,
   });
   const p = e.owner.run();
   e.c.open();
@@ -660,7 +672,8 @@ async function genuineRun(
   e.c.message(notif(1, o.logs));
   await flush();
   await e.to(RECEIVED_AT + 3_000);
-  e.c.message(notif(1, o.logs));
+  if (o.secondSignature !== undefined) e.script.push(okTx(o.secondSignature));
+  e.c.message(notif(o.secondSignature ?? 1, o.logs));
   e.c.emit("ping", o.pingPayload ?? Buffer.from([9, 9]));
   await flush();
   await e.to(NOMINAL_END);
@@ -744,11 +757,44 @@ function sealInput(
 
 const NOT_ATTEMPTED = { status: "NOT_ATTEMPTED", implementedComponents: null, components: null };
 
-/** Pool context and collector reproduced; everything else explicitly not implemented. */
-function expectReproduced(v: ReturnType<typeof verifyCpmmObservationEvidence>): void {
+/** The analysis credentials the harness's adapter was given (supplied explicitly, never read). */
+const ANALYSIS = { analysisSecrets: [RPC_URL, SECRET] } as const;
+/** Verification without credentials: binding checked, the analysis unavailable with its reason. */
+const UNCREDENTIALED = {
+  status: "MISSING_EVIDENCE",
+  findings: ["MISSING_EVIDENCE:ANALYSIS_CREDENTIALS_NOT_SUPPLIED"],
+  analysis: "UNAVAILABLE",
+  unavailableReason: "ANALYSIS_CREDENTIALS_NOT_SUPPLIED",
+};
+/** Credentialed verification of the clean run: one bound swap, decoded and matched. */
+const MATCHED_SWAP = {
+  status: "REPRODUCED",
+  findings: [],
+  analysis: "AVAILABLE",
+  unavailableReason: null,
+  comparedExchanges: 1,
+  runtimeOutcomesNotCompared: 0,
+  exchanges: [
+    {
+      decoded: { kind: "RESOLVED_SWAPS", replay: "DECODER_REPLAYABLE", bodyState: "STORED" },
+      notAnalysed: null,
+      recorded: { factKind: "RESOLVED_SWAPS" },
+      comparison: "MATCHED",
+    },
+  ],
+};
+
+/**
+ * Pool context and collector reproduced; the transaction analysis as expected; ledger accounting
+ * and owner/wrapper cross-checks explicitly not implemented; runtime accounting not reproduced.
+ */
+function expectReproduced(
+  v: ReturnType<typeof verifyCpmmObservationEvidence>,
+  transactionAnalysis: { status: string } & Record<string, unknown> = UNCREDENTIALED,
+): void {
   expect(v.rederivation).toMatchObject({
     status: "PARTIAL",
-    implementedComponents: "REPRODUCED",
+    implementedComponents: transactionAnalysis.status,
     components: {
       poolContext: { status: "REPRODUCED", findings: [] },
       collector: {
@@ -758,7 +804,7 @@ function expectReproduced(v: ReturnType<typeof verifyCpmmObservationEvidence>): 
         epochReportCompared: true,
         countersCompared: true,
       },
-      transactionAnalysis: { status: "NOT_IMPLEMENTED" },
+      transactionAnalysis,
       ledger: { status: "NOT_IMPLEMENTED" },
       ownerWrapperCrossChecks: { status: "NOT_IMPLEMENTED" },
       runtimeAccounting: { status: "RUNTIME_ACCOUNTING_NOT_REPRODUCED" },
@@ -900,6 +946,7 @@ describe("CPMM observation evidence: sealing", () => {
     expect(v.integrity).toEqual({ ok: true, problems: [] });
     expect(v.retention).toEqual({ status: "COMPLETE", reasons: [] });
     expectReproduced(v);
+    expectReproduced(verifyCpmmObservationEvidence(result.outDir, ANALYSIS), MATCHED_SWAP);
     expect(v.sealedClaims).toMatchObject({ rederivation: { status: "NOT_IMPLEMENTED" } });
     expect(v.poolContextProvenance).toBe("SUPPLIED_UNVERIFIED");
     expect(v.acquisitionProvenance).toBe("OPEN_G3");
@@ -2173,8 +2220,11 @@ describe("Re-derivation, partial (item G): pool context and collector replay", (
     if (!r.ok) throw new Error(`seal failed: ${r.code}`);
     return r.outDir;
   };
-  const components = (dir: string) => {
-    const v = verifyCpmmObservationEvidence(dir);
+  const components = (
+    dir: string,
+    options?: Parameters<typeof verifyCpmmObservationEvidence>[1],
+  ) => {
+    const v = verifyCpmmObservationEvidence(dir, options);
     expect(v.integrity, "integrity").toEqual({ ok: true, problems: [] });
     expect(v.flags).toEqual(CPMM_EVIDENCE_FALSE_FLAGS);
     expect(v.poolContextProvenance).toBe("SUPPLIED_UNVERIFIED");
@@ -2226,7 +2276,10 @@ describe("Re-derivation, partial (item G): pool context and collector replay", (
       countersCompared: true,
     });
     expect(v.rederivation.status).toBe("PARTIAL");
-    expect(v.rederivation.implementedComponents).toBe("REPRODUCED");
+    // Without analysis credentials the transaction analysis is unavailable, with its reason.
+    expect(v.rederivation.implementedComponents).toBe("MISSING_EVIDENCE");
+    expect(v.rederivation.components!.transactionAnalysis).toMatchObject(UNCREDENTIALED);
+    expect(components(dir, ANALYSIS).v.rederivation.implementedComponents).toBe("REPRODUCED");
     // The sealed report still says what the sealer could say; verification computed the rest.
     expect(v.sealedClaims).toMatchObject({
       rederivation: { status: "NOT_IMPLEMENTED" },
@@ -2729,18 +2782,36 @@ describe("Re-derivation, partial (item G): pool context and collector replay", (
     ).toMatchObject({
       status: "BUILT_UNOBSERVED",
     });
-    for (const responder of [
-      async () => new Response("x".repeat(200_001), { status: 200 }),
-      async () => {
-        throw new Error("transport failure");
-      },
-    ] as Responder[]) {
+    for (const [responder, notAnalysed] of [
+      [async () => new Response("x".repeat(200_001), { status: 200 }), "BODY_PARTIAL_OVERFLOW"],
+      [
+        async () => {
+          throw new Error("transport failure");
+        },
+        "BODY_NOT_READ",
+      ],
+    ] as [Responder, string][]) {
       const dir = sealRun(await genuineRun({ responder }));
-      const { v, poolContext, collector } = components(dir);
+      const { v, poolContext, collector, transactionAnalysis } = components(dir, ANALYSIS);
       expect(v.retention.status).toBe("INCOMPLETE");
       expect(poolContext.status).toBe("REPRODUCED");
       expect(collector.status).toBe("REPRODUCED");
-      expect(v.rederivation.components!.transactionAnalysis).toEqual({ status: "NOT_IMPLEMENTED" });
+      // A runtime-only fact over an incomplete body: bound, listed, never compared or upgraded.
+      expect(transactionAnalysis).toMatchObject({
+        status: "REPRODUCED",
+        findings: [],
+        analysis: "AVAILABLE",
+        comparedExchanges: 0,
+        runtimeOutcomesNotCompared: 1,
+        exchanges: [
+          {
+            decoded: null,
+            notAnalysed,
+            recorded: { factKind: "TRANSPORT_FAILED" },
+            comparison: "RUNTIME_OUTCOME_NOT_COMPARED",
+          },
+        ],
+      });
       expect(v.rederivation.components!.runtimeAccounting).toEqual({
         status: "RUNTIME_ACCOUNTING_NOT_REPRODUCED",
       });
@@ -3110,5 +3181,693 @@ describe("Notification structure (review of 84a5ff9)", () => {
       });
     });
     expect(collectorOf(shifted).findings).toContain("MISMATCH:NOTIFICATION_SEQUENCE_INCONSISTENT");
+  });
+});
+
+describe("Transaction analysis and binding (items C and G, partial)", () => {
+  type Run = Awaited<ReturnType<typeof genuineRun>>;
+  type Options = Parameters<typeof verifyCpmmObservationEvidence>[1];
+  const MEMO = "MemoSq4gqABAXKb96qnH8TysNcWxMyWCqXgDLGmfcHr";
+  const LEDGER = CPMM_EVIDENCE_FILES.ledger;
+  const SESSION = CPMM_EVIDENCE_FILES.sessionLedger;
+  const COL = CPMM_EVIDENCE_FILES.collector;
+  const sealRun = (run: Run) => {
+    const r = sealCpmmObservationEvidence(
+      sealInput(run.snapshot, run.recorder, {}, run.recorderLimits, run.collectorLimits),
+    );
+    if (!r.ok) throw new Error(`seal failed: ${r.code}`);
+    return r.outDir;
+  };
+  /** Integrity holds; returns the transaction component (and the whole verification). */
+  /** Verifies with the run's analysis credentials unless options (even `undefined`) are given. */
+  const txOf = (dir: string, ...options: [] | [Options]) => {
+    const v = verifyCpmmObservationEvidence(dir, ...(options.length === 0 ? [ANALYSIS] : options));
+    expect(v.integrity, "integrity").toEqual({ ok: true, problems: [] });
+    expect(v.flags).toEqual(CPMM_EVIDENCE_FALSE_FLAGS);
+    expect(v.poolContextProvenance).toBe("SUPPLIED_UNVERIFIED");
+    expect(v.rederivation.components!.runtimeAccounting).toEqual({
+      status: "RUNTIME_ACCOUNTING_NOT_REPRODUCED",
+    });
+    expect(v.rederivation.components!.ledger).toEqual({ status: "NOT_IMPLEMENTED" });
+    expect(v.rederivation.components!.ownerWrapperCrossChecks).toEqual({
+      status: "NOT_IMPLEMENTED",
+    });
+    // Credentials are used, never kept: nothing in the result carries one.
+    expect(JSON.stringify(v).includes(SECRET)).toBe(false);
+    return { v, tx: v.rederivation.components!.transactionAnalysis };
+  };
+  const exchangeFile = (dir: string, i = 0) =>
+    (readJson(dir, CPMM_EVIDENCE_FILES.exchangeIndex).exchanges as { path: string }[])[i]!.path;
+  const ledgerRecords = (d: Record<string, unknown>) =>
+    get(d, "records", "value") as Record<string, unknown>[];
+  const ledgerCalls = (d: Record<string, unknown>) => d.calls as Record<string, unknown>[];
+  const windowOf = (d: Record<string, unknown>) =>
+    get(d, "window", "value") as Record<string, unknown>[];
+  /** A consistent text-payload rewrite (digests and sizes true, as a careful forger would). */
+  const setText = (p: Record<string, unknown>, text: string) => {
+    const b = Buffer.from(text, "utf8");
+    Object.assign(p, {
+      storedEncoding: "utf8",
+      stored: text,
+      storedBytes: b.length,
+      storedSha256: sha(b),
+      originalBytes: b.length,
+      originalSha256: sha(b),
+    });
+  };
+  /** Rewrites the recorded fact consistently in the ledger record and its settlement. */
+  const setFact = (d: Record<string, unknown>, factKind: string, factCode: string | null) => {
+    for (const r of ledgerRecords(d)) Object.assign(r, { factKind, factCode });
+    for (const c of ledgerCalls(d)) {
+      if (c.kind === "ACCOUNT_SETTLEMENT" && c.status === "RECORDED") {
+        Object.assign(c, { factKind, factCode });
+      }
+    }
+  };
+  const memoIx = (): Ix => ({ program: MEMO, accounts: [], data: Uint8Array.from([1]) });
+  const respond =
+    (result: (sig: string) => unknown): Responder =>
+    async ({ id }) =>
+      new Response(JSON.stringify({ jsonrpc: "2.0", id, result: result(signatureOf(1)) }), {
+        status: 200,
+      });
+
+  it("T1: genuine swap, no-target, failed, not-found and RPC-error outcomes decode and match their recorded facts", async () => {
+    const failed = (sig: string) => {
+      const t = txResult(sig) as { meta: Record<string, unknown> };
+      t.meta.err = { InstructionError: [0, { Custom: 6005 }] };
+      return t;
+    };
+    const cases: [string, Responder, string][] = [
+      ["swap", okTx(1), "RESOLVED_SWAPS"],
+      ["no target", respond((sig) => txResult(sig, [memoIx()])), "RESOLVED_NO_TARGET_SWAP"],
+      ["failed", respond(failed), "RECORDED_FAILED_TRANSACTION"],
+      ["not found", respond(() => null), "TRANSACTION_NOT_FOUND"],
+      [
+        "rpc error",
+        async ({ id }) =>
+          new Response(
+            JSON.stringify({ jsonrpc: "2.0", id, error: { code: -32_004, message: "x" } }),
+            { status: 200 },
+          ),
+        "RPC_ERROR",
+      ],
+    ];
+    for (const [label, responder, kind] of cases) {
+      const dir = sealRun(await genuineRun({ responder }));
+      const { v, tx } = txOf(dir);
+      const record = ledgerRecords(readJson(dir, LEDGER))[0]!;
+      expect(record.factKind, label).toBe(kind);
+      expect(tx, label).toMatchObject({
+        status: "REPRODUCED",
+        findings: [],
+        analysis: "AVAILABLE",
+        comparedExchanges: 1,
+        runtimeOutcomesNotCompared: 0,
+        exchanges: [
+          {
+            seq: get(readJson(dir, exchangeFile(dir)), "entry", "seq"),
+            signature: signatureOf(1),
+            decoded: { kind, code: record.factCode },
+            notAnalysed: null,
+            recorded: { factKind: kind, factCode: record.factCode },
+            comparison: "MATCHED",
+          },
+        ],
+      });
+      expect(v.rederivation.implementedComponents, label).toBe("REPRODUCED");
+      // The sealed report's claim is unchanged by what verification computed.
+      expect(v.sealedClaims).toMatchObject({ rederivation: { status: "NOT_IMPLEMENTED" } });
+    }
+  });
+
+  it("T2: a changed request configuration, id, signature or slot is a contradiction", async () => {
+    const { dir } = await shared;
+    const ex = exchangeFile(dir);
+    const requestOf = (d: Record<string, unknown>) => d.requestBody as Record<string, unknown>;
+    const id = get(readJson(dir, ex), "entry", "jsonRpcId") as number;
+    const seq = get(readJson(dir, ex), "entry", "seq");
+    const body = (over: Record<string, unknown> = {}, cfg: Record<string, unknown> = {}) =>
+      JSON.stringify({
+        jsonrpc: "2.0",
+        id,
+        method: "getTransaction",
+        params: [
+          signatureOf(1),
+          { encoding: "json", commitment: "confirmed", maxSupportedTransactionVersion: 0, ...cfg },
+        ],
+        ...over,
+      });
+    // The accepted body itself, rewritten byte-identically, still matches (the control).
+    const same = copyOf(dir);
+    reseal(same, ex, (x) => setText(requestOf(x), body()));
+    expect(txOf(same).tx).toMatchObject(MATCHED_SWAP);
+
+    const requestCases: [string, string][] = [
+      ["commitment", body({}, { commitment: "finalized" })],
+      ["encoding", body({}, { encoding: "jsonParsed" })],
+      ["version", body({}, { maxSupportedTransactionVersion: 1 })],
+      ["method", body({ method: "getSignatureStatuses" })],
+      ["id", body({ id: id + 1 })],
+      ["key order", JSON.stringify(JSON.parse(body()), Object.keys(JSON.parse(body())).reverse())],
+    ];
+    for (const [label, text] of requestCases) {
+      const d = copyOf(dir);
+      reseal(d, ex, (x) => setText(requestOf(x), text));
+      const { tx } = txOf(d);
+      expect(tx.status, label).toBe("MISMATCH");
+      expect(tx.findings, label).toEqual(["MISMATCH:REQUEST_BODY"]);
+      // The intact response still decodes and matches: the contradiction is localized.
+      expect(tx.exchanges[0]!.comparison, label).toBe("MATCHED");
+    }
+
+    // A GET carries no request body: not the accepted request at all.
+    const get_ = copyOf(dir);
+    reseal(get_, ex, (x) => Object.assign(x, { method: "GET", requestBody: null }));
+    expect(txOf(get_).tx.findings).toEqual(["MISMATCH:REQUEST_METHOD"]);
+
+    // The sealed id, consistently in the exchange and the session ledger: the request no longer
+    // matches it, and the response's id contradicts it.
+    const idChanged = copyOf(dir);
+    reseal(idChanged, ex, (x) => ((x.entry as Record<string, unknown>).jsonRpcId = id + 1));
+    reseal(idChanged, SESSION, (s) => {
+      windowOf(s).find((w) => w.seq === seq)!.jsonRpcId = id + 1;
+    });
+    const byId = txOf(idChanged).tx;
+    expect(byId.findings).toEqual(
+      expect.arrayContaining(["MISMATCH:REQUEST_BODY", "MISMATCH:FACT_MISMATCH"]),
+    );
+    expect(byId.exchanges[0]).toMatchObject({
+      decoded: { kind: "MALFORMED_RESPONSE" },
+      recorded: { factKind: "RESOLVED_SWAPS" },
+      comparison: "MISMATCH",
+    });
+
+    // The signature, consistently in the exchange, its request and the session ledger.
+    const sigChanged = copyOf(dir);
+    reseal(sigChanged, ex, (x) => {
+      (x.entry as Record<string, unknown>).requestedIdentity = signatureOf(2);
+      setText(requestOf(x), body({ params: [signatureOf(2), CPMM_GET_TRANSACTION_CONFIG] }));
+    });
+    reseal(sigChanged, SESSION, (s) => {
+      windowOf(s).find((w) => w.seq === seq)!.requestedIdentity = signatureOf(2);
+    });
+    const bySig = txOf(sigChanged).tx;
+    expect(bySig.status).toBe("MISMATCH");
+    expect(bySig.findings).toEqual(
+      expect.arrayContaining([
+        "MISMATCH:REQUEST_MISSING_FOR_FACT",
+        "MISMATCH:NOTIFICATION_MISSING",
+        "MISMATCH:ACCOUNT_CALL_MISSING",
+        "MISMATCH:LEDGER_RECORD_MISSING",
+      ]),
+    );
+    expect(bySig.exchanges[0]).toMatchObject({
+      signature: signatureOf(2),
+      decoded: null,
+      notAnalysed: "BINDING_UNAVAILABLE",
+      recorded: null,
+      comparison: "NOT_COMPARED_MISSING_EVIDENCE",
+    });
+
+    // Slot metadata: the ledger's notified slot, then the collector's notification slot.
+    const ledgerSlot = copyOf(dir);
+    reseal(ledgerSlot, LEDGER, (l) => (ledgerRecords(l)[0]!.notifiedSlot = SLOT + 1));
+    expect(txOf(ledgerSlot).tx.findings).toEqual(["MISMATCH:LEDGER_RECORD_IDENTITY"]);
+    const noteSlot = copyOf(dir);
+    reseal(noteSlot, COL, (c) => {
+      for (const n of get(c, "notifications", "value") as Record<string, unknown>[]) {
+        n.slot = SLOT + 1;
+      }
+    });
+    const bySlot = txOf(noteSlot);
+    expect(bySlot.tx.findings).toEqual(
+      expect.arrayContaining(["MISMATCH:LEDGER_RECORD_IDENTITY", "MISMATCH:FACT_MISMATCH"]),
+    );
+    expect(bySlot.tx.exchanges[0]!.decoded).toMatchObject({ kind: "METADATA_CONTRADICTION" });
+    // The collector replay finds its own contradiction independently.
+    expect(bySlot.v.rederivation.components!.collector.status).toBe("MISMATCH");
+  });
+
+  it("T3: duplicate and missing exchanges, and missing binding records, are reported explicitly", async () => {
+    // Two signatures, two exchanges; the second exchange re-labelled with the first signature.
+    const two = sealRun(await genuineRun({ secondSignature: 2 }));
+    const clean = txOf(two).tx;
+    expect(clean).toMatchObject({ status: "REPRODUCED", comparedExchanges: 2 });
+    const dup = copyOf(two);
+    const second = exchangeFile(dup, 1);
+    const seq2 = get(readJson(dup, second), "entry", "seq");
+    reseal(
+      dup,
+      second,
+      (x) => ((x.entry as Record<string, unknown>).requestedIdentity = signatureOf(1)),
+    );
+    reseal(dup, SESSION, (s) => {
+      windowOf(s).find((w) => w.seq === seq2)!.requestedIdentity = signatureOf(1);
+    });
+    const dupTx = txOf(dup).tx;
+    expect(dupTx.status).toBe("MISMATCH");
+    expect(dupTx.findings).toEqual(
+      expect.arrayContaining([
+        "MISMATCH:DUPLICATE_EXCHANGE",
+        "MISMATCH:REQUEST_MISSING_FOR_FACT",
+        "MISMATCH:REQUEST_BODY",
+      ]),
+    );
+
+    const { dir } = await shared;
+    // An exchange the authoritative session ledger shows, missing from the evidence (dropped).
+    const dropped = sealRun(await genuineRun({ limits: { maxExchangeRecords: 0 } }));
+    const droppedTx = txOf(dropped).tx;
+    expect(readJson(dropped, CPMM_EVIDENCE_FILES.exchangeIndex).exchanges).toEqual([]);
+    expect(droppedTx).toMatchObject({
+      status: "MISSING_EVIDENCE",
+      findings: ["MISSING_EVIDENCE:EXCHANGE_NOT_SEALED"],
+      exchanges: [],
+    });
+
+    // A recorded fact that implies a dispatch the session never made.
+    const moved = copyOf(dir);
+    reseal(moved, LEDGER, (l) => (ledgerRecords(l)[0]!.signature = signatureOf(2)));
+    expect(txOf(moved).tx.findings).toEqual(
+      expect.arrayContaining([
+        "MISMATCH:REQUEST_MISSING_FOR_FACT",
+        "MISMATCH:LEDGER_RECORD_MISSING",
+      ]),
+    );
+    // A request whose recorded fact says nothing was dispatched.
+    const refused = copyOf(dir);
+    reseal(refused, LEDGER, (l) => setFact(l, "REQUEST_REFUSED", "TEST"));
+    const refusedTx = txOf(refused).tx;
+    expect(refusedTx.findings).toEqual(["MISMATCH:EXCHANGE_WITHOUT_DISPATCH_FACT"]);
+    expect(refusedTx.exchanges[0]!.comparison).toBe("RUNTIME_OUTCOME_NOT_COMPARED");
+
+    // Missing binding records: the ledger record, the first account() call, its settlement.
+    const noRecord = copyOf(dir);
+    reseal(noRecord, LEDGER, (l) => (ledgerRecords(l)[0]!.signature = signatureOf(3)));
+    expect(txOf(noRecord).tx.exchanges[0]).toMatchObject({
+      recorded: null,
+      comparison: "NOT_COMPARED_MISSING_EVIDENCE",
+    });
+    const noCall = copyOf(dir);
+    reseal(noCall, LEDGER, (l) => {
+      for (const c of ledgerCalls(l)) if (c.kind === "ACCOUNT_CALL") c.signature = signatureOf(3);
+    });
+    expect(txOf(noCall).tx.findings).toEqual([
+      "MISMATCH:ACCOUNT_CALL_MISSING",
+      "MISSING_EVIDENCE:ACCOUNT_SETTLEMENT_UNAVAILABLE",
+    ]);
+    const callTime = copyOf(dir);
+    reseal(callTime, LEDGER, (l) => {
+      ledgerCalls(l).find((c) => c.kind === "ACCOUNT_CALL")!.hostReceivedAtMs = RECEIVED_AT + 1;
+    });
+    expect(txOf(callTime).tx.findings).toEqual(["MISMATCH:ACCOUNT_CALL_IDENTITY"]);
+    const settlement = copyOf(dir);
+    reseal(settlement, LEDGER, (l) => {
+      ledgerCalls(l).find((c) => c.kind === "ACCOUNT_SETTLEMENT")!.factKind = "RPC_ERROR";
+    });
+    expect(txOf(settlement).tx.findings).toEqual(["MISMATCH:LEDGER_SETTLEMENT"]);
+    // A dispatch recorded before the notification that caused it was received.
+    const early = copyOf(dir);
+    const ex = exchangeFile(dir);
+    const seq = get(readJson(dir, ex), "entry", "seq");
+    reseal(
+      early,
+      ex,
+      (x) => ((x.entry as Record<string, unknown>).dispatchedAtMs = RECEIVED_AT - 1),
+    );
+    reseal(early, SESSION, (s) => {
+      windowOf(s).find((w) => w.seq === seq)!.dispatchedAtMs = RECEIVED_AT - 1;
+    });
+    expect(txOf(early).tx.findings).toEqual(["MISMATCH:DISPATCH_BEFORE_RECEIPT"]);
+  });
+
+  it("T4: a genuine LATE_RESPONSE whose stored body decodes stays a runtime outcome, never compared", async () => {
+    const late = await genuineRun({
+      onExchange: (clock) => (clock.now = OBS_START + 600_000),
+    });
+    const dir = sealRun(late);
+    const record = ledgerRecords(readJson(dir, LEDGER))[0]!;
+    expect(record.factKind).toBe("LATE_RESPONSE");
+    const { tx, v } = txOf(dir);
+    expect(tx).toMatchObject({
+      status: "REPRODUCED",
+      findings: [],
+      analysis: "AVAILABLE",
+      comparedExchanges: 0,
+      runtimeOutcomesNotCompared: 1,
+      exchanges: [
+        {
+          decoded: { kind: "RESOLVED_SWAPS" },
+          recorded: { factKind: "LATE_RESPONSE", factCode: record.factCode },
+          comparison: "RUNTIME_OUTCOME_NOT_COMPARED",
+        },
+      ],
+    });
+    expect(v.rederivation.implementedComponents).toBe("REPRODUCED");
+    // A response-dependent fact that the body contradicts is a mismatch...
+    const forged = copyOf(dir);
+    reseal(forged, LEDGER, (l) => setFact(l, "TRANSACTION_NOT_FOUND", null));
+    expect(txOf(forged).tx).toMatchObject({
+      status: "MISMATCH",
+      findings: ["MISMATCH:FACT_MISMATCH"],
+      exchanges: [{ comparison: "MISMATCH" }],
+    });
+    // ...and one with a different code too.
+    const code = copyOf((await shared).dir);
+    reseal(code, LEDGER, (l) => setFact(l, "RESOLVED_SWAPS", "OTHER_CODE"));
+    expect(txOf(code).tx.findings).toEqual(["MISMATCH:FACT_MISMATCH"]);
+  });
+
+  it("T5: absent or invalid analysis credentials leave analysis unavailable while integrity and the other checks continue", async () => {
+    const { dir } = await shared;
+    const getter = {
+      get analysisSecrets(): string[] {
+        throw new Error("getter must not run");
+      },
+    };
+    const proxy = new Proxy({ analysisSecrets: [RPC_URL, SECRET] }, {});
+    const cases: [string, unknown, string][] = [
+      ["no options", undefined, "ANALYSIS_CREDENTIALS_NOT_SUPPLIED"],
+      ["empty options", {}, "ANALYSIS_CREDENTIALS_NOT_SUPPLIED"],
+      ["undefined list", { analysisSecrets: undefined }, "ANALYSIS_CREDENTIALS_NOT_SUPPLIED"],
+      ["empty list", { analysisSecrets: [] }, "ANALYSIS_CREDENTIALS_INVALID"],
+      ["too short", { analysisSecrets: ["abc"] }, "ANALYSIS_CREDENTIALS_INVALID"],
+      ["not printable", { analysisSecrets: ["abc def ghi"] }, "ANALYSIS_CREDENTIALS_INVALID"],
+      ["not a string", { analysisSecrets: [123_456_789] }, "ANALYSIS_CREDENTIALS_INVALID"],
+      ["not a list", { analysisSecrets: SECRET }, "ANALYSIS_CREDENTIALS_INVALID"],
+      ["too many", { analysisSecrets: Array(65).fill(SECRET) }, "ANALYSIS_CREDENTIALS_INVALID"],
+      ["unknown key", { analysisSecrets: [SECRET], other: 1 }, "ANALYSIS_CREDENTIALS_INVALID"],
+      ["getter", getter, "ANALYSIS_CREDENTIALS_INVALID"],
+      ["proxy", proxy, "ANALYSIS_CREDENTIALS_INVALID"],
+      ["not an object", "secret", "ANALYSIS_CREDENTIALS_INVALID"],
+    ];
+    for (const [label, options, reason] of cases) {
+      const { v, tx } = txOf(dir, options as Options);
+      expect(v.retention, label).toEqual({ status: "COMPLETE", reasons: [] });
+      expect(v.rederivation.components!.poolContext.status, label).toBe("REPRODUCED");
+      expect(v.rederivation.components!.collector.status, label).toBe("REPRODUCED");
+      expect(tx, label).toMatchObject({
+        status: "MISSING_EVIDENCE",
+        findings: [`MISSING_EVIDENCE:${reason}`],
+        analysis: "UNAVAILABLE",
+        unavailableReason: reason,
+        comparedExchanges: 0,
+        exchanges: [
+          {
+            decoded: null,
+            notAnalysed: reason,
+            recorded: { factKind: "RESOLVED_SWAPS" },
+            comparison: "NOT_COMPARED_ANALYSIS_UNAVAILABLE",
+          },
+        ],
+      });
+    }
+    // Binding checks run without credentials: a changed request is still a contradiction.
+    const d = copyOf(dir);
+    reseal(d, LEDGER, (l) => (ledgerRecords(l)[0]!.notifiedSlot = SLOT + 1));
+    expect(txOf(d, undefined).tx.findings).toEqual([
+      "MISMATCH:LEDGER_RECORD_IDENTITY",
+      "MISSING_EVIDENCE:ANALYSIS_CREDENTIALS_NOT_SUPPLIED",
+    ]);
+    // A supplied list is copied, not retained: mutating it afterwards changes nothing.
+    const list = [RPC_URL, SECRET];
+    const v = verifyCpmmObservationEvidence(dir, { analysisSecrets: list });
+    list.length = 0;
+    expect(v.rederivation.components!.transactionAnalysis).toMatchObject(MATCHED_SWAP);
+  });
+
+  it("T6: partial, missing and redacted material stays explicit and localized", async () => {
+    const clean = (await shared).dir;
+    // A redacted response body: not comparable, limited by redaction (never reproduced).
+    const redacted = sealRun(
+      await genuineRun({
+        responder: respond((sig) => {
+          const t = txResult(sig) as { meta: { logMessages: string[] } };
+          t.meta.logMessages.push(`Program log: ${SECRET}`);
+          return t;
+        }),
+      }),
+    );
+    expect(get(readJson(redacted, exchangeFile(redacted)), "body", "payloadRedacted")).toBe(true);
+    expect(txOf(redacted).tx).toMatchObject({
+      status: "LIMITED_BY_REDACTION",
+      findings: ["LIMITED_BY_REDACTION:RESPONSE_BODY_REDACTED"],
+      exchanges: [
+        {
+          decoded: null,
+          notAnalysed: "BODY_REDACTED",
+          comparison: "NOT_COMPARED_LIMITED_BY_REDACTION",
+        },
+      ],
+    });
+    // Unrelated redaction does not conceal an independently checkable contradiction.
+    const redactedForged = copyOf(redacted);
+    reseal(redactedForged, LEDGER, (l) => (ledgerRecords(l)[0]!.notifiedSlot = SLOT + 1));
+    expect(txOf(redactedForged).tx).toMatchObject({
+      status: "MISMATCH",
+      findings: ["MISMATCH:LEDGER_RECORD_IDENTITY", "LIMITED_BY_REDACTION:RESPONSE_BODY_REDACTED"],
+    });
+
+    // Redacted notification logs with an intact response: the transaction still reproduces.
+    const logs = sealRun(await genuineRun({ logs: [`Program log: ${RPC_URL}`] }));
+    const logsV = txOf(logs);
+    expect(logsV.v.rederivation.components!.collector.status).toBe("LIMITED_BY_REDACTION");
+    expect(logsV.tx).toMatchObject(MATCHED_SWAP);
+
+    // An omitted response body (beyond the recorder's body budget): missing, not comparable.
+    const omitted = sealRun(await genuineRun({ limits: { maxExchangeBodyBytes: 64 } }));
+    expect(get(readJson(omitted, exchangeFile(omitted)), "body", "payloadOmitted")).not.toBeNull();
+    expect(txOf(omitted).tx).toMatchObject({
+      status: "MISSING_EVIDENCE",
+      findings: ["MISSING_EVIDENCE:RESPONSE_BODY_UNAVAILABLE"],
+      exchanges: [{ decoded: null, comparison: "NOT_COMPARED_MISSING_EVIDENCE" }],
+    });
+
+    // A partial body under a response-dependent fact: missing, never decoded from a prefix.
+    const partial = sealRun(
+      await genuineRun({
+        responder: async () => new Response("x".repeat(200_001), { status: 200 }),
+      }),
+    );
+    reseal(partial, LEDGER, (l) => setFact(l, "MALFORMED_RESPONSE", "NOT_JSON"));
+    expect(txOf(partial).tx).toMatchObject({
+      status: "MISSING_EVIDENCE",
+      findings: ["MISSING_EVIDENCE:RESPONSE_BODY_PARTIAL_OVERFLOW"],
+      exchanges: [{ decoded: null, notAnalysed: "BODY_PARTIAL_OVERFLOW" }],
+    });
+    // Sections the run could not read: the ledger records, the collector's notifications.
+    const unread = (rel: string, mutate: (d: Record<string, unknown>) => void) => {
+      const d = copyOf(clean);
+      reseal(d, rel, mutate);
+      return txOf(d).tx;
+    };
+    const failedSection = { status: "READ_FAILED", code: "TEST_READ_FAILED" };
+    expect(unread(LEDGER, (l) => (l.records = failedSection))).toMatchObject({
+      status: "MISSING_EVIDENCE",
+      findings: ["MISSING_EVIDENCE:LEDGER_RECORDS_UNAVAILABLE"],
+      exchanges: [{ recorded: null, comparison: "NOT_COMPARED_MISSING_EVIDENCE" }],
+    });
+    expect(unread(COL, (c) => (c.notifications = failedSection))).toMatchObject({
+      status: "MISSING_EVIDENCE",
+      findings: [
+        "MISSING_EVIDENCE:NOTIFICATIONS_UNAVAILABLE",
+        "MISSING_EVIDENCE:RESPONSE_BINDING_UNAVAILABLE",
+      ],
+      exchanges: [{ decoded: null, notAnalysed: "BINDING_UNAVAILABLE" }],
+    });
+  });
+
+  it("T8: an unreproduced pool, unknown or pending facts, dropped records and refused inputs stay explicit", async () => {
+    const { dir } = await shared;
+    const ex = exchangeFile(dir);
+    const seq = get(readJson(dir, ex), "entry", "seq");
+    // A pool context that does not reproduce is never used for analysis.
+    const pool = copyOf(dir);
+    reseal(pool, CPMM_EVIDENCE_FILES.poolContext, (c) => {
+      const p = get(c, "accounts", "vault0", "data") as Record<string, unknown>;
+      const b = Buffer.from(p.stored as string, p.storedEncoding === "base64" ? "base64" : "utf8");
+      b[64] = b[64]! ^ 0x01;
+      Object.assign(p, {
+        storedEncoding: "base64",
+        stored: b.toString("base64"),
+        storedBytes: b.length,
+        storedSha256: sha(b),
+        originalBytes: b.length,
+        originalSha256: sha(b),
+      });
+    });
+    const byPool = txOf(pool);
+    expect(byPool.v.rederivation.components!.poolContext.status).toBe("MISMATCH");
+    expect(byPool.tx).toMatchObject({
+      status: "MISSING_EVIDENCE",
+      findings: ["MISSING_EVIDENCE:POOL_CONTEXT_NOT_REPRODUCED"],
+      analysis: "UNAVAILABLE",
+      unavailableReason: "POOL_CONTEXT_NOT_REPRODUCED",
+      exchanges: [{ decoded: null, comparison: "NOT_COMPARED_ANALYSIS_UNAVAILABLE" }],
+    });
+
+    // An unknown fact kind is a contradiction; a pending one is missing.
+    const unknown = copyOf(dir);
+    reseal(unknown, LEDGER, (l) => setFact(l, "NEW_KIND", null));
+    expect(txOf(unknown).tx.findings).toContain("MISMATCH:FACT_KIND_UNKNOWN");
+    const pending = copyOf(dir);
+    reseal(pending, LEDGER, (l) => (ledgerRecords(l)[0]!.factKind = null));
+    const pendingTx = txOf(pending).tx;
+    expect(pendingTx.findings).toEqual(
+      expect.arrayContaining([
+        "MISSING_EVIDENCE:LEDGER_FACT_PENDING",
+        "MISMATCH:LEDGER_SETTLEMENT",
+      ]),
+    );
+    expect(pendingTx.exchanges[0]).toMatchObject({
+      recorded: { factKind: null },
+      comparison: "NOT_COMPARED_MISSING_EVIDENCE",
+    });
+
+    // Records the recorder or the collector dropped are missing, never contradictions.
+    const noCalls = sealRun(await genuineRun({ limits: { maxLedgerCallRecords: 0 } }));
+    expect(txOf(noCalls).tx.findings).toEqual([
+      "MISSING_EVIDENCE:ACCOUNT_CALL_NOT_RETAINED",
+      "MISSING_EVIDENCE:ACCOUNT_SETTLEMENT_UNAVAILABLE",
+    ]);
+    const noNotes = sealRun(
+      await genuineRun({ secondSignature: 2, collectorLimits: { maxRetainedNotifications: 1 } }),
+    );
+    expect(txOf(noNotes).tx.findings).toEqual(
+      expect.arrayContaining([
+        "MISSING_EVIDENCE:NOTIFICATION_NOT_RETAINED",
+        "MISSING_EVIDENCE:RESPONSE_BINDING_UNAVAILABLE",
+      ]),
+    );
+
+    // An identity that is not a signature, consistently in the exchange and the session ledger.
+    const badSig = copyOf(dir);
+    reseal(
+      badSig,
+      ex,
+      (x) => ((x.entry as Record<string, unknown>).requestedIdentity = "not-a-signature"),
+    );
+    reseal(badSig, SESSION, (s) => {
+      windowOf(s).find((w) => w.seq === seq)!.requestedIdentity = "not-a-signature";
+    });
+    expect(txOf(badSig).tx.findings).toContain("MISMATCH:EXCHANGE_IDENTITY_INVALID");
+
+    // A body limit the accepted analysis refuses: an input contradiction, not a decoded outcome.
+    const limit = copyOf(dir);
+    reseal(limit, ex, (x) => (x.maxResponseBytes = 64 * 1024 * 1024 + 1));
+    const limitV = verifyCpmmObservationEvidence(limit, ANALYSIS);
+    expect(limitV.integrity).toEqual({ ok: true, problems: [] });
+    expect(limitV.rederivation.components!.transactionAnalysis).toMatchObject({
+      status: "MISMATCH",
+      findings: ["MISMATCH:ANALYSIS_INPUT_INVALID"],
+      exchanges: [{ decoded: null, notAnalysed: "ANALYSIS_INPUT_INVALID" }],
+    });
+  });
+
+  it("T9: dispatch facts, window purposes, identities and block times are checked link by link", async () => {
+    const { dir } = await shared;
+    // A dispatch exception never reached the session: an exchange contradicts it.
+    const exception = copyOf(dir);
+    reseal(exception, LEDGER, (l) => setFact(l, "TRANSPORT_FAILED", "DISPATCH_EXCEPTION"));
+    expect(txOf(exception).tx.findings).toEqual(["MISMATCH:EXCHANGE_WITHOUT_DISPATCH_FACT"]);
+    // Any other transport failure implies a dispatch, so its exchange is expected.
+    const transport = copyOf(dir);
+    reseal(transport, LEDGER, (l) => setFact(l, "TRANSPORT_FAILED", "NETWORK_ERROR"));
+    expect(txOf(transport).tx).toMatchObject({
+      status: "REPRODUCED",
+      findings: [],
+      exchanges: [{ comparison: "RUNTIME_OUTCOME_NOT_COMPARED" }],
+    });
+
+    // Only a CPMM request in the session window shows that a missing exchange was dispatched.
+    const dropped = sealRun(await genuineRun({ limits: { maxExchangeRecords: 0 } }));
+    const other = copyOf(dropped);
+    reseal(other, SESSION, (s) => {
+      const counts = s.countsByLaneOwnerPurpose as Record<string, number>;
+      for (const w of windowOf(s)) {
+        if (w.purpose !== CPMM_TX_PURPOSE) continue;
+        const from = `${String(w.lane)}|${String(w.owner)}|${String(w.purpose)}`;
+        w.purpose = "OTHER_PURPOSE";
+        const to = `${String(w.lane)}|${String(w.owner)}|OTHER_PURPOSE`;
+        counts[from] = counts[from]! - 1;
+        if (counts[from] === 0) delete counts[from];
+        counts[to] = (counts[to] ?? 0) + 1;
+      }
+    });
+    expect(txOf(other).tx.findings).toEqual(["MISMATCH:REQUEST_MISSING_FOR_FACT"]);
+
+    // Epochs: the notification's, the account() call's and the record's.
+    const noteEpoch = copyOf(dir);
+    reseal(noteEpoch, COL, (c) => {
+      for (const n of get(c, "notifications", "value") as Record<string, unknown>[]) n.epoch = 2;
+    });
+    expect(txOf(noteEpoch).tx.findings).toContain("MISMATCH:NOTIFICATION_IDENTITY");
+    const callEpoch = copyOf(dir);
+    reseal(callEpoch, LEDGER, (l) => {
+      ledgerCalls(l).find((c) => c.kind === "ACCOUNT_CALL")!.epoch = 2;
+    });
+    expect(txOf(callEpoch).tx.findings).toEqual(["MISMATCH:ACCOUNT_CALL_IDENTITY"]);
+    const recordEpoch = copyOf(dir);
+    reseal(recordEpoch, LEDGER, (l) => (ledgerRecords(l)[0]!.epoch = 2));
+    expect(txOf(recordEpoch).tx.findings).toEqual(["MISMATCH:LEDGER_RECORD_IDENTITY"]);
+    // The record's receipt, and a block time the collector never passes.
+    const receipt = copyOf(dir);
+    reseal(receipt, LEDGER, (l) => (ledgerRecords(l)[0]!.hostReceivedAtMs = RECEIVED_AT + 1));
+    expect(txOf(receipt).tx.findings).toEqual(["MISMATCH:LEDGER_RECORD_IDENTITY"]);
+    const blockTime = copyOf(dir);
+    reseal(blockTime, LEDGER, (l) => (ledgerRecords(l)[0]!.notifiedBlockTimeSec = BLOCK_TIME));
+    expect(txOf(blockTime).tx.findings).toEqual(["MISMATCH:LEDGER_RECORD_IDENTITY"]);
+
+    // The settlement: its status and the record sequence it names.
+    for (const [label, mutate] of [
+      ["status", (c: Record<string, unknown>) => (c.status = "DUPLICATE")],
+      ["sequence", (c: Record<string, unknown>) => (c.recordSequence = 99)],
+      ["code", (c: Record<string, unknown>) => (c.factCode = "OTHER_CODE")],
+    ] as [string, (c: Record<string, unknown>) => void][]) {
+      const d = copyOf(dir);
+      reseal(d, LEDGER, (l) =>
+        mutate(ledgerCalls(l).find((c) => c.kind === "ACCOUNT_SETTLEMENT")!),
+      );
+      expect(txOf(d).tx.findings, label).toEqual(["MISMATCH:LEDGER_SETTLEMENT"]);
+    }
+    // The first account() occurrence is the one that binds, not a later duplicate's.
+    const order = copyOf(dir);
+    reseal(order, LEDGER, (l) => {
+      const calls = ledgerCalls(l).filter((c) => c.kind === "ACCOUNT_CALL");
+      expect(calls.length).toBe(2);
+      l.calls = [...ledgerCalls(l)].reverse();
+    });
+    expect(txOf(order).tx.findings).toEqual([]);
+    // A ledger that was not recorded at all: absent calls are missing, never contradictions.
+    const unrecorded = copyOf(dir);
+    reseal(unrecorded, LEDGER, (l) => (l.calls = []));
+    reseal(unrecorded, CPMM_EVIDENCE_FILES.recording, (r) => {
+      r.ledgerRecorded = false;
+      Object.assign(get(r, "retention", "ledgerCalls") as Record<string, unknown>, {
+        observed: 0,
+        retained: 0,
+        dropped: 0,
+      });
+    });
+    expect(txOf(unrecorded).tx.findings).toEqual([
+      "MISSING_EVIDENCE:ACCOUNT_CALL_NOT_RETAINED",
+      "MISSING_EVIDENCE:ACCOUNT_SETTLEMENT_UNAVAILABLE",
+    ]);
+  });
+
+  it("T7: an integrity failure prevents analysis, credentials or not", async () => {
+    const d = copyOf((await shared).dir);
+    const ex = exchangeFile(d);
+    writeFileSync(
+      path.join(d, ...ex.split("/")),
+      `${readFileSync(path.join(d, ...ex.split("/")), "utf8")} `,
+    );
+    for (const options of [undefined, ANALYSIS]) {
+      const v = verifyCpmmObservationEvidence(d, options);
+      expect(v.integrity.ok).toBe(false);
+      expect(v.rederivation).toEqual(NOT_ATTEMPTED);
+      expect(v.flags).toEqual(CPMM_EVIDENCE_FALSE_FLAGS);
+    }
   });
 });

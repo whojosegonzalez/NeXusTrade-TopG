@@ -32,7 +32,12 @@ import {
 } from "../candidate-scanner/CpmmPoolNotificationCollector.js";
 import { adaptRaydiumCpmmPoolState } from "../candidate-scanner/RaydiumCpmmPoolStateAdapter.js";
 import { isValidSolanaSignature } from "../candidate-scanner/ExactPoolHistoryEnumerator.js";
-import { CPMM_TX_PURPOSE } from "../candidate-scanner/RaydiumCpmmTransactionSourceAdapter.js";
+import {
+  CPMM_GET_TRANSACTION_CONFIG,
+  CPMM_MIN_SECRET_CHARS,
+  CPMM_TX_PURPOSE,
+  analyzeCpmmTransactionResponse,
+} from "../candidate-scanner/RaydiumCpmmTransactionSourceAdapter.js";
 import {
   EVIDENCE_SANITIZER_LIMITS,
   deriveEvidenceSecrets,
@@ -1182,6 +1187,53 @@ export interface CpmmCollectorRederivation extends CpmmComponentRederivation {
   readonly countersCompared: boolean;
 }
 
+/** One sealed CPMM exchange: its decoded outcome, the recorded fact and their comparison, apart. */
+export interface CpmmTransactionExchangeResult {
+  readonly seq: number;
+  readonly signature: string | null;
+  /** The accepted analysis of the exact complete response bytes; null when not analysed. */
+  readonly decoded: {
+    readonly kind: string;
+    readonly code: string | null;
+    readonly detail: string | null;
+    readonly replay: string;
+    readonly decoderStatus: string | null;
+    readonly bodyState: string;
+  } | null;
+  /** Why the response was not analysed (a fixed code), or null. */
+  readonly notAnalysed: string | null;
+  /** The ledger's recorded runtime fact for this signature, or null when not available. */
+  readonly recorded: { readonly factKind: string | null; readonly factCode: string | null } | null;
+  readonly comparison:
+    | "MATCHED"
+    | "MISMATCH"
+    | "RUNTIME_OUTCOME_NOT_COMPARED"
+    | "NOT_COMPARED_ANALYSIS_UNAVAILABLE"
+    | "NOT_COMPARED_LIMITED_BY_REDACTION"
+    | "NOT_COMPARED_MISSING_EVIDENCE";
+}
+
+export interface CpmmTransactionRederivation extends CpmmComponentRederivation {
+  /** UNAVAILABLE: no valid analysis credentials, or no reproduced pool context. */
+  readonly analysis: "AVAILABLE" | "UNAVAILABLE";
+  readonly unavailableReason:
+    | "ANALYSIS_CREDENTIALS_NOT_SUPPLIED"
+    | "ANALYSIS_CREDENTIALS_INVALID"
+    | "POOL_CONTEXT_NOT_REPRODUCED"
+    | null;
+  readonly exchanges: readonly CpmmTransactionExchangeResult[];
+  /** Exchanges whose response-dependent fact was compared (matched or not). */
+  readonly comparedExchanges: number;
+  /** Exchanges with a runtime-only fact: listed, never counted as reproduced or contradicted. */
+  readonly runtimeOutcomesNotCompared: number;
+}
+
+/** Explicitly supplied; never read from configuration or the environment, never retained. */
+export interface CpmmEvidenceVerificationOptions {
+  /** The credential values the run's adapter was given (the adapter's own `secrets` rule). */
+  readonly analysisSecrets?: readonly string[];
+}
+
 export interface CpmmRederivation {
   readonly status: "PARTIAL" | "NOT_ATTEMPTED";
   /** The worst result among the implemented components only; never a whole-run claim. */
@@ -1189,7 +1241,7 @@ export interface CpmmRederivation {
   readonly components: {
     readonly poolContext: CpmmComponentRederivation;
     readonly collector: CpmmCollectorRederivation;
-    readonly transactionAnalysis: { readonly status: "NOT_IMPLEMENTED" };
+    readonly transactionAnalysis: CpmmTransactionRederivation;
     readonly ledger: { readonly status: "NOT_IMPLEMENTED" };
     readonly ownerWrapperCrossChecks: { readonly status: "NOT_IMPLEMENTED" };
     readonly runtimeAccounting: { readonly status: "RUNTIME_ACCOUNTING_NOT_REPRODUCED" };
@@ -1755,7 +1807,11 @@ function structureProblems(v: StructureView): string[] {
 }
 
 /** Fail-closed, read-only verification of one sealed run directory. */
-export function verifyCpmmObservationEvidence(outDir: string): CpmmEvidenceVerification {
+export function verifyCpmmObservationEvidence(
+  outDir: string,
+  options?: CpmmEvidenceVerificationOptions,
+): CpmmEvidenceVerification {
+  const credentials = readAnalysisCredentials(options);
   const problems: string[] = [];
   let manifestSha256: string | null = null;
   const result = (
@@ -1926,7 +1982,7 @@ export function verifyCpmmObservationEvidence(outDir: string): CpmmEvidenceVerif
     return result(
       { status: reasons.length === 0 ? "COMPLETE" : "INCOMPLETE", reasons },
       "SUPPLIED_UNVERIFIED",
-      rederive(docs),
+      rederive(docs, credentials),
       claims,
     );
   } catch {
@@ -2354,10 +2410,13 @@ const sameBinding = (a: unknown, b: unknown): boolean =>
  * owners and slots, compared canonically (bigints tagged as sealed) with the recorded adapted pool
  * and with every recorded binding. Provenance stays SUPPLIED_UNVERIFIED whatever the result.
  */
-function rederivePoolContext(
-  docs: Map<string, Record<string, unknown>>,
-): CpmmComponentRederivation {
+function rederivePoolContext(docs: Map<string, Record<string, unknown>>): {
+  readonly result: CpmmComponentRederivation;
+  /** The freshly adapted pool, only when it matched the recorded one with no contradiction. */
+  readonly pool: unknown;
+} {
   const f = new Findings();
+  let adapted: unknown = null;
   const ctx = docs.get(CPMM_EVIDENCE_FILES.poolContext)!;
   const binding = get(docs.get(CPMM_EVIDENCE_FILES.plan), "plan", "binding");
   const target = get(ctx, "target");
@@ -2409,9 +2468,11 @@ function rederivePoolContext(
     else {
       const derived = copyPlain(r, { nodes: SEAL_LIMITS.maxInputNodes }, 0);
       if (canonical(derived) !== canonical(recorded)) f.add("MISMATCH", "ADAPTED_POOL");
+      else adapted = r;
     }
   }
-  return { status: f.status, findings: f.list };
+  const contradicted = f.list.some((x) => x.startsWith("MISMATCH:"));
+  return { result: { status: f.status, findings: f.list }, pool: contradicted ? null : adapted };
 }
 
 /** Collector refusals decided before the receipt is read or the bytes hashed (item G). */
@@ -2822,15 +2883,21 @@ const NOTIFICATION_KEYS = [
 ];
 
 /** Each implemented component in its own guard: an internal failure is never a success. */
-function rederive(docs: Map<string, Record<string, unknown>>): CpmmRederivation {
+function rederive(
+  docs: Map<string, Record<string, unknown>>,
+  credentials: AnalysisCredentials,
+): CpmmRederivation {
   const failed = (): Findings => {
     const f = new Findings();
     f.add("MISMATCH", "REDERIVATION_FAILED");
     return f;
   };
   let poolContext: CpmmComponentRederivation;
+  let pool: unknown = null;
   try {
-    poolContext = rederivePoolContext(docs);
+    const derived = rederivePoolContext(docs);
+    poolContext = derived.result;
+    pool = derived.pool;
   } catch {
     const f = failed();
     poolContext = { status: f.status, findings: f.list };
@@ -2850,16 +2917,403 @@ function rederive(docs: Map<string, Record<string, unknown>>): CpmmRederivation 
       countersCompared: false,
     };
   }
+  let transactionAnalysis: CpmmTransactionRederivation;
+  try {
+    transactionAnalysis = analyzeTransactions(docs, pool, credentials);
+  } catch {
+    const f = failed();
+    transactionAnalysis = {
+      status: f.status,
+      findings: f.list,
+      analysis: "UNAVAILABLE",
+      unavailableReason: null,
+      exchanges: [],
+      comparedExchanges: 0,
+      runtimeOutcomesNotCompared: 0,
+    };
+  }
   return {
     status: "PARTIAL",
-    implementedComponents: worstOf(poolContext.status, collector.status),
+    implementedComponents: worstOf(
+      worstOf(poolContext.status, collector.status),
+      transactionAnalysis.status,
+    ),
     components: {
       poolContext,
       collector,
-      transactionAnalysis: { status: "NOT_IMPLEMENTED" },
+      transactionAnalysis,
       ledger: { status: "NOT_IMPLEMENTED" },
       ownerWrapperCrossChecks: { status: "NOT_IMPLEMENTED" },
       runtimeAccounting: { status: "RUNTIME_ACCOUNTING_NOT_REPRODUCED" },
     },
+  };
+}
+
+// ---------------------------------------------------------------------------------------------
+// Transaction analysis and its binding (items C and G, partial)
+// ---------------------------------------------------------------------------------------------
+
+type AnalysisCredentials =
+  | { readonly status: "SUPPLIED"; readonly secrets: readonly string[] }
+  | { readonly status: "NOT_SUPPLIED" }
+  | { readonly status: "INVALID" };
+
+/**
+ * The supplied analysis credentials, copied through own data properties (no getter or proxy
+ * trap). The adapter's own `secrets` rule is mirrored here (1..64 printable-ASCII strings of at
+ * least `CPMM_MIN_SECRET_CHARS`); the export's own refusal remains authoritative. Never throws.
+ */
+function readAnalysisCredentials(options: unknown): AnalysisCredentials {
+  if (options === undefined) return { status: "NOT_SUPPLIED" };
+  try {
+    const o = plainRecord(options);
+    if (o === null) return { status: "INVALID" };
+    const keys = reflectOwnKeys(o);
+    if (keys.length === 0) return { status: "NOT_SUPPLIED" };
+    if (keys.length !== 1 || keys[0] !== "analysisSecrets") return { status: "INVALID" };
+    const d = getOwnDesc(o, "analysisSecrets")!;
+    if (!("value" in d)) return { status: "INVALID" };
+    const list = d.value as unknown;
+    if (list === undefined) return { status: "NOT_SUPPLIED" };
+    if (typeof list !== "object" || list === null || isProxy(list) || !Array.isArray(list)) {
+      return { status: "INVALID" };
+    }
+    const length = getOwnDesc(list, "length")!.value as number;
+    if (length < 1 || length > 64) return { status: "INVALID" };
+    const secrets: string[] = [];
+    for (let i = 0; i < length; i++) {
+      const e = getOwnDesc(list, String(i));
+      const v = e !== undefined && "value" in e ? (e.value as unknown) : undefined;
+      if (
+        typeof v !== "string" ||
+        v.length < CPMM_MIN_SECRET_CHARS ||
+        v.length > 4096 ||
+        !/^[\x21-\x7e]+$/.test(v)
+      ) {
+        return { status: "INVALID" };
+      }
+      secrets.push(v);
+    }
+    return { status: "SUPPLIED", secrets: Object.freeze(secrets) };
+  } catch {
+    return { status: "INVALID" };
+  }
+}
+
+/** Item G: facts whose kind depends on the response alone, and so are compared with the analysis. */
+const RESPONSE_DEPENDENT_KINDS: ReadonlySet<unknown> = new Set([
+  "MALFORMED_RESPONSE",
+  "EVIDENCE_NOT_REPLAYABLE",
+  "RPC_ERROR",
+  "TRANSACTION_NOT_FOUND",
+  "SIGNATURE_MISMATCH",
+  "METADATA_CONTRADICTION",
+  "RESOLVED_SWAPS",
+  "RESOLVED_NO_TARGET_SWAP",
+  "RECORDED_FAILED_TRANSACTION",
+  "UNRESOLVED",
+]);
+/** Item G: runtime-only facts (lifecycle, transport, evidence, admission): never compared. */
+const RUNTIME_ONLY_KINDS: ReadonlySet<unknown> = new Set([
+  "LATE_RESPONSE",
+  "CANCELLED_IN_FLIGHT",
+  "SESSION_STOPPED_IN_FLIGHT",
+  "TRANSPORT_FAILED",
+  "HTTP_ERROR",
+  "EVIDENCE_MISSING",
+  "EVIDENCE_MISMATCH",
+  "REQUEST_REFUSED",
+  "INVALID_NOTIFICATION",
+  "INVALID_GATE",
+  "DUPLICATE_NOTIFICATION",
+  "TRACKING_CAPACITY_REACHED",
+]);
+/** Facts the adapter records without dispatching a request. */
+const NO_DISPATCH_KINDS: ReadonlySet<unknown> = new Set([
+  "REQUEST_REFUSED",
+  "INVALID_NOTIFICATION",
+  "INVALID_GATE",
+  "DUPLICATE_NOTIFICATION",
+  "TRACKING_CAPACITY_REACHED",
+]);
+const requiresDispatch = (kind: unknown, code: unknown): boolean =>
+  !NO_DISPATCH_KINDS.has(kind) && !(kind === "TRANSPORT_FAILED" && code === "DISPATCH_EXCEPTION");
+
+/** The request body the accepted adapter sends for one signature and id (exact bytes). */
+const expectedRequestBody = (signature: string, id: number): string =>
+  JSON.stringify({
+    jsonrpc: "2.0",
+    id,
+    method: "getTransaction",
+    params: [signature, CPMM_GET_TRANSACTION_CONFIG],
+  });
+
+/**
+ * Transaction-response analysis and its binding (items C and G), over the validated documents:
+ * - binding, independent of analysis and of redaction: one sealed exchange per signature (its
+ *   CPMM purpose is bound by integrity to the session ledger); a POST whose original digest
+ *   equals the accepted adapter's exact `getTransaction` body for that signature, the sealed
+ *   JSON-RPC id and `CPMM_GET_TRANSACTION_CONFIG`; the first retained
+ *   collector notification of that signature; the first `account()` call (receipt and epoch); its
+ *   settlement and the ledger record (sequence, fact, slot, receipt, epoch); dispatch not before
+ *   the notification's receipt; every recorded fact that implies a dispatch has a request, and
+ *   none that does not has one;
+ * - analysis: the accepted `analyzeCpmmTransactionResponse` over exact, complete, unredacted
+ *   response bytes, with the freshly re-adapted pool, the bound notification identity, the sealed
+ *   request id and its body limit, and the supplied credentials;
+ * - comparison: kind and code only for item G's response-dependent facts; runtime-only facts are
+ *   RUNTIME_OUTCOME_NOT_COMPARED whatever the decoded body says.
+ * Decoded outcomes, recorded facts and comparison results are kept apart.
+ */
+function analyzeTransactions(
+  docs: Map<string, Record<string, unknown>>,
+  pool: unknown,
+  credentials: AnalysisCredentials,
+): CpmmTransactionRederivation {
+  const f = new Findings();
+  const plan = get(docs.get(CPMM_EVIDENCE_FILES.plan), "plan");
+  const epoch = get(plan, "epoch");
+  const read = (file: string, section: string): unknown =>
+    get(docs.get(file), section, "status") === "READ"
+      ? get(docs.get(file), section, "value")
+      : undefined;
+  const records = read(CPMM_EVIDENCE_FILES.ledger, "records") as
+    | Record<string, unknown>[]
+    | undefined;
+  const calls = (get(docs.get(CPMM_EVIDENCE_FILES.ledger), "calls") ?? []) as Record<
+    string,
+    unknown
+  >[];
+  const recording = docs.get(CPMM_EVIDENCE_FILES.recording);
+  // Calls not recorded, or some dropped: an absent call is missing, never a contradiction.
+  const callsDropped =
+    get(recording, "ledgerRecorded") !== true ||
+    get(recording, "retention", "ledgerCalls", "dropped") !== 0;
+  const notes = read(CPMM_EVIDENCE_FILES.collector, "notifications") as
+    | Record<string, unknown>[]
+    | undefined;
+  const notesDropped =
+    get(
+      read(CPMM_EVIDENCE_FILES.collector, "counters"),
+      "metadataRetention",
+      "notificationRecordsDropped",
+    ) !== 0;
+  const window = read(CPMM_EVIDENCE_FILES.sessionLedger, "window") as
+    | Record<string, unknown>[]
+    | undefined;
+  const index = get(docs.get(CPMM_EVIDENCE_FILES.exchangeIndex), "exchanges") as unknown[];
+  const sealed = index.map((x) => docs.get(get(x, "path") as string)!);
+
+  let unavailable: CpmmTransactionRederivation["unavailableReason"] =
+    credentials.status === "NOT_SUPPLIED"
+      ? "ANALYSIS_CREDENTIALS_NOT_SUPPLIED"
+      : credentials.status === "INVALID"
+        ? "ANALYSIS_CREDENTIALS_INVALID"
+        : pool === null
+          ? "POOL_CONTEXT_NOT_REPRODUCED"
+          : null;
+
+  // One exchange per signature; every fact that implies a dispatch has one, and none other does.
+  const perSignature = new Map<unknown, number>();
+  for (const ex of sealed) {
+    const sig = get(ex, "entry", "requestedIdentity");
+    perSignature.set(sig, (perSignature.get(sig) ?? 0) + 1);
+  }
+  if ([...perSignature.values()].some((n) => n > 1)) f.add("MISMATCH", "DUPLICATE_EXCHANGE");
+  if (records === undefined) f.add("MISSING_EVIDENCE", "LEDGER_RECORDS_UNAVAILABLE");
+  else {
+    for (const r of records) {
+      const kind = r.factKind;
+      if (kind === null) {
+        f.add("MISSING_EVIDENCE", "LEDGER_FACT_PENDING");
+        continue;
+      }
+      if (!RESPONSE_DEPENDENT_KINDS.has(kind) && !RUNTIME_ONLY_KINDS.has(kind)) {
+        f.add("MISMATCH", "FACT_KIND_UNKNOWN");
+        continue;
+      }
+      const has = perSignature.has(r.signature);
+      if (requiresDispatch(kind, r.factCode) && !has) {
+        const requested =
+          window === undefined ||
+          window.some((e) => e.purpose === CPMM_TX_PURPOSE && e.requestedIdentity === r.signature);
+        // A request the authoritative session ledger shows but the evidence lacks is missing;
+        // a fact that needed a request the session never made is a contradiction.
+        f.add(
+          requested ? "MISSING_EVIDENCE" : "MISMATCH",
+          requested ? "EXCHANGE_NOT_SEALED" : "REQUEST_MISSING_FOR_FACT",
+        );
+      }
+      if (!requiresDispatch(kind, r.factCode) && has)
+        f.add("MISMATCH", "EXCHANGE_WITHOUT_DISPATCH_FACT");
+    }
+  }
+
+  const exchanges: CpmmTransactionExchangeResult[] = [];
+  let compared = 0;
+  let runtimeOnly = 0;
+  for (const ex of sealed) {
+    const entry = get(ex, "entry");
+    const seq = get(entry, "seq") as number;
+    const sig = get(entry, "requestedIdentity");
+    const id = get(entry, "jsonRpcId");
+    const signature = isValidSolanaSignature(sig) ? sig : null;
+    if (signature === null || !isInt(id) || id < 1) f.add("MISMATCH", "EXCHANGE_IDENTITY_INVALID");
+
+    // The request: the original digest against the adapter's exact body (redaction-independent).
+    const rb = get(ex, "requestBody");
+    if (get(ex, "method") !== "POST") f.add("MISMATCH", "REQUEST_METHOD");
+    else if (signature !== null && isInt(id)) {
+      const expected = expectedRequestBody(signature, id);
+      const digest = get(rb, "originalSha256");
+      if (typeof digest !== "string") f.add("MISSING_EVIDENCE", "REQUEST_BODY_UNVERIFIABLE");
+      else if (
+        digest !== sha256(expected) ||
+        get(rb, "originalBytes") !== Buffer.byteLength(expected)
+      ) {
+        f.add("MISMATCH", "REQUEST_BODY");
+      }
+    }
+
+    // The notification, the first account() occurrence, its settlement and the ledger record.
+    const note = notes?.find((n) => n.signature === signature);
+    if (notes === undefined) f.add("MISSING_EVIDENCE", "NOTIFICATIONS_UNAVAILABLE");
+    else if (note === undefined) {
+      f.add(
+        notesDropped ? "MISSING_EVIDENCE" : "MISMATCH",
+        notesDropped ? "NOTIFICATION_NOT_RETAINED" : "NOTIFICATION_MISSING",
+      );
+    } else {
+      if (note.epoch !== epoch) f.add("MISMATCH", "NOTIFICATION_IDENTITY");
+      const dispatched = get(entry, "dispatchedAtMs");
+      if (isInt(dispatched) && isInt(note.receivedAtMs) && dispatched < note.receivedAtMs) {
+        f.add("MISMATCH", "DISPATCH_BEFORE_RECEIPT");
+      }
+    }
+    const firstCall = calls
+      .filter((c) => c.kind === "ACCOUNT_CALL" && c.signature === signature)
+      .sort((a, b) => (a.call as number) - (b.call as number))[0];
+    if (firstCall === undefined) {
+      f.add(
+        callsDropped ? "MISSING_EVIDENCE" : "MISMATCH",
+        callsDropped ? "ACCOUNT_CALL_NOT_RETAINED" : "ACCOUNT_CALL_MISSING",
+      );
+    } else if (
+      firstCall.epoch !== epoch ||
+      (note !== undefined && firstCall.hostReceivedAtMs !== note.receivedAtMs)
+    ) {
+      f.add("MISMATCH", "ACCOUNT_CALL_IDENTITY");
+    }
+    const record = records?.find((r) => r.signature === signature);
+    if (records !== undefined && record === undefined) f.add("MISMATCH", "LEDGER_RECORD_MISSING");
+    if (record !== undefined) {
+      if (
+        record.epoch !== epoch ||
+        // The collector's envelope never carries a block time.
+        record.notifiedBlockTimeSec !== null ||
+        (note !== undefined &&
+          (record.notifiedSlot !== note.slot || record.hostReceivedAtMs !== note.receivedAtMs))
+      ) {
+        f.add("MISMATCH", "LEDGER_RECORD_IDENTITY");
+      }
+      const settlement =
+        firstCall === undefined
+          ? undefined
+          : calls.find((c) => c.kind === "ACCOUNT_SETTLEMENT" && c.call === firstCall.call);
+      if (settlement === undefined) {
+        f.add("MISSING_EVIDENCE", "ACCOUNT_SETTLEMENT_UNAVAILABLE");
+      } else if (
+        settlement.status !== "RECORDED" ||
+        settlement.recordSequence !== record.sequence ||
+        settlement.factKind !== record.factKind ||
+        settlement.factCode !== record.factCode
+      ) {
+        f.add("MISMATCH", "LEDGER_SETTLEMENT");
+      }
+    }
+    const recorded =
+      record === undefined
+        ? null
+        : {
+            factKind: typeof record.factKind === "string" ? record.factKind : null,
+            factCode: typeof record.factCode === "string" ? record.factCode : null,
+          };
+
+    // The analysis: only exact, complete, unredacted response bytes.
+    let notAnalysed: string | null = null;
+    let decoded: CpmmTransactionExchangeResult["decoded"] = null;
+    const body = exactBytes(get(ex, "body"));
+    if (unavailable !== null) notAnalysed = unavailable;
+    else if (get(ex, "bodyState") !== "COMPLETE")
+      notAnalysed = `BODY_${String(get(ex, "bodyState"))}`;
+    else if ("missing" in body) notAnalysed = `BODY_${body.missing}`;
+    else if (note === undefined || signature === null || !isInt(id))
+      notAnalysed = "BINDING_UNAVAILABLE";
+    else {
+      const a = analyzeCpmmTransactionResponse({
+        notification: { signature, slot: note.slot, receivedAtMs: note.receivedAtMs },
+        jsonRpcId: id,
+        pool,
+        responseBytes: body.bytes,
+        maxResponseBytes: get(ex, "maxResponseBytes"),
+        secrets: credentials.status === "SUPPLIED" ? credentials.secrets : [],
+      }) as unknown as Record<string, unknown>;
+      if (a.status !== "ANALYZED") {
+        if (a.code === "SECRETS_INVALID") {
+          unavailable = "ANALYSIS_CREDENTIALS_INVALID";
+          notAnalysed = unavailable;
+        } else {
+          notAnalysed = "ANALYSIS_INPUT_INVALID";
+          f.add("MISMATCH", "ANALYSIS_INPUT_INVALID");
+        }
+      } else {
+        decoded = {
+          kind: a.kind as string,
+          code: (a.code as string | null) ?? null,
+          detail: (a.detail as string | null) ?? null,
+          replay: a.replay as string,
+          decoderStatus: (get(a, "decoder", "status") as string | undefined) ?? null,
+          bodyState: get(a, "body", "state") as string,
+        };
+      }
+    }
+
+    // The comparison, for response-dependent facts only.
+    let comparison: CpmmTransactionExchangeResult["comparison"];
+    if (recorded === null || recorded.factKind === null) {
+      comparison = "NOT_COMPARED_MISSING_EVIDENCE";
+    } else if (RUNTIME_ONLY_KINDS.has(recorded.factKind)) {
+      comparison = "RUNTIME_OUTCOME_NOT_COMPARED";
+      runtimeOnly++;
+    } else if (decoded !== null) {
+      compared++;
+      const same = decoded.kind === recorded.factKind && decoded.code === recorded.factCode;
+      comparison = same ? "MATCHED" : "MISMATCH";
+      if (!same) f.add("MISMATCH", "FACT_MISMATCH");
+    } else if (notAnalysed === "BODY_REDACTED") {
+      comparison = "NOT_COMPARED_LIMITED_BY_REDACTION";
+      f.add("LIMITED_BY_REDACTION", "RESPONSE_BODY_REDACTED");
+    } else if (notAnalysed === unavailable && unavailable !== null) {
+      comparison = "NOT_COMPARED_ANALYSIS_UNAVAILABLE";
+      f.add("MISSING_EVIDENCE", unavailable);
+    } else {
+      comparison = "NOT_COMPARED_MISSING_EVIDENCE";
+      // A refused analysis input is already a contradiction; anything else is missing material.
+      if (notAnalysed !== "ANALYSIS_INPUT_INVALID") {
+        f.add("MISSING_EVIDENCE", `RESPONSE_${notAnalysed ?? "NOT_ANALYSED"}`);
+      }
+    }
+    exchanges.push({ seq, signature, decoded, notAnalysed, recorded, comparison });
+  }
+  // No analysis at all is missing evidence whenever there is a response to analyse.
+  if (unavailable !== null && sealed.length > 0) f.add("MISSING_EVIDENCE", unavailable);
+  return {
+    status: f.status,
+    findings: f.list,
+    analysis: unavailable === null ? "AVAILABLE" : "UNAVAILABLE",
+    unavailableReason: unavailable,
+    exchanges,
+    comparedExchanges: compared,
+    runtimeOutcomesNotCompared: runtimeOnly,
   };
 }
