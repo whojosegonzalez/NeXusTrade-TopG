@@ -1210,7 +1210,9 @@ export interface CpmmTransactionExchangeResult {
     | "RUNTIME_OUTCOME_NOT_COMPARED"
     | "NOT_COMPARED_ANALYSIS_UNAVAILABLE"
     | "NOT_COMPARED_LIMITED_BY_REDACTION"
-    | "NOT_COMPARED_MISSING_EVIDENCE";
+    | "NOT_COMPARED_MISSING_EVIDENCE"
+    /** The account call, settlement or ledger record binding this exchange is contradicted. */
+    | "NOT_COMPARED_BINDING_CONTRADICTED";
 }
 
 export interface CpmmTransactionRederivation extends CpmmComponentRederivation {
@@ -3039,6 +3041,45 @@ const NO_DISPATCH_KINDS: ReadonlySet<unknown> = new Set([
 const requiresDispatch = (kind: unknown, code: unknown): boolean =>
   !NO_DISPATCH_KINDS.has(kind) && !(kind === "TRANSPORT_FAILED" && code === "DISPATCH_EXCEPTION");
 
+const codeOrNull = (v: unknown): boolean =>
+  v === null || (typeof v === "string" && FIXED_CODE.test(v));
+const positiveInt = (v: unknown): v is number => isInt(v) && v >= 1;
+
+/** A ledger record's fields used by the binding: required, in their domains. */
+const ledgerRecordValid = (r: Record<string, unknown>): boolean =>
+  positiveInt(r.sequence) &&
+  isValidSolanaSignature(r.signature) &&
+  isInt(r.epoch) &&
+  positiveInt(r.hostReceivedAtMs) &&
+  isInt(r.notifiedSlot) &&
+  (r.notifiedBlockTimeSec === null || isInt(r.notifiedBlockTimeSec)) &&
+  codeOrNull(r.factKind) &&
+  codeOrNull(r.factCode) &&
+  typeof r.disposition === "string" &&
+  FIXED_CODE.test(r.disposition);
+
+/** A recorded `account()` call: required fields in their domains. */
+const accountCallValid = (c: Record<string, unknown>): boolean =>
+  positiveInt(c.call) &&
+  isInt(c.epoch) &&
+  positiveInt(c.hostReceivedAtMs) &&
+  (c.outcome === "RETURNED" || c.outcome === "THREW" || c.outcome === "IN_PROGRESS");
+
+/**
+ * A `RECORDED` first-occurrence settlement: every record field in its domain, and no
+ * duplicate or refusal field.
+ */
+const recordedSettlementValid = (c: Record<string, unknown>): boolean =>
+  positiveInt(c.occurrence) &&
+  positiveInt(c.recordSequence) &&
+  isValidSolanaSignature(c.signature) &&
+  typeof c.disposition === "string" &&
+  FIXED_CODE.test(c.disposition) &&
+  codeOrNull(c.factKind) &&
+  codeOrNull(c.factCode) &&
+  c.firstSequence === null &&
+  c.code === null;
+
 /** The request body the accepted adapter sends for one signature and id (exact bytes). */
 const expectedRequestBody = (signature: string, id: number): string =>
   JSON.stringify({
@@ -3120,9 +3161,32 @@ function analyzeTransactions(
     perSignature.set(sig, (perSignature.get(sig) ?? 0) + 1);
   }
   if ([...perSignature.values()].some((n) => n > 1)) f.add("MISMATCH", "DUPLICATE_EXCHANGE");
+  // The ledger records used by the binding: valid, and one per signature and per sequence. A
+  // malformed record whose signature cannot be read could belong to any exchange.
+  const validRecords: Record<string, unknown>[] = [];
+  const malformedSignatures = new Set<unknown>();
+  let unattributableMalformed = false;
+  for (const r of records ?? []) {
+    if (isRec(r) && ledgerRecordValid(r)) validRecords.push(r);
+    else {
+      f.add("MISMATCH", "LEDGER_RECORD_MALFORMED");
+      if (isRec(r) && isValidSolanaSignature(r.signature)) malformedSignatures.add(r.signature);
+      else unattributableMalformed = true;
+    }
+  }
+  const countBy = (key: string): Map<unknown, number> => {
+    const m = new Map<unknown, number>();
+    for (const r of validRecords) m.set(r[key], (m.get(r[key]) ?? 0) + 1);
+    return m;
+  };
+  const recordsPerSignature = countBy("signature");
+  const recordsPerSequence = countBy("sequence");
+  const ambiguous = (r: Record<string, unknown>): boolean =>
+    recordsPerSignature.get(r.signature)! > 1 || recordsPerSequence.get(r.sequence)! > 1;
+  if (validRecords.some(ambiguous)) f.add("MISMATCH", "LEDGER_RECORD_AMBIGUOUS");
   if (records === undefined) f.add("MISSING_EVIDENCE", "LEDGER_RECORDS_UNAVAILABLE");
   else {
-    for (const r of records) {
+    for (const r of validRecords) {
       const kind = r.factKind;
       if (kind === null) {
         f.add("MISSING_EVIDENCE", "LEDGER_FACT_PENDING");
@@ -3190,66 +3254,131 @@ function analyzeTransactions(
         f.add("MISMATCH", "DISPATCH_BEFORE_RECEIPT");
       }
     }
-    const firstCall = calls
-      .filter((c) => c.kind === "ACCOUNT_CALL" && c.signature === signature)
-      .sort((a, b) => (a.call as number) - (b.call as number))[0];
-    if (firstCall === undefined) {
-      f.add(
-        callsDropped ? "MISSING_EVIDENCE" : "MISMATCH",
-        callsDropped ? "ACCOUNT_CALL_NOT_RETAINED" : "ACCOUNT_CALL_MISSING",
-      );
-    } else if (
-      firstCall.epoch !== epoch ||
-      (note !== undefined && firstCall.hostReceivedAtMs !== note.receivedAtMs)
-    ) {
-      f.add("MISMATCH", "ACCOUNT_CALL_IDENTITY");
+    // The ledger link: the first account() call, its single settlement and the single ledger
+    // record, each structurally valid. Any contradiction here stops the fact's comparison.
+    let linkContradicted = false;
+    const contradict = (code: string): void => {
+      f.add("MISMATCH", code);
+      linkContradicted = true;
+    };
+    const candidates = calls.filter((c) => c.kind === "ACCOUNT_CALL" && c.signature === signature);
+    let firstCall: Record<string, unknown> | undefined;
+    if (candidates.some((c) => !accountCallValid(c))) contradict("ACCOUNT_CALL_MALFORMED");
+    else {
+      for (const c of candidates) {
+        if (firstCall === undefined || (c.call as number) < (firstCall.call as number))
+          firstCall = c;
+      }
     }
-    const record = records?.find((r) => r.signature === signature);
-    if (records !== undefined && record === undefined) f.add("MISMATCH", "LEDGER_RECORD_MISSING");
-    if (record !== undefined) {
+    let callReturned = false;
+    if (firstCall === undefined) {
+      if (candidates.length === 0) {
+        if (callsDropped) f.add("MISSING_EVIDENCE", "ACCOUNT_CALL_NOT_RETAINED");
+        else contradict("ACCOUNT_CALL_MISSING");
+      }
+    } else if (
+      calls.filter((c) => c.kind === "ACCOUNT_CALL" && c.call === firstCall.call).length > 1
+    ) {
+      contradict("ACCOUNT_CALL_AMBIGUOUS");
+    } else if (firstCall.outcome === "THREW") {
+      // A first occurrence that threw cannot have produced the record the ledger holds.
+      contradict("ACCOUNT_CALL_MALFORMED");
+    } else {
       if (
-        record.epoch !== epoch ||
+        firstCall.epoch !== epoch ||
+        (note !== undefined && firstCall.hostReceivedAtMs !== note.receivedAtMs)
+      ) {
+        contradict("ACCOUNT_CALL_IDENTITY");
+      }
+      if (firstCall.outcome === "IN_PROGRESS") {
+        f.add("MISSING_EVIDENCE", "ACCOUNT_CALL_IN_PROGRESS");
+      } else callReturned = true;
+    }
+
+    const own = validRecords.filter((r) => r.signature === signature);
+    const recordMalformed = unattributableMalformed || malformedSignatures.has(signature);
+    if (recordMalformed) linkContradicted = true;
+    let record: Record<string, unknown> | undefined;
+    if (own.length > 1 || own.some(ambiguous)) linkContradicted = true;
+    else if (own.length === 1) record = own[0];
+    else if (records !== undefined && !recordMalformed) contradict("LEDGER_RECORD_MISSING");
+    if (
+      record !== undefined &&
+      (record.epoch !== epoch ||
         // The collector's envelope never carries a block time.
         record.notifiedBlockTimeSec !== null ||
         (note !== undefined &&
-          (record.notifiedSlot !== note.slot || record.hostReceivedAtMs !== note.receivedAtMs))
-      ) {
-        f.add("MISMATCH", "LEDGER_RECORD_IDENTITY");
-      }
-      const settlement =
-        firstCall === undefined
-          ? undefined
-          : calls.find((c) => c.kind === "ACCOUNT_SETTLEMENT" && c.call === firstCall.call);
-      if (settlement === undefined) {
+          (record.notifiedSlot !== note.slot || record.hostReceivedAtMs !== note.receivedAtMs)))
+    ) {
+      contradict("LEDGER_RECORD_IDENTITY");
+    }
+
+    if (firstCall === undefined) {
+      // No call to settle: the settlement cannot be located.
+      if (candidates.length === 0 && record !== undefined) {
         f.add("MISSING_EVIDENCE", "ACCOUNT_SETTLEMENT_UNAVAILABLE");
+      }
+    } else if (callReturned) {
+      const settlements = calls.filter(
+        (c) => c.kind === "ACCOUNT_SETTLEMENT" && c.call === firstCall.call,
+      );
+      const settled = settlements[0];
+      if (settlements.length > 1) contradict("ACCOUNT_SETTLEMENT_AMBIGUOUS");
+      else if (settled === undefined) {
+        // Missing only when the recorder dropped calls or settlements were still pending.
+        if (callsDropped || get(recording, "pending", "accountSettlementsPending") !== 0) {
+          f.add("MISSING_EVIDENCE", "ACCOUNT_SETTLEMENT_UNAVAILABLE");
+        } else contradict("ACCOUNT_SETTLEMENT_MISSING");
       } else if (
-        settlement.status !== "RECORDED" ||
-        settlement.recordSequence !== record.sequence ||
-        settlement.factKind !== record.factKind ||
-        settlement.factCode !== record.factCode
+        settled.outcome !== "FULFILLED" ||
+        !codeOrNull(settled.status) ||
+        settled.status === null
       ) {
-        f.add("MISMATCH", "LEDGER_SETTLEMENT");
+        // A rejection carries no status; a fulfilment always has one.
+        contradict("ACCOUNT_SETTLEMENT_MALFORMED");
+      } else if (settled.status !== "RECORDED") {
+        contradict("LEDGER_SETTLEMENT");
+      } else if (!recordedSettlementValid(settled)) {
+        contradict("ACCOUNT_SETTLEMENT_MALFORMED");
+      } else if (
+        settled.signature !== signature ||
+        (record !== undefined &&
+          (settled.recordSequence !== record.sequence ||
+            settled.factKind !== record.factKind ||
+            settled.factCode !== record.factCode))
+      ) {
+        contradict("LEDGER_SETTLEMENT");
       }
     }
     const recorded =
       record === undefined
         ? null
         : {
-            factKind: typeof record.factKind === "string" ? record.factKind : null,
-            factCode: typeof record.factCode === "string" ? record.factCode : null,
+            factKind: record.factKind as string | null,
+            factCode: record.factCode as string | null,
           };
 
-    // The analysis: only exact, complete, unredacted response bytes.
-    let notAnalysed: string | null = null;
-    let decoded: CpmmTransactionExchangeResult["decoded"] = null;
+    // The response material, assessed for every exchange whatever its recorded fact: only
+    // exact, complete, unredacted bytes are available.
+    const state = get(ex, "bodyState");
     const body = exactBytes(get(ex, "body"));
-    if (unavailable !== null) notAnalysed = unavailable;
-    else if (get(ex, "bodyState") !== "COMPLETE")
-      notAnalysed = `BODY_${String(get(ex, "bodyState"))}`;
-    else if ("missing" in body) notAnalysed = `BODY_${body.missing}`;
-    else if (note === undefined || signature === null || !isInt(id))
+    const material: string | null =
+      state !== "COMPLETE"
+        ? `BODY_${String(state)}`
+        : "missing" in body
+          ? `BODY_${body.missing}`
+          : null;
+    if (material === "BODY_REDACTED") f.add("LIMITED_BY_REDACTION", "RESPONSE_BODY_REDACTED");
+    else if (material !== null) f.add("MISSING_EVIDENCE", `RESPONSE_${material}`);
+
+    // The analysis of those bytes.
+    let notAnalysed: string | null = material ?? unavailable;
+    let decoded: CpmmTransactionExchangeResult["decoded"] = null;
+    if (notAnalysed !== null || "missing" in body) {
+      // Not analysable: the material or the analysis is unavailable (above).
+    } else if (note === undefined || signature === null || !isInt(id)) {
       notAnalysed = "BINDING_UNAVAILABLE";
-    else {
+    } else {
       const a = analyzeCpmmTransactionResponse({
         notification: { signature, slot: note.slot, receivedAtMs: note.receivedAtMs },
         jsonRpcId: id,
@@ -3278,9 +3407,11 @@ function analyzeTransactions(
       }
     }
 
-    // The comparison, for response-dependent facts only.
+    // The comparison: response-dependent facts only, over an intact ledger link.
     let comparison: CpmmTransactionExchangeResult["comparison"];
-    if (recorded === null || recorded.factKind === null) {
+    if (linkContradicted) {
+      comparison = "NOT_COMPARED_BINDING_CONTRADICTED";
+    } else if (recorded === null || recorded.factKind === null) {
       comparison = "NOT_COMPARED_MISSING_EVIDENCE";
     } else if (RUNTIME_ONLY_KINDS.has(recorded.factKind)) {
       comparison = "RUNTIME_OUTCOME_NOT_COMPARED";
@@ -3290,17 +3421,18 @@ function analyzeTransactions(
       const same = decoded.kind === recorded.factKind && decoded.code === recorded.factCode;
       comparison = same ? "MATCHED" : "MISMATCH";
       if (!same) f.add("MISMATCH", "FACT_MISMATCH");
-    } else if (notAnalysed === "BODY_REDACTED") {
+    } else if (material === "BODY_REDACTED") {
       comparison = "NOT_COMPARED_LIMITED_BY_REDACTION";
-      f.add("LIMITED_BY_REDACTION", "RESPONSE_BODY_REDACTED");
+    } else if (material !== null) {
+      comparison = "NOT_COMPARED_MISSING_EVIDENCE";
     } else if (notAnalysed === unavailable && unavailable !== null) {
       comparison = "NOT_COMPARED_ANALYSIS_UNAVAILABLE";
       f.add("MISSING_EVIDENCE", unavailable);
     } else {
       comparison = "NOT_COMPARED_MISSING_EVIDENCE";
-      // A refused analysis input is already a contradiction; anything else is missing material.
-      if (notAnalysed !== "ANALYSIS_INPUT_INVALID") {
-        f.add("MISSING_EVIDENCE", `RESPONSE_${notAnalysed ?? "NOT_ANALYSED"}`);
+      // A refused analysis input is already a contradiction.
+      if (notAnalysed === "BINDING_UNAVAILABLE") {
+        f.add("MISSING_EVIDENCE", "RESPONSE_BINDING_UNAVAILABLE");
       }
     }
     exchanges.push({ seq, signature, decoded, notAnalysed, recorded, comparison });

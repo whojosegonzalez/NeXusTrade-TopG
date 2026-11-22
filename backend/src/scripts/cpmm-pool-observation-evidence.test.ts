@@ -766,6 +766,11 @@ const UNCREDENTIALED = {
   analysis: "UNAVAILABLE",
   unavailableReason: "ANALYSIS_CREDENTIALS_NOT_SUPPLIED",
 };
+/** Without credentials, over response material that is itself missing or redacted. */
+const uncredentialed = (...material: string[]) => ({
+  ...UNCREDENTIALED,
+  findings: [...material, "MISSING_EVIDENCE:ANALYSIS_CREDENTIALS_NOT_SUPPLIED"],
+});
 /** Credentialed verification of the clean run: one bound swap, decoded and matched. */
 const MATCHED_SWAP = {
   status: "REPRODUCED",
@@ -1686,7 +1691,8 @@ describe("Structural and retention boundaries (review of 84546f3)", () => {
       expect(v.integrity).toEqual({ ok: true, problems: [] });
       expect(v.retention.status).toBe("INCOMPLETE");
       expect(v.retention.reasons).toContain(reason);
-      expectReproduced(v);
+      // The missing response material is reported, whatever the recorded fact (review of 0375e1a).
+      expectReproduced(v, uncredentialed(`MISSING_EVIDENCE:RESPONSE_BODY_${state}`));
       expect(v.flags).toEqual(CPMM_EVIDENCE_FALSE_FLAGS);
     }
   });
@@ -2190,7 +2196,12 @@ describe("Response-limit relationships (review of 55daf13)", () => {
         status: reasons.length === 0 ? "COMPLETE" : "INCOMPLETE",
         reasons,
       });
-      expectReproduced(v);
+      expectReproduced(
+        v,
+        state === "COMPLETE"
+          ? UNCREDENTIALED
+          : uncredentialed(`MISSING_EVIDENCE:RESPONSE_BODY_${state}`),
+      );
       expect(v.flags).toEqual(CPMM_EVIDENCE_FALSE_FLAGS);
     }
     // Redaction changes the stored length; the rules compare original byte counts.
@@ -2796,10 +2807,11 @@ describe("Re-derivation, partial (item G): pool context and collector replay", (
       expect(v.retention.status).toBe("INCOMPLETE");
       expect(poolContext.status).toBe("REPRODUCED");
       expect(collector.status).toBe("REPRODUCED");
-      // A runtime-only fact over an incomplete body: bound, listed, never compared or upgraded.
+      // A runtime-only fact over an incomplete body: bound, listed, never compared or upgraded,
+      // and the missing response material reported as such (review of 0375e1a).
       expect(transactionAnalysis).toMatchObject({
-        status: "REPRODUCED",
-        findings: [],
+        status: "MISSING_EVIDENCE",
+        findings: [`MISSING_EVIDENCE:RESPONSE_${notAnalysed}`],
         analysis: "AVAILABLE",
         comparedExchanges: 0,
         runtimeOutcomesNotCompared: 1,
@@ -3387,7 +3399,7 @@ describe("Transaction analysis and binding (items C and G, partial)", () => {
       decoded: null,
       notAnalysed: "BINDING_UNAVAILABLE",
       recorded: null,
-      comparison: "NOT_COMPARED_MISSING_EVIDENCE",
+      comparison: "NOT_COMPARED_BINDING_CONTRADICTED",
     });
 
     // Slot metadata: the ledger's notified slot, then the collector's notification slot.
@@ -3401,10 +3413,13 @@ describe("Transaction analysis and binding (items C and G, partial)", () => {
       }
     });
     const bySlot = txOf(noteSlot);
-    expect(bySlot.tx.findings).toEqual(
-      expect.arrayContaining(["MISMATCH:LEDGER_RECORD_IDENTITY", "MISMATCH:FACT_MISMATCH"]),
-    );
-    expect(bySlot.tx.exchanges[0]!.decoded).toMatchObject({ kind: "METADATA_CONTRADICTION" });
+    // The record no longer binds, so its fact is not compared; the analysis still decodes the
+    // contradiction between the response's slot and the notification's.
+    expect(bySlot.tx.findings).toEqual(["MISMATCH:LEDGER_RECORD_IDENTITY"]);
+    expect(bySlot.tx.exchanges[0]).toMatchObject({
+      decoded: { kind: "METADATA_CONTRADICTION" },
+      comparison: "NOT_COMPARED_BINDING_CONTRADICTED",
+    });
     // The collector replay finds its own contradiction independently.
     expect(bySlot.v.rederivation.components!.collector.status).toBe("MISMATCH");
   });
@@ -3467,7 +3482,7 @@ describe("Transaction analysis and binding (items C and G, partial)", () => {
     reseal(noRecord, LEDGER, (l) => (ledgerRecords(l)[0]!.signature = signatureOf(3)));
     expect(txOf(noRecord).tx.exchanges[0]).toMatchObject({
       recorded: null,
-      comparison: "NOT_COMPARED_MISSING_EVIDENCE",
+      comparison: "NOT_COMPARED_BINDING_CONTRADICTED",
     });
     const noCall = copyOf(dir);
     reseal(noCall, LEDGER, (l) => {
@@ -3722,7 +3737,8 @@ describe("Transaction analysis and binding (items C and G, partial)", () => {
     );
     expect(pendingTx.exchanges[0]).toMatchObject({
       recorded: { factKind: null },
-      comparison: "NOT_COMPARED_MISSING_EVIDENCE",
+      // The settlement's fact contradicts the pending record, so nothing is compared.
+      comparison: "NOT_COMPARED_BINDING_CONTRADICTED",
     });
 
     // Records the recorder or the collector dropped are missing, never contradictions.
@@ -3869,5 +3885,270 @@ describe("Transaction analysis and binding (items C and G, partial)", () => {
       expect(v.rederivation).toEqual(NOT_ATTEMPTED);
       expect(v.flags).toEqual(CPMM_EVIDENCE_FALSE_FLAGS);
     }
+  });
+
+  // --- review of 0375e1a ------------------------------------------------------------------------
+
+  it("R1: response material is assessed apart from the comparison category", async () => {
+    const late = (clock: { now: number }) => (clock.now = OBS_START + 600_000);
+    const secretBody = respond((sig) => {
+      const t = txResult(sig) as { meta: { logMessages: string[] } };
+      t.meta.logMessages.push(`Program log: ${SECRET}`);
+      return t;
+    });
+    const cases: [string, Parameters<typeof genuineRun>[0], string, string][] = [
+      [
+        "overflow",
+        { responder: async () => new Response("x".repeat(200_001), { status: 200 }) },
+        "MISSING_EVIDENCE:RESPONSE_BODY_PARTIAL_OVERFLOW",
+        "TRANSPORT_FAILED",
+      ],
+      [
+        "network failure",
+        {
+          responder: async () => {
+            throw new Error("transport failure");
+          },
+        },
+        "MISSING_EVIDENCE:RESPONSE_BODY_NOT_READ",
+        "TRANSPORT_FAILED",
+      ],
+      [
+        "late, omitted body",
+        { onExchange: late, limits: { maxExchangeBodyBytes: 64 } },
+        "MISSING_EVIDENCE:RESPONSE_BODY_UNAVAILABLE",
+        "LATE_RESPONSE",
+      ],
+      [
+        "late, redacted body",
+        { onExchange: late, responder: secretBody },
+        "LIMITED_BY_REDACTION:RESPONSE_BODY_REDACTED",
+        "LATE_RESPONSE",
+      ],
+    ];
+    for (const [label, options, finding, kind] of cases) {
+      const dir = sealRun(await genuineRun(options));
+      const { tx, v } = txOf(dir);
+      expect(tx, label).toMatchObject({
+        status: finding.split(":")[0],
+        findings: [finding],
+        analysis: "AVAILABLE",
+        comparedExchanges: 0,
+        runtimeOutcomesNotCompared: 1,
+        exchanges: [
+          {
+            decoded: null,
+            recorded: { factKind: kind },
+            comparison: "RUNTIME_OUTCOME_NOT_COMPARED",
+          },
+        ],
+      });
+      expect(v.rederivation.implementedComponents, label).toBe(finding.split(":")[0]);
+      // Without credentials the material finding stays, beside the unavailability, and the
+      // missing material (not the credentials) is why this body was not analysed.
+      const uncredentialedTx = txOf(dir, undefined).tx;
+      expect(uncredentialedTx.findings, label).toEqual([
+        finding,
+        "MISSING_EVIDENCE:ANALYSIS_CREDENTIALS_NOT_SUPPLIED",
+      ]);
+      expect(uncredentialedTx.exchanges[0]!.notAnalysed, label).toBe(
+        finding.split(":RESPONSE_")[1],
+      );
+    }
+    // Control: an intact late body decodes, is listed and is not compared.
+    const intact = sealRun(await genuineRun({ onExchange: late }));
+    expect(txOf(intact).tx).toMatchObject({
+      status: "REPRODUCED",
+      findings: [],
+      comparedExchanges: 0,
+      runtimeOutcomesNotCompared: 1,
+      exchanges: [
+        {
+          decoded: { kind: "RESOLVED_SWAPS" },
+          recorded: { factKind: "LATE_RESPONSE" },
+          comparison: "RUNTIME_OUTCOME_NOT_COMPARED",
+        },
+      ],
+    });
+  });
+
+  it("R2: the account call, settlement and ledger record used by the binding are valid and unambiguous", async () => {
+    const { dir } = await shared;
+    const REC = CPMM_EVIDENCE_FILES.recording;
+    const settlementOf = (l: Record<string, unknown>) =>
+      ledgerCalls(l).find((c) => c.kind === "ACCOUNT_SETTLEMENT" && c.status === "RECORDED")!;
+    const firstCallOf = (l: Record<string, unknown>) =>
+      ledgerCalls(l).find((c) => c.kind === "ACCOUNT_CALL")!;
+    /** Adds or removes ledger-call records, keeping the recorder's counts consistent. */
+    const editCalls = (d: string, mutate: (calls: Record<string, unknown>[]) => void) => {
+      let delta = 0;
+      reseal(d, LEDGER, (l) => {
+        const before = ledgerCalls(l).length;
+        mutate(ledgerCalls(l));
+        delta = ledgerCalls(l).length - before;
+      });
+      reseal(d, REC, (r) => {
+        const stats = get(r, "retention", "ledgerCalls") as Record<string, number>;
+        stats.observed! += delta;
+        stats.retained! += delta;
+      });
+    };
+    const contradicted = (d: string, label: string, findings: string[]) => {
+      const { tx } = txOf(d);
+      expect(tx.status, label).toBe("MISMATCH");
+      expect(tx.findings, label).toEqual(findings);
+      expect(tx.comparedExchanges, label).toBe(0);
+      expect(tx.exchanges[0]!.comparison, label).toBe("NOT_COMPARED_BINDING_CONTRADICTED");
+      expect(tx.exchanges[0]!.decoded, label).toMatchObject({ kind: "RESOLVED_SWAPS" });
+    };
+
+    // The review's four reproductions.
+    const ledgerCases: [string, (l: Record<string, unknown>) => void, string[]][] = [
+      [
+        "settlement signature",
+        (l) => (settlementOf(l).signature = signatureOf(2)),
+        ["MISMATCH:LEDGER_SETTLEMENT"],
+      ],
+      [
+        "rejected yet recorded",
+        (l) => (settlementOf(l).outcome = "REJECTED"),
+        ["MISMATCH:ACCOUNT_SETTLEMENT_MALFORMED"],
+      ],
+      [
+        "second record for the signature",
+        (l) =>
+          ledgerRecords(l).push({
+            ...ledgerRecords(l)[0]!,
+            sequence: 2,
+            factKind: "TRANSACTION_NOT_FOUND",
+            factCode: null,
+          }),
+        ["MISMATCH:LEDGER_RECORD_AMBIGUOUS"],
+      ],
+      [
+        "sequences deleted",
+        (l) => {
+          delete ledgerRecords(l)[0]!.sequence;
+          delete settlementOf(l).recordSequence;
+        },
+        ["MISMATCH:LEDGER_RECORD_MALFORMED", "MISMATCH:ACCOUNT_SETTLEMENT_MALFORMED"],
+      ],
+      // Further domains and relationships of the same three records.
+      [
+        "record fact not a code",
+        (l) => (ledgerRecords(l)[0]!.factKind = 5),
+        ["MISMATCH:LEDGER_RECORD_MALFORMED"],
+      ],
+      [
+        "record signature invalid",
+        (l) => (ledgerRecords(l)[0]!.signature = "not-a-signature"),
+        ["MISMATCH:LEDGER_RECORD_MALFORMED"],
+      ],
+      [
+        "two records, one sequence",
+        (l) =>
+          ledgerRecords(l).push({
+            ...ledgerRecords(l)[0]!,
+            signature: signatureOf(2),
+          }),
+        // The second record's fact also lacks a request of its own.
+        ["MISMATCH:LEDGER_RECORD_AMBIGUOUS", "MISMATCH:REQUEST_MISSING_FOR_FACT"],
+      ],
+      [
+        "settlement sequence a string",
+        (l) => (settlementOf(l).recordSequence = "1"),
+        ["MISMATCH:ACCOUNT_SETTLEMENT_MALFORMED"],
+      ],
+      [
+        "settlement with a duplicate's field",
+        (l) => (settlementOf(l).firstSequence = 1),
+        ["MISMATCH:ACCOUNT_SETTLEMENT_MALFORMED"],
+      ],
+      [
+        "settlement status missing",
+        (l) => (settlementOf(l).status = null),
+        ["MISMATCH:ACCOUNT_SETTLEMENT_MALFORMED"],
+      ],
+      [
+        "call receipt not an integer",
+        (l) => (firstCallOf(l).hostReceivedAtMs = RECEIVED_AT + 0.5),
+        ["MISMATCH:ACCOUNT_CALL_MALFORMED"],
+      ],
+      [
+        "call threw",
+        (l) => (firstCallOf(l).outcome = "THREW"),
+        ["MISMATCH:ACCOUNT_CALL_MALFORMED"],
+      ],
+    ];
+    for (const [label, mutate, findings] of ledgerCases) {
+      const d = copyOf(dir);
+      reseal(d, LEDGER, mutate);
+      contradicted(d, label, findings);
+    }
+
+    // Competing records added consistently: a second call with the same number, a second
+    // settlement for the first call; and a settlement removed with nothing pending or dropped.
+    const twoCalls = copyOf(dir);
+    editCalls(twoCalls, (calls) =>
+      calls.push({ ...calls.find((c) => c.kind === "ACCOUNT_CALL")! }),
+    );
+    contradicted(twoCalls, "same call number", ["MISMATCH:ACCOUNT_CALL_AMBIGUOUS"]);
+    const twoSettlements = copyOf(dir);
+    editCalls(twoSettlements, (calls) =>
+      calls.push({
+        ...calls.find((c) => c.kind === "ACCOUNT_SETTLEMENT" && c.status === "RECORDED")!,
+      }),
+    );
+    contradicted(twoSettlements, "two settlements", ["MISMATCH:ACCOUNT_SETTLEMENT_AMBIGUOUS"]);
+    const noSettlement = copyOf(dir);
+    editCalls(noSettlement, (calls) =>
+      calls.splice(
+        calls.findIndex((c) => c.kind === "ACCOUNT_SETTLEMENT" && c.status === "RECORDED"),
+        1,
+      ),
+    );
+    contradicted(noSettlement, "settlement missing", ["MISMATCH:ACCOUNT_SETTLEMENT_MISSING"]);
+
+    // Controls: the genuine capture's duplicate account() call (a second call, its settlement
+    // DUPLICATE) is legitimate, and still matches.
+    const calls = ledgerCalls(readJson(dir, LEDGER));
+    expect(calls.filter((c) => c.kind === "ACCOUNT_CALL")).toHaveLength(2);
+    expect(calls.filter((c) => c.kind === "ACCOUNT_SETTLEMENT").map((c) => c.status)).toEqual([
+      "RECORDED",
+      "DUPLICATE",
+    ]);
+    expect(txOf(dir).tx).toMatchObject(MATCHED_SWAP);
+    // A call still in progress, or a settlement still pending, is missing, not contradicted.
+    const inProgress = copyOf(dir);
+    reseal(inProgress, LEDGER, (l) =>
+      Object.assign(firstCallOf(l), { outcome: "IN_PROGRESS", endOrdinal: null }),
+    );
+    reseal(
+      inProgress,
+      REC,
+      (r) => ((r.pending as Record<string, unknown>).accountCallsInProgress = 1),
+    );
+    expect(txOf(inProgress).tx).toMatchObject({
+      status: "MISSING_EVIDENCE",
+      findings: ["MISSING_EVIDENCE:ACCOUNT_CALL_IN_PROGRESS"],
+      exchanges: [{ comparison: "MATCHED" }],
+    });
+    const pendingSettlement = copyOf(dir);
+    editCalls(pendingSettlement, (c) =>
+      c.splice(
+        c.findIndex((x) => x.kind === "ACCOUNT_SETTLEMENT" && x.status === "RECORDED"),
+        1,
+      ),
+    );
+    reseal(
+      pendingSettlement,
+      REC,
+      (r) => ((r.pending as Record<string, unknown>).accountSettlementsPending = 1),
+    );
+    expect(txOf(pendingSettlement).tx).toMatchObject({
+      status: "MISSING_EVIDENCE",
+      findings: ["MISSING_EVIDENCE:ACCOUNT_SETTLEMENT_UNAVAILABLE"],
+      exchanges: [{ comparison: "MATCHED" }],
+    });
   });
 });
