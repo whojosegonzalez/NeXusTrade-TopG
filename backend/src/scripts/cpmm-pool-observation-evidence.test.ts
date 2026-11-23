@@ -6337,4 +6337,121 @@ describe("Collector replay: application sends placed by the owner's attempts (re
     expect(cancelled.report.terminal.cause).toBe("CANCELLED");
     expect(collectorOf(seal(cancelled))).toMatchObject({ status: "REPRODUCED", findings: [] });
   });
+
+  it("O7: a lone send whose identity evidence is unavailable is not attributed, and replay past it is limited", async () => {
+    const TR = CPMM_EVIDENCE_FILES.transportRecords;
+    const COL = CPMM_EVIDENCE_FILES.collector;
+    const respond = (body: Row) => enc({ jsonrpc: "2.0", id: SUB_REQ, ...body });
+    const loneSend = (t: Row) => {
+      const sends = (t.records as Row[]).filter((r) => r.kind === "CALL" && r.method === "send");
+      expect(sends).toHaveLength(1);
+      return sends[0]!.payload as Row;
+    };
+    const mismatches = (findings: readonly string[]) =>
+      findings.filter((x) => x.startsWith("MISMATCH:"));
+    let omitted: Row = {};
+    const variants: [string, Row][] = [
+      ["subscribe rejected", { error: { code: -32_000, message: "no" } }],
+      ["subscribe malformed", { result: "bad" }],
+    ];
+    for (const [label, body] of variants) {
+      // Identity evidence available: the lone send is the subscribe by its length and digest,
+      // with the owner's report read or unread.
+      const hashed = seal(await genuineRun({ subscribeResponse: respond(body) }));
+      expect(collectorOf(hashed), label).toMatchObject({ status: "REPRODUCED", findings: [] });
+      expect(collectorOf(rewrite(hashed, unread)), label).toMatchObject({
+        status: "MISSING_EVIDENCE",
+        findings: ["MISSING_EVIDENCE:OWNER_COUNTS_UNAVAILABLE"],
+        epochReportCompared: true,
+        countersCompared: true,
+      });
+      // Its bytes altered at the same length (digest kept true), unread report: its digest alone
+      // proves it is not the subscribe, and no unsubscribe is buildable after a refused subscribe.
+      const altered = copyOf(hashed);
+      reseal(altered, TR, (t) => {
+        const p = loneSend(t);
+        const b = Buffer.from(String(p.stored).replace(`"id":${SUB_REQ}`, '"id":9'));
+        expect(b.length).toBe(p.originalBytes);
+        Object.assign(p, {
+          stored: b.toString("utf8"),
+          storedBytes: b.length,
+          storedSha256: sha(b),
+          originalBytes: b.length,
+          originalSha256: sha(b),
+        });
+      });
+      reseal(altered, OR, unread);
+      expect(collectorOf(altered).findings, label).toContain("MISMATCH:UNSUBSCRIBE_NOT_BUILDABLE");
+
+      // The review's reproduction: the subscribe is retained without its length or digest.
+      const run = await genuineRun({
+        subscribeResponse: respond(body),
+        limits: { maxPayloadBytesPerRecord: 100 },
+      });
+      const dir = seal(run);
+      expect(loneSend(readJson(dir, TR)), label).toMatchObject({
+        payloadOmitted: "OVERSIZE_NOT_HASHED",
+        originalSha256: null,
+      });
+      const read = collectorOf(dir);
+      expect(read.findings, label).toContain("MISSING_EVIDENCE:SUBSCRIBE_FRAME_UNVERIFIABLE");
+      expect(mismatches(read.findings), label).toEqual([]);
+      // Report unread. Before the correction: MISMATCH:UNSUBSCRIBE_NOT_BUILDABLE (the lone send
+      // taken as the unsubscribe because its digest was absent).
+      const unreadDir = rewrite(dir, unread);
+      const u = collectorOf(unreadDir);
+      expect(u.findings, label).toEqual(
+        expect.arrayContaining([
+          "MISSING_EVIDENCE:OWNER_COUNTS_UNAVAILABLE",
+          "MISSING_EVIDENCE:SEND_ATTRIBUTION_UNAVAILABLE",
+        ]),
+      );
+      expect(mismatches(u.findings), label).toEqual([]);
+      expect(u, label).toMatchObject({
+        status: "MISSING_EVIDENCE",
+        replayedFrames: 0,
+        epochReportCompared: false,
+        countersCompared: false,
+      });
+      expect(u.structurallyCheckedFrames, label).toBe(u.handedOverMessages);
+      // Structural checks continue past the unattributed send: a reordered frame record and an
+      // inconsistent epoch identity are still contradictions.
+      const reordered = copyOf(unreadDir);
+      reseal(reordered, COL, (c) => ((get(c, "frameRecords", "value") as Row[])[0]!.sequence = 2));
+      expect(collectorOf(reordered).findings, label).toContain("MISMATCH:FRAME_ORDER");
+      const otherId = copyOf(unreadDir);
+      reseal(
+        otherId,
+        COL,
+        (c) => ((get(c, "epochReport", "value") as Row).subscribeRequestId = SUB_REQ + 90),
+      );
+      expect(collectorOf(otherId).findings, label).toContain("MISMATCH:EPOCH_IDENTITY");
+      // A recorded length alone that differs from the subscribe frame's still proves a different
+      // frame, so the send is attributed and contradicted as before.
+      const lengthOnly = copyOf(unreadDir);
+      reseal(lengthOnly, TR, (t) => (loneSend(t).originalBytes = 150));
+      const l = collectorOf(lengthOnly).findings;
+      expect(l, label).toContain("MISMATCH:UNSUBSCRIBE_NOT_BUILDABLE");
+      expect(l, label).not.toContain("MISSING_EVIDENCE:SEND_ATTRIBUTION_UNAVAILABLE");
+      omitted = loneSend(readJson(dir, TR));
+    }
+
+    // With no handed-over frame after the unattributed send, the epoch report and counters are
+    // still not compared: the unsubscribe answered never arrives, and the lone unsubscribe is
+    // retained without its length or digest (a consistent rewrite to the recorder's oversize shape).
+    const late = seal(await genuineRun({ subscribeBeforeOpen: true, noUnsubscribeAck: true }));
+    expect(collectorOf(rewrite(late, unread))).toMatchObject({
+      findings: ["MISSING_EVIDENCE:OWNER_COUNTS_UNAVAILABLE"],
+      epochReportCompared: true,
+    });
+    const lateUnhashed = rewrite(late, unread);
+    reseal(lateUnhashed, TR, (t) => Object.assign(loneSend(t), omitted));
+    const lu = collectorOf(lateUnhashed);
+    expect(lu.findings).toEqual([
+      "MISSING_EVIDENCE:OWNER_COUNTS_UNAVAILABLE",
+      "MISSING_EVIDENCE:SEND_ATTRIBUTION_UNAVAILABLE",
+    ]);
+    expect(lu).toMatchObject({ epochReportCompared: false, countersCompared: false });
+    expect(lu.replayedFrames).toBe(lu.handedOverMessages);
+  });
 });

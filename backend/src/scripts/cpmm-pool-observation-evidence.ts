@@ -2606,7 +2606,8 @@ const UNHASHED_REFUSALS: ReadonlySet<unknown> = new Set([
  * - the epoch opens with its recorded start and request id, and its subscribe bytes must equal the
  *   first send's original digest; the unsubscribe frame is built where the owner built it (just
  *   before the second send, so before any later handed-over message) and must equal that send's
- *   original digest; the recorded close applies after the last handed-over frame.
+ *   original digest; the recorded close applies after the last handed-over frame. A lone send
+ *   whose identity evidence is absent (and no owner report) is not attributed: replay stops at it.
  * - a frame is replayed only with its exact original bytes and the collector's own recorded
  *   receipt time. Replay stops at the first frame it cannot reproduce: an unhashed refusal (no
  *   receipt time; it must be the run's last handed-over frame and is checked structurally),
@@ -2738,20 +2739,29 @@ function replayCollector(docs: Map<string, Record<string, unknown>>): CpmmCollec
   // The owner's own attempts place its sends: the subscribe first when it was attempted, then
   // the unsubscribe. A peer can answer the subscribe id before the socket opens, and the owner then
   // sends no subscribe, so the only send is the unsubscribe. Without a readable report, a lone send
-  // is the subscribe only if its digest is the subscribe frame's. Either way each attributed send
-  // is compared with the frame the collector builds.
-  const isSubscribeFrame = (sent: unknown): boolean => {
+  // is the subscribe when its length and digest are the subscribe frame's, the unsubscribe when
+  // either proves it different, and otherwise unattributed: an absent length or digest proves
+  // neither. Each attributed send is compared with the frame the collector builds.
+  const loneIdentity = (sent: unknown): "SUBSCRIBE" | "OTHER" | "UNKNOWN" => {
     const p = get(sent, "payload");
-    return (
-      get(p, "originalBytes") === opened.subscribeFrame.length &&
-      get(p, "originalSha256") === sha256(opened.subscribeFrame)
-    );
+    const length = get(p, "originalBytes");
+    const digest = get(p, "originalSha256");
+    if (isInt(length) && length !== opened.subscribeFrame.length) return "OTHER";
+    if (typeof digest === "string" && digest !== sha256(opened.subscribeFrame)) return "OTHER";
+    return isInt(length) && typeof digest === "string" ? "SUBSCRIBE" : "UNKNOWN";
   };
+  const identity = !isRec(report) && sends.length === 1 ? loneIdentity(sends[0]) : undefined;
+  // Whether the unsubscribe was built at the unattributed send changes the collector's state, so
+  // nothing after it is replayed and the epoch report and counters are not compared.
+  const unattributed = identity === "UNKNOWN" ? sends[0] : undefined;
+  if (unattributed !== undefined) f.add("MISSING_EVIDENCE", "SEND_ATTRIBUTION_UNAVAILABLE");
   const sendFor = isRec(report)
     ? applicationSends(report, sends as TransportRecord[])
-    : sends.length === 1 && !isSubscribeFrame(sends[0])
-      ? { subscribe: undefined, unsubscribe: sends[0] }
-      : { subscribe: sends[0], unsubscribe: sends[1] };
+    : identity === "UNKNOWN"
+      ? { subscribe: undefined, unsubscribe: undefined }
+      : identity === "OTHER"
+        ? { subscribe: undefined, unsubscribe: sends[0] }
+        : { subscribe: sends[0], unsubscribe: sends[1] };
   if (sendFor.subscribe !== undefined) {
     sameAsSent(opened.subscribeFrame, sendFor.subscribe, "SUBSCRIBE_FRAME");
   }
@@ -2766,6 +2776,9 @@ function replayCollector(docs: Map<string, Record<string, unknown>>): CpmmCollec
 
   let stopped = false;
   handedOver.forEach((msg, i) => {
+    if (unattributed !== undefined && (unattributed.ordinal as number) < (msg.ordinal as number)) {
+      stopped = true;
+    }
     if (
       !stopped &&
       !unsubscribeBuilt &&
@@ -2835,7 +2848,7 @@ function replayCollector(docs: Map<string, Record<string, unknown>>): CpmmCollec
   const compare = (replayed: unknown, recorded: unknown, code: string): void => {
     if (canonical(copyJson(replayed)) !== canonical(recorded)) f.add("MISMATCH", code);
   };
-  if (stopped) {
+  if (stopped || unattributed !== undefined) {
     // Only what was replayed is compared: the frame and notification prefixes it produced.
     const rf = c.frameRecords();
     const rn = c.notifications();
