@@ -1292,6 +1292,245 @@ describe("CPMM observation run: composition core (item 17 T)", () => {
     expect(r.status).toBe("FAILED");
   });
 
+  it.each(["synchronous", "queued"] as const)(
+    "RN11: %s cancellation from the session lifetime clear preserves the completed observation",
+    async (when) => {
+      const controller = new AbortController();
+      const h = harness();
+      const { clearTimeout } = h.timers;
+      h.timers.clearTimeout = (handle) => {
+        clearTimeout(handle);
+        if (handle !== 1) return;
+        const cancel = () => controller.abort(new Error(SECRET));
+        if (when === "queued") queueMicrotask(cancel);
+        else cancel();
+      };
+      const pending = runCpmmPoolObservation(h.options({ signal: controller.signal }));
+      await observe(h);
+      const r = await pending;
+      expect(controller.signal.aborted).toBe(true);
+      expect(r).toMatchObject({
+        status: "FAILED",
+        firstFailure: { stage: "FINALIZATION", code: "CANCELLED" },
+        finalizationCancelled: true,
+        clockFailure: null,
+        cleanupFailures: [],
+        observation: {
+          report: { terminal: { cause: "OBSERVATION_COMPLETED" }, connectionRunClean: true },
+        },
+        recording: { finished: true },
+        observationEvidence: {
+          verification: { integrity: { ok: true }, acquisitionBinding: { status: "REPRODUCED" } },
+        },
+        flags: CPMM_EVIDENCE_FALSE_FLAGS,
+      });
+      expect(h.queue.size).toBe(0);
+      expectNoCredential(h.root, r);
+    },
+  );
+
+  it("RN12: a cross-stage regression within the acquisition interval refuses observation", async () => {
+    const beforeRegression: number[] = [];
+    const h = harness({
+      onSchedule: (ms, x) => {
+        if (ms === 0 && x.acquisitionCalls === 2) {
+          beforeRegression.push(x.state.now);
+          x.state.now = T0 + 1_000;
+        }
+      },
+    });
+    const pending = runCpmmPoolObservation(h.options());
+    await h.to(AFTER_ALL);
+    const r = await pending;
+    expect(beforeRegression).toEqual([T0 + 2_500]);
+    expect(r.acquisitionEvidence.verification).toMatchObject({ computed: "ACQUIRED_REPRODUCED" });
+    expect(r.firstFailure).toEqual({ stage: "STAGE_BOUNDARY", code: "CLOCK_REGRESSED" });
+    expect(r.clockFailure).toEqual(r.firstFailure);
+    expect(r.cleanupFailures).toEqual([]);
+    expect(h.queue.size).toBe(0);
+    expectNotObserved(h, r);
+  });
+
+  it("RN13: a clock that throws after session opening resolves and clears the timer", async () => {
+    const h = harness();
+    const faults: number[] = [];
+    const clock = () => {
+      if (h.queue.size > 0 && h.calls.length === 0) {
+        faults.push(h.queue.size);
+        throw new Error(SECRET);
+      }
+      return h.state.now;
+    };
+    const r = await runCpmmPoolObservation(h.options({ clock }));
+    // The clock also throws from stop(), before the lifetime timer has been cleared.
+    expect(faults.length).toBeGreaterThanOrEqual(2);
+    expect(r.firstFailure).toEqual({ stage: "SETUP", code: "CLOCK_THREW" });
+    expect(r.clockFailure).toEqual(r.firstFailure);
+    expect(r.cleanupFailures).toEqual([]);
+    expect(r.session.stopReason).toBe(CPMM_RUN_STOP_ABANDONED);
+    expect(h.queue.size).toBe(0);
+    expect(h.calls).toHaveLength(0);
+    expect(listAll(h.root)).toEqual([]);
+    expectNotObserved(h, r);
+    expectNoCredential(h.root, r);
+  });
+
+  it.each(["CLOCK_INVALID", "CLOCK_REGRESSED", "CLOCK_THREW"] as const)(
+    "RN14: final cleanup latches a one-read %s even though the owner completed",
+    async (code) => {
+      const h = harness();
+      let injectFault = false;
+      const { clearTimeout } = h.timers;
+      h.timers.clearTimeout = (handle) => {
+        clearTimeout(handle);
+        if (handle === 1) injectFault = true;
+      };
+      const clock = () => {
+        if (!injectFault) return h.state.now;
+        injectFault = false;
+        if (code === "CLOCK_THREW") throw new Error(SECRET);
+        return code === "CLOCK_INVALID" ? Number.NaN : h.state.now - 1;
+      };
+      const pending = runCpmmPoolObservation(h.options({ clock }));
+      await observe(h);
+      const r = await pending;
+      expect(injectFault).toBe(false);
+      expect(r).toMatchObject({
+        status: "FAILED",
+        firstFailure: { stage: "FINALIZATION", code },
+        clockFailure: { stage: "FINALIZATION", code },
+        finalizationCancelled: false,
+        cleanupFailures: [],
+        observation: {
+          report: { terminal: { cause: "OBSERVATION_COMPLETED" }, connectionRunClean: true },
+        },
+        observationEvidence: {
+          verification: { integrity: { ok: true }, acquisitionBinding: { status: "REPRODUCED" } },
+        },
+        flags: CPMM_EVIDENCE_FALSE_FLAGS,
+      });
+      expect(h.queue.size).toBe(0);
+      expectNoCredential(h.root, r);
+    },
+  );
+
+  it("RN15: earlier observation failure wins over cancellation, a clock fault and a failed timer clear", async () => {
+    const controller = new AbortController();
+    const h = harness();
+    const { clearTimeout } = h.timers;
+    h.timers.clearTimeout = (handle) => {
+      clearTimeout(handle);
+      if (handle === 1) {
+        controller.abort();
+        throw new Error(SECRET);
+      }
+    };
+    const pending = runCpmmPoolObservation(
+      h.options({
+        signal: controller.signal,
+        clock: () => (controller.signal.aborted ? NaN : h.state.now),
+      }),
+    );
+    await h.to(OBS_START + 10);
+    h.client.emit("error", new Error("offline test transport failure"));
+    await h.to(AFTER_ALL);
+    const r = await pending;
+    expect(r.firstFailure).toMatchObject({
+      stage: "OBSERVATION",
+      code: expect.stringMatching(/^TRANSPORT_ERROR/),
+    });
+    expect(r.observation.report!.terminal.cause).toBe("TRANSPORT_ERROR");
+    expect(r.status).toBe("FAILED");
+    expect(r.finalizationCancelled).toBe(true);
+    expect(r.clockFailure).toEqual({ stage: "FINALIZATION", code: "CLOCK_INVALID" });
+    expect(r.cleanupFailures).toEqual(["SESSION_TIMER_CLEAR_FAILED"]);
+    expect(r.observationEvidence.verification!.integrity.ok).toBe(true);
+    expect(h.queue.size).toBe(0);
+    expect(r.flags).toEqual(CPMM_EVIDENCE_FALSE_FLAGS);
+    expectNoCredential(h.root, r);
+  });
+
+  it("RN16: harmless cleanup and equal clock readings preserve success", async () => {
+    const h = harness();
+    const { clearTimeout } = h.timers;
+    const cleanupReadings: number[] = [];
+    let clearingLifetime = false;
+    h.timers.clearTimeout = (handle) => {
+      clearTimeout(handle);
+      if (handle === 1) {
+        clearingLifetime = true;
+        cleanupReadings.push(h.state.now);
+      }
+    };
+    const clock = () => {
+      if (clearingLifetime) cleanupReadings.push(h.state.now);
+      return h.state.now;
+    };
+    const pending = runCpmmPoolObservation(
+      h.options({ clock, signal: new AbortController().signal }),
+    );
+    await observe(h);
+    const r = await pending;
+    expect(cleanupReadings).toHaveLength(2);
+    expect(cleanupReadings[0]).toBe(cleanupReadings[1]);
+    expect(r).toMatchObject({
+      status: "SUCCEEDED",
+      firstFailure: null,
+      clockFailure: null,
+      finalizationCancelled: false,
+      cleanupFailures: [],
+      flags: CPMM_EVIDENCE_FALSE_FLAGS,
+    });
+    expect(h.queue.size).toBe(0);
+  });
+
+  it("RN17: a permanent clock exception aborts in-flight work and bounds stuck owner cleanup", async () => {
+    let clockBroken = false;
+    let signal: AbortSignal | null | undefined;
+    const h = harness({
+      client: { closeMode: "none" },
+      transaction: () => new Promise<Response>(() => {}),
+    });
+    const pending = runCpmmPoolObservation(
+      h.options({
+        clock: () => {
+          if (clockBroken) throw new Error(SECRET);
+          return h.state.now;
+        },
+        fetchFn: (url: Parameters<typeof fetch>[0], init?: RequestInit) => {
+          if (String(init?.body).includes("getTransaction")) signal = init?.signal;
+          return h.fetchFn(url, init);
+        },
+      }),
+    );
+    await h.to(OBS_START + 10);
+    h.client.open();
+    await h.to(OBS_START + 20);
+    h.client.message(ackFrame());
+    await h.to(RECEIVED_AT);
+    h.client.message(notif(1));
+    await flush();
+    expect(h.method("getTransaction")).toBe(1);
+    expect(signal?.aborted).toBe(false);
+    clockBroken = true;
+    h.client.message(notif(2));
+    await flush();
+    expect(signal?.aborted).toBe(true);
+    expect(h.method("getTransaction")).toBe(1);
+    await h.to(AFTER_ALL);
+    const r = await pending;
+    expect(signal?.aborted).toBe(true);
+    expect(r.firstFailure).toEqual({ stage: "OBSERVATION", code: "CLOCK_THREW" });
+    expect(r.clockFailure).toEqual(r.firstFailure);
+    expect(r.status).toBe("FAILED");
+    expect(r.cleanupFailures).toEqual(["OWNER_CLEANUP:FAILED_STILL_OPEN"]);
+    expect(r.recording.finished).toBe(true);
+    expect(r.observationEvidence.verification!.integrity.ok).toBe(true);
+    expect(h.queue.size).toBe(0);
+    expect(r.flags).toEqual(CPMM_EVIDENCE_FALSE_FLAGS);
+    expectNoCredential(h.root, r);
+  });
+
   it("RN10: missing, altered and different dependencies never bind; a relocated exact copy does", async () => {
     const { h, r } = await shared;
     const dir = observationDirOf(h.root);
@@ -1339,5 +1578,105 @@ describe("CPMM observation run: composition core (item 17 T)", () => {
     );
     // The run's own result is unaffected by any of this.
     expect(r.status).toBe("SUCCEEDED");
+  });
+
+  it("RN18: an acquisition refusal still clears the lifetime timer and preserves its first failure", async () => {
+    const controller = new AbortController();
+    const h = harness({
+      acquisition: (_n, req) =>
+        Response.json({ jsonrpc: "2.0", id: req.id, error: { code: -32005, message: "x" } }),
+    });
+    const { clearTimeout } = h.timers;
+    h.timers.clearTimeout = (handle) => {
+      clearTimeout(handle);
+      if (handle === 1) controller.abort();
+    };
+    const r = await runCpmmPoolObservation(h.options({ signal: controller.signal }));
+    expect(r.firstFailure).toEqual({ stage: "ACQUISITION", code: "RPC_ERROR" });
+    expect(r.finalizationCancelled).toBe(true);
+    expect(r.cleanupFailures).toEqual([]);
+    expect(r.acquisitionEvidence.verification).toMatchObject({ computed: "ACQUISITION_FAILED" });
+    expect(r.session.stopReason).toBe(CPMM_RUN_STOP_ABANDONED);
+    expect(h.queue.size).toBe(0);
+    expectNotObserved(h, r);
+  });
+
+  it("RN19: the clock can recover after a request without clearing the acquisition-stage refusal", async () => {
+    const h = harness();
+    let injectFault = false;
+    let recovered = false;
+    let readFault = false;
+    const { clearTimeout } = h.timers;
+    h.timers.clearTimeout = (handle) => {
+      clearTimeout(handle);
+      if (handle !== 1 && h.calls.length === 1 && !readFault) injectFault = true;
+    };
+    const clock = () => {
+      if (injectFault) {
+        injectFault = false;
+        readFault = true;
+        return NaN;
+      }
+      if (readFault) recovered = true;
+      return h.state.now;
+    };
+    const pending = runCpmmPoolObservation(h.options({ clock }));
+    await h.to(AFTER_ALL);
+    const r = await pending;
+    expect(recovered).toBe(true);
+    expect(r.firstFailure).toEqual({ stage: "ACQUISITION", code: "CLOCK_INVALID" });
+    expect(r.clockFailure).toEqual(r.firstFailure);
+    expect(h.calls).toHaveLength(1);
+    expect(r.acquisitionEvidence.verification?.integrity).toBe("VERIFIED");
+    expect(r.cleanupFailures).toEqual([]);
+    expect(h.queue.size).toBe(0);
+    expectNotObserved(h, r);
+  });
+
+  it("RN20: a clock fault at dispatch does not reach the injected fetch", async () => {
+    let schedulingAcquisition = false;
+    let reads = 0;
+    const h = harness({
+      onSchedule: (ms) => {
+        if (ms === limits().acquisition.durationMs) schedulingAcquisition = true;
+      },
+    });
+    const clock = () => {
+      // After scheduling the acquisition deadline: its initial request check, the
+      // session's two refusal checks, then the session's dispatch timestamp.
+      if (schedulingAcquisition && ++reads === 4) return NaN;
+      return h.state.now;
+    };
+    const r = await runCpmmPoolObservation(h.options({ clock }));
+    expect(r.firstFailure).toEqual({ stage: "ACQUISITION", code: "CLOCK_INVALID" });
+    expect(r.session.httpAttempts).toBe(1); // the session reserved the dispatch
+    expect(h.calls).toHaveLength(0); // but the injected fetch was never called
+    expect(h.queue.size).toBe(0);
+    expectNotObserved(h, r);
+  });
+
+  it("RN21: a clock fault on owner start does not reach the client constructor", async () => {
+    let atBoundary = false;
+    let reads = 0;
+    const h = harness({
+      onSchedule: (ms, x) => {
+        if (ms === 0 && x.acquisitionCalls === 2) atBoundary = true;
+      },
+    });
+    const clock = () => {
+      // The transition check passes. The owner's first clock read fails.
+      if (atBoundary && ++reads === 2) throw new Error(SECRET);
+      return h.state.now;
+    };
+    const pending = runCpmmPoolObservation(h.options({ clock }));
+    await h.to(AFTER_ALL);
+    const r = await pending;
+    expect(r.firstFailure).toEqual({ stage: "OBSERVATION", code: "CLOCK_THREW" });
+    expect(r.observation.started).toBe(true);
+    expect(h.instances).toHaveLength(0);
+    expect(h.method("getTransaction")).toBe(0);
+    expect(h.queue.size).toBe(0);
+    expect(r.status).toBe("FAILED");
+    expectNoCredential(h.root, r);
   });
 });

@@ -148,7 +148,14 @@ export type CpmmObservationRunStage =
   | "STAGE_BOUNDARY"
   | "OBSERVATION"
   | "RECORDING"
+  | "FINALIZATION"
   | "OBSERVATION_EVIDENCE";
+
+type RunFailure<C extends string = string> = {
+  readonly stage: CpmmObservationRunStage;
+  readonly code: C;
+};
+type ClockFailureCode = "CLOCK_INVALID" | "CLOCK_REGRESSED" | "CLOCK_THREW";
 
 export type CpmmAcquisitionSealResult = ReturnType<typeof sealCpmmPoolAcquisitionEvidence>;
 
@@ -158,7 +165,11 @@ export interface CpmmObservationRunResult {
   /** SUCCEEDED only with no failure and no cleanup failure; never upgraded later. */
   readonly status: "SUCCEEDED" | "FAILED";
   /** The first failure in lifecycle order (fixed codes only); never replaced by a later one. */
-  readonly firstFailure: { readonly stage: CpmmObservationRunStage; readonly code: string } | null;
+  readonly firstFailure: RunFailure | null;
+  /** The first clock fault, even if the run had already failed for another reason. */
+  readonly clockFailure: RunFailure<ClockFailureCode> | null;
+  /** Run-level cancellation at finalization, independent of the owner's settled cause. */
+  readonly finalizationCancelled: boolean;
   /** Kept apart from the first failure and from the owner's terminal cause. */
   readonly cleanupFailures: readonly string[];
   readonly acquisition: {
@@ -624,6 +635,11 @@ export async function runCpmmPoolObservation(
   let observationSeal: SealCpmmObservationResult | null = null;
   let observationVerification: CpmmEvidenceVerification | null = null;
   let session: PaperRequestSession | null = null;
+  let stage: CpmmObservationRunStage = "SETUP";
+  let clockFailure: CpmmObservationRunResult["clockFailure"] = null;
+  let finalizationCancelled = false;
+  let finalizing = false;
+  let finished = false;
   let acquisitionWindow: { start: number; end: number } | null = null;
   let observationWindow: { start: number; end: number } | null = null;
 
@@ -642,6 +658,8 @@ export async function runCpmmPoolObservation(
       version: 1 as const,
       status: firstFailure === null && cleanupFailures.length === 0 ? "SUCCEEDED" : "FAILED",
       firstFailure,
+      clockFailure,
+      finalizationCancelled,
       cleanupFailures: Object.freeze([...cleanupFailures]),
       acquisition: acquisitionSummary,
       acquisitionEvidence: Object.freeze({
@@ -678,317 +696,408 @@ export async function runCpmmPoolObservation(
     return result();
   }
 
-  // 2. Every exchange observer exists before the session can dispatch.
-  let acquisition: CpmmPoolAccountAcquisition;
-  let evidence: ReturnType<typeof createCpmmExchangeEvidenceRecorder>;
-  let recorder: ReturnType<typeof createCpmmPoolObservationRecorder>;
-  let collector: CpmmPoolNotificationCollector;
-  let fanOut: ReturnType<typeof createExchangeObserverFanOut>;
-  let opened: PaperRequestSession;
-  try {
-    acquisition = new CpmmPoolAccountAcquisition();
-    evidence = createCpmmExchangeEvidenceRecorder({ ...L.evidenceRecorder });
-    recorder = createCpmmPoolObservationRecorder({ limits: { ...L.recorder } });
-    collector = new CpmmPoolNotificationCollector({
-      binding: { ...o.target },
-      limits: { ...L.collector },
-      commitment: "confirmed",
-    });
-    const acquirer = acquisition;
-    const evidenceRecorder = evidence;
-    const observationRecorder = recorder;
-    // The adapter's evidence recorder first, by the accepted fan-out contract.
-    fanOut = createExchangeObserverFanOut({
-      observers: [
-        { label: "adapter-evidence", observe: (ev) => evidenceRecorder.observe(ev) },
-        { label: "acquisition", observe: (ev) => acquirer.onExchangeComplete(ev) },
-        { label: "observation-recorder", observe: (ev) => observationRecorder.observeExchange(ev) },
-      ],
-      maxRetainedFailures: L.fanOut.maxRetainedFailures,
-    });
-    opened = new PaperRequestSession({
-      executionContext: "PAPER_SIMULATION",
-      fetchFn: o.fetchFn,
-      limits: L.session,
-      clock: o.clock,
-      timers: o.timers,
-      onExchangeComplete: fanOut.observe,
-    });
-    evidence.bind(opened);
-  } catch {
-    fail("SETUP", "COMPOSITION_FAILED");
-    return result();
-  }
-  session = opened;
-  try {
-    opened.open();
-  } catch {
-    fail("SETUP", "SESSION_OPEN_FAILED");
-    stopSession(CPMM_RUN_STOP_ABANDONED);
-    return result();
-  }
-
-  // 3. Acquire once, on the shared session.
-  const acquisitionStart = opened.now();
-  if (!safeTime(acquisitionStart)) {
-    fail("SETUP", "CLOCK_INVALID");
-    stopSession(CPMM_RUN_STOP_ABANDONED);
-    return result();
-  }
-  const deadlineMs = acquisitionStart + L.acquisition.durationMs;
-  const ledgerStart = opened.getLedgerLength();
-  let acquired: CpmmPoolAccountAcquisitionResult;
-  try {
-    acquired = await acquisition.acquire({
-      session: opened,
-      url: o.rpcUrl,
-      target: { ...o.target },
-      deadlineMs,
-      timers: { setTimeout: o.timers.setTimeout, clearTimeout: o.timers.clearTimeout },
-      timeoutMs: L.acquisition.timeoutMs,
-      maxResponseBytes: L.acquisition.maxResponseBytes,
-      ...(o.signal === undefined ? {} : { signal: o.signal }),
-    });
-  } catch {
-    fail("ACQUISITION", "ACQUISITION_THREW");
-    stopSession(CPMM_RUN_STOP_ABANDONED);
-    return result();
-  }
-  const ledgerEnd = opened.getLedgerLength();
-  acquisitionWindow = { start: ledgerStart, end: ledgerEnd };
-  acquisitionSummary = Object.freeze({
-    outcome: acquired.outcome,
-    code: acquired.code,
-    stage: acquired.stage,
-    sessionStopReason:
-      acquired.outcome === "ACQUIRED" ? null : (acquired.sessionStopReason ?? null),
-    retainedExchanges: acquired.exchanges.length,
-  });
-  if (acquired.outcome !== "ACQUIRED") fail("ACQUISITION", acquired.code);
-
-  // 4. Seal and verify the acquisition, whatever its outcome.
-  acquisitionSeal = sealCpmmPoolAcquisitionEvidence({
-    projectRoot: o.projectRoot,
-    runId: o.runId,
-    target: { ...o.target },
-    limits: {
-      deadlineMs,
-      timeoutMs: L.acquisition.timeoutMs,
-      maxResponseBytes: L.acquisition.maxResponseBytes,
-      pacingMs: L.session.lanes.SOLANA_RPC.pacingMs,
-    },
-    ledger: opened.getLedgerSince(ledgerStart).slice(0, ledgerEnd - ledgerStart),
-    result: acquired,
-    credentials: { urls: [...o.credentials.urls], additional: [...o.credentials.additional] },
-  });
-  if (!acquisitionSeal.ok) {
-    fail("ACQUISITION_EVIDENCE", `SEAL_FAILED:${acquisitionSeal.code}`);
-  } else {
-    acquisitionVerification = verifyCpmmPoolAcquisitionEvidence(acquisitionSeal.outDir);
-    if (acquisitionVerification.integrity !== "VERIFIED") {
-      fail(
-        "ACQUISITION_EVIDENCE",
-        `INTEGRITY_FAILED:${acquisitionVerification.integrityCode ?? "UNKNOWN"}`,
-      );
-    } else if (acquisitionVerification.manifestSha256 !== acquisitionSeal.manifestSha256) {
-      fail("ACQUISITION_EVIDENCE", "MANIFEST_DIGEST_MISMATCH");
-    } else if (acquisitionVerification.computed !== "ACQUIRED_REPRODUCED") {
-      fail("ACQUISITION_EVIDENCE", `NOT_REPRODUCED:${acquisitionVerification.computed}`);
+  let lastValidTime: number | undefined;
+  let ownerTimerTime = 0;
+  const cleanupSafeTime = (): number =>
+    Math.max(lastValidTime ?? 1, clockFailure ? ownerTimerTime : 0);
+  const clock = (): number => {
+    if (finished) return cleanupSafeTime();
+    let code: ClockFailureCode | undefined;
+    try {
+      const now = o.clock();
+      if (!safeTime(now)) code = "CLOCK_INVALID";
+      else if (lastValidTime !== undefined && now < lastValidTime) code = "CLOCK_REGRESSED";
+      else lastValidTime = now;
+    } catch {
+      code = "CLOCK_THREW";
     }
-  }
-  if (failed() || acquired.outcome !== "ACQUIRED" || !acquisitionSeal.ok) {
-    stopSession(CPMM_RUN_STOP_ABANDONED);
-    return result();
-  }
-  const acquisitionDir = acquisitionSeal.outDir;
-  const acquisitionManifest = acquisitionSeal.manifestSha256;
-
-  // 5. Stage boundary: one wait through the injected timers, then every stop condition.
-  try {
-    await new Promise<void>((resolve) => {
-      o.timers.setTimeout(resolve, 0);
-    });
-  } catch {
-    fail("STAGE_BOUNDARY", "TIMER_FAILED");
-  }
-  const observationStart = opened.now();
-  if (!failed()) {
-    if (aborted(o.signal)) fail("STAGE_BOUNDARY", "CANCELLED");
-    else if (!opened.isOpen() || opened.getStopReason() !== null)
-      fail("STAGE_BOUNDARY", "SESSION_STOPPED");
-    else if (!safeTime(observationStart) || observationStart < acquisitionStart)
-      fail("STAGE_BOUNDARY", "CLOCK_INVALID");
-    else if ((opened.getDeadlineMs() ?? 0) - observationStart < ownerCeilingMs(L.owner))
-      fail("STAGE_BOUNDARY", "SESSION_LIFETIME_INSUFFICIENT");
-  }
-  if (failed()) {
-    stopSession(CPMM_RUN_STOP_ABANDONED);
-    return result();
-  }
-
-  // 6. Observe: one owner, one connection.
-  let owner: CpmmPoolConnectionOwner;
-  let ledger: CpmmResolutionAccountingLedger;
-  let wrapper: CpmmPoolWebSocketTransport | null = null;
-  try {
-    const pool = acquired.adapted;
-    const adapter = new RaydiumCpmmTransactionSourceAdapter({
-      pool,
-      session: opened,
-      evidence,
-      rpcUrl: o.rpcUrl,
-      secrets: [...o.analysisSecrets],
-      ...L.adapter,
-    });
-    ledger = new CpmmResolutionAccountingLedger({
-      binding: adapter.getBinding(),
-      adapter,
-      tracker: new RollingTradeFlowTracker({
-        poolId: pool.poolAddress,
-        tokenMint: pool.candidateMint,
-        trackingStartedMs: observationStart,
-        clock: o.clock,
-      }),
-      limits: { ...L.ledger },
-    });
-    const observationRecorder = recorder;
-    owner = new CpmmPoolConnectionOwner({
-      session: opened,
-      collector,
-      ledger: recorder.recordLedger(ledger),
-      binding: adapter.getBinding(),
-      transportFactory: (): CpmmOwnerTransport => {
-        factoryCalls++;
-        if (wrapper !== null) throw new Error("[CPMM_RUN] SECOND_TRANSPORT_REFUSED");
-        wrapper = new CpmmPoolWebSocketTransport({
-          endpoint: o.streamUrl,
-          clientConstructor: o.ctor,
-          limits: { ...L.wrapper },
+    if (code !== undefined && clockFailure === null) {
+      clockFailure = Object.freeze({ stage, code });
+      fail(stage, code);
+      // Never interrupt a session stack from inside its clock (including open and stop).
+      if (!finalizing) {
+        queueMicrotask(() => {
+          if (!finalizing) stopSession(CPMM_RUN_STOP_ABANDONED);
         });
-        return observationRecorder.recordTransport(wrapper);
+      }
+    }
+    // Session.stop() reads the clock before aborting work and clearing timers. A bad read must
+    // never throw into it. The fallback keeps cleanup running, not the run eligible for success.
+    return cleanupSafeTime();
+  };
+
+  const sessionTimers: PaperRequestSessionTimers = {
+    setTimeout: o.timers.setTimeout,
+    clearTimeout: (handle) => {
+      try {
+        o.timers.clearTimeout(handle);
+      } catch {
+        // A bad clear must not interrupt abort listeners or the session's remaining clears.
+        cleanupFailures.push("SESSION_TIMER_CLEAR_FAILED");
+      }
+    },
+  };
+  const ownerTimers: PaperRequestSessionTimers = {
+    setTimeout: (callback, delay) => {
+      const due = Math.min(Number.MAX_SAFE_INTEGER, cleanupSafeTime() + delay);
+      return o.timers.setTimeout(() => {
+        // On clock failure only, an elapsed owner wake can advance bounded cleanup even when
+        // the injected clock never recovers. This time never qualifies a run as successful.
+        ownerTimerTime = Math.max(ownerTimerTime, due);
+        callback();
+      }, delay);
+    },
+    clearTimeout: o.timers.clearTimeout,
+  };
+
+  const finalizeSession = async (reason: string): Promise<void> => {
+    if (session === null || finalizing) return;
+    finalizing = true;
+    stage = "FINALIZATION";
+    const wasAborted = aborted(o.signal);
+    const checkCancellation = (): void => {
+      if ((!wasAborted || report?.cancellation.requestedAtMs === null) && aborted(o.signal)) {
+        finalizationCancelled = true;
+        fail("FINALIZATION", "CANCELLED");
+      }
+    };
+    checkCancellation();
+    stopSession(reason);
+    checkCancellation();
+    // Let stop-triggered promise reactions run before the last clock and signal checks.
+    await Promise.resolve();
+    checkCancellation();
+    // The stop's last clock read precedes injected timer cleanup; observe its effects too.
+    clock();
+    checkCancellation();
+  };
+
+  try {
+    await execute();
+  } catch {
+    fail(stage, "COMPONENT_FAILED");
+  } finally {
+    await finalizeSession(CPMM_RUN_STOP_ABANDONED);
+    finished = true;
+  }
+  return result();
+
+  async function execute(): Promise<void> {
+    // 2. Every exchange observer exists before the session can dispatch.
+    let acquisition: CpmmPoolAccountAcquisition;
+    let evidence: ReturnType<typeof createCpmmExchangeEvidenceRecorder>;
+    let recorder: ReturnType<typeof createCpmmPoolObservationRecorder>;
+    let collector: CpmmPoolNotificationCollector;
+    let fanOut: ReturnType<typeof createExchangeObserverFanOut>;
+    let opened: PaperRequestSession;
+    try {
+      acquisition = new CpmmPoolAccountAcquisition();
+      evidence = createCpmmExchangeEvidenceRecorder({ ...L.evidenceRecorder });
+      recorder = createCpmmPoolObservationRecorder({ limits: { ...L.recorder } });
+      collector = new CpmmPoolNotificationCollector({
+        binding: { ...o.target },
+        limits: { ...L.collector },
+        commitment: "confirmed",
+      });
+      const acquirer = acquisition;
+      const evidenceRecorder = evidence;
+      const observationRecorder = recorder;
+      // The adapter's evidence recorder first, by the accepted fan-out contract.
+      fanOut = createExchangeObserverFanOut({
+        observers: [
+          { label: "adapter-evidence", observe: (ev) => evidenceRecorder.observe(ev) },
+          { label: "acquisition", observe: (ev) => acquirer.onExchangeComplete(ev) },
+          {
+            label: "observation-recorder",
+            observe: (ev) => observationRecorder.observeExchange(ev),
+          },
+        ],
+        maxRetainedFailures: L.fanOut.maxRetainedFailures,
+      });
+      opened = session = new PaperRequestSession({
+        executionContext: "PAPER_SIMULATION",
+        fetchFn: (...args: Parameters<typeof fetch>) => {
+          // A read during dispatch can latch a fault before the queued stop runs.
+          if (clockFailure !== null) throw new RunRefusal(clockFailure.code);
+          return o.fetchFn(...args);
+        },
+        limits: L.session,
+        clock,
+        timers: sessionTimers,
+        onExchangeComplete: fanOut.observe,
+      });
+      evidence.bind(opened);
+    } catch {
+      fail("SETUP", "COMPOSITION_FAILED");
+      return;
+    }
+    try {
+      opened.open();
+    } catch {
+      fail("SETUP", "SESSION_OPEN_FAILED");
+      return;
+    }
+
+    // 3. Acquire once, on the shared session.
+    const acquisitionStart = opened.now();
+    if (failed()) return;
+    const deadlineMs = acquisitionStart + L.acquisition.durationMs;
+    if (!safeTime(opened.getDeadlineMs()) || !safeTime(deadlineMs)) {
+      fail("SETUP", "CLOCK_INVALID");
+      return;
+    }
+    stage = "ACQUISITION";
+    const ledgerStart = opened.getLedgerLength();
+    let acquired: CpmmPoolAccountAcquisitionResult;
+    try {
+      acquired = await acquisition.acquire({
+        session: opened,
+        url: o.rpcUrl,
+        target: { ...o.target },
+        deadlineMs,
+        timers: { setTimeout: o.timers.setTimeout, clearTimeout: o.timers.clearTimeout },
+        timeoutMs: L.acquisition.timeoutMs,
+        maxResponseBytes: L.acquisition.maxResponseBytes,
+        ...(o.signal === undefined ? {} : { signal: o.signal }),
+      });
+    } catch {
+      fail("ACQUISITION", "ACQUISITION_THREW");
+      return;
+    }
+    const ledgerEnd = opened.getLedgerLength();
+    acquisitionWindow = { start: ledgerStart, end: ledgerEnd };
+    acquisitionSummary = Object.freeze({
+      outcome: acquired.outcome,
+      code: acquired.code,
+      stage: acquired.stage,
+      sessionStopReason:
+        acquired.outcome === "ACQUIRED" ? null : (acquired.sessionStopReason ?? null),
+      retainedExchanges: acquired.exchanges.length,
+    });
+    if (acquired.outcome !== "ACQUIRED") fail("ACQUISITION", acquired.code);
+
+    // 4. Seal and verify the acquisition, whatever its outcome.
+    stage = "ACQUISITION_EVIDENCE";
+    acquisitionSeal = sealCpmmPoolAcquisitionEvidence({
+      projectRoot: o.projectRoot,
+      runId: o.runId,
+      target: { ...o.target },
+      limits: {
+        deadlineMs,
+        timeoutMs: L.acquisition.timeoutMs,
+        maxResponseBytes: L.acquisition.maxResponseBytes,
+        pacingMs: L.session.lanes.SOLANA_RPC.pacingMs,
       },
-      timers: o.timers,
-      ...(o.signal === undefined ? {} : { signal: o.signal }),
+      ledger: opened.getLedgerSince(ledgerStart).slice(0, ledgerEnd - ledgerStart),
+      result: acquired,
+      credentials: { urls: [...o.credentials.urls], additional: [...o.credentials.additional] },
+    });
+    if (!acquisitionSeal.ok) {
+      fail("ACQUISITION_EVIDENCE", `SEAL_FAILED:${acquisitionSeal.code}`);
+    } else {
+      acquisitionVerification = verifyCpmmPoolAcquisitionEvidence(acquisitionSeal.outDir);
+      if (acquisitionVerification.integrity !== "VERIFIED") {
+        fail(
+          "ACQUISITION_EVIDENCE",
+          `INTEGRITY_FAILED:${acquisitionVerification.integrityCode ?? "UNKNOWN"}`,
+        );
+      } else if (acquisitionVerification.manifestSha256 !== acquisitionSeal.manifestSha256) {
+        fail("ACQUISITION_EVIDENCE", "MANIFEST_DIGEST_MISMATCH");
+      } else if (acquisitionVerification.computed !== "ACQUIRED_REPRODUCED") {
+        fail("ACQUISITION_EVIDENCE", `NOT_REPRODUCED:${acquisitionVerification.computed}`);
+      }
+    }
+    if (failed() || acquired.outcome !== "ACQUIRED" || !acquisitionSeal.ok) {
+      return;
+    }
+    const acquisitionDir = acquisitionSeal.outDir;
+    const acquisitionManifest = acquisitionSeal.manifestSha256;
+
+    // 5. Stage boundary: one wait through the injected timers, then every stop condition.
+    stage = "STAGE_BOUNDARY";
+    try {
+      await new Promise<void>((resolve) => {
+        o.timers.setTimeout(resolve, 0);
+      });
+    } catch {
+      fail("STAGE_BOUNDARY", "TIMER_FAILED");
+    }
+    const observationStart = opened.now();
+    if (!failed()) {
+      if (aborted(o.signal)) fail("STAGE_BOUNDARY", "CANCELLED");
+      else if (!opened.isOpen() || opened.getStopReason() !== null)
+        fail("STAGE_BOUNDARY", "SESSION_STOPPED");
+      else if ((opened.getDeadlineMs() ?? 0) - observationStart < ownerCeilingMs(L.owner))
+        fail("STAGE_BOUNDARY", "SESSION_LIFETIME_INSUFFICIENT");
+    }
+    if (failed()) return;
+
+    // 6. Observe: one owner, one connection.
+    stage = "OBSERVATION";
+    let owner: CpmmPoolConnectionOwner;
+    let ledger: CpmmResolutionAccountingLedger;
+    let wrapper: CpmmPoolWebSocketTransport | null = null;
+    try {
+      const pool = acquired.adapted;
+      const adapter = new RaydiumCpmmTransactionSourceAdapter({
+        pool,
+        session: opened,
+        evidence,
+        rpcUrl: o.rpcUrl,
+        secrets: [...o.analysisSecrets],
+        ...L.adapter,
+      });
+      ledger = new CpmmResolutionAccountingLedger({
+        binding: adapter.getBinding(),
+        adapter,
+        tracker: new RollingTradeFlowTracker({
+          poolId: pool.poolAddress,
+          tokenMint: pool.candidateMint,
+          trackingStartedMs: observationStart,
+          clock,
+        }),
+        limits: { ...L.ledger },
+      });
+      const observationRecorder = recorder;
+      owner = new CpmmPoolConnectionOwner({
+        session: opened,
+        collector,
+        ledger: recorder.recordLedger(ledger),
+        binding: adapter.getBinding(),
+        transportFactory: (): CpmmOwnerTransport => {
+          factoryCalls++;
+          if (clockFailure !== null) throw new RunRefusal(clockFailure.code);
+          if (wrapper !== null) throw new Error("[CPMM_RUN] SECOND_TRANSPORT_REFUSED");
+          wrapper = new CpmmPoolWebSocketTransport({
+            endpoint: o.streamUrl,
+            clientConstructor: o.ctor,
+            limits: { ...L.wrapper },
+          });
+          return observationRecorder.recordTransport(wrapper);
+        },
+        timers: ownerTimers,
+        ...(o.signal === undefined ? {} : { signal: o.signal }),
+        epoch: o.epoch,
+        subscribeRequestId: o.subscribeRequestId,
+        unsubscribeRequestId: o.unsubscribeRequestId,
+        limits: { ...L.owner },
+      });
+    } catch {
+      fail("OBSERVATION", "COMPOSITION_FAILED");
+      return;
+    }
+    const sessionLedgerStart = opened.getLedgerLength();
+    started = true;
+    report = await owner.run();
+    if (report.terminal.cause !== "OBSERVATION_COMPLETED") {
+      fail(
+        "OBSERVATION",
+        report.terminal.code === null
+          ? report.terminal.cause
+          : `${report.terminal.cause}:${report.terminal.code}`,
+      );
+    }
+    const ownerCleanup = report.cleanup.status;
+    if (ownerCleanup === "FAILED_STILL_OPEN" || ownerCleanup === "DISPOSE_FAILED")
+      cleanupFailures.push(`OWNER_CLEANUP:${ownerCleanup}`);
+    else if (!report.connectionRunClean) fail("OBSERVATION", "CONNECTION_RUN_NOT_CLEAN");
+
+    // 7. Settled: finish the recorder here (a continuation, outside every callback), then stop.
+    stage = "RECORDING";
+    try {
+      snapshot = recorder.finish({
+        report,
+        owner,
+        wrapper,
+        collector,
+        ledger,
+        session: opened,
+        sessionLedgerStart,
+        epoch: o.epoch,
+        fanOut,
+      });
+    } catch {
+      fail("RECORDING", "FINISH_FAILED");
+    }
+    observationWindow = { start: sessionLedgerStart, end: opened.getLedgerLength() };
+    await finalizeSession(CPMM_RUN_STOP_FINISHED);
+    if (snapshot === null) return;
+
+    // 8. Seal the observation with its exact dependency, then verify both offline.
+    stage = "OBSERVATION_EVIDENCE";
+    const plan = {
+      kinds: {
+        run: "CPMM_POOL_OBSERVATION_RUN",
+        acquisition: "CPMM_POOL_ACCOUNT_ACQUISITION",
+        owner: "CPMM_POOL_CONNECTION_OWNER",
+        wrapper: "CPMM_POOL_WEBSOCKET_TRANSPORT",
+        recorder: "CPMM_POOL_OBSERVATION_RECORDER",
+      },
+      limits: {
+        owner: { ...L.owner },
+        wrapper: { ...L.wrapper },
+        collector: { ...L.collector },
+        ledger: { ...L.ledger },
+        adapter: { ...L.adapter },
+        sessionLanes: Object.fromEntries(
+          PAPER_REQUEST_LANES.map((lane) => [lane, { ...L.session.lanes[lane] }]),
+        ),
+        recorder: { ...L.recorder },
+      },
+      binding: { ...o.target },
       epoch: o.epoch,
       subscribeRequestId: o.subscribeRequestId,
       unsubscribeRequestId: o.unsubscribeRequestId,
-      limits: { ...L.owner },
+      endpointLabels: { rpc: "SOLANA_RPC_HTTP", stream: "SOLANA_RPC_WEBSOCKET" },
+    };
+    const account = (a: {
+      address: string;
+      ownerProgramId: string;
+      slot: number;
+      data: Uint8Array;
+    }) => ({
+      address: a.address,
+      ownerProgramId: a.ownerProgramId,
+      slot: a.slot,
+      data: a.data,
     });
-  } catch {
-    fail("OBSERVATION", "COMPOSITION_FAILED");
-    stopSession(CPMM_RUN_STOP_ABANDONED);
-    return result();
-  }
-  const sessionLedgerStart = opened.getLedgerLength();
-  started = true;
-  report = await owner.run();
-  if (report.terminal.cause !== "OBSERVATION_COMPLETED") {
-    fail(
-      "OBSERVATION",
-      report.terminal.code === null
-        ? report.terminal.cause
-        : `${report.terminal.cause}:${report.terminal.code}`,
-    );
-  }
-  const ownerCleanup = report.cleanup.status;
-  if (ownerCleanup === "FAILED_STILL_OPEN" || ownerCleanup === "DISPOSE_FAILED")
-    cleanupFailures.push(`OWNER_CLEANUP:${ownerCleanup}`);
-  else if (!report.connectionRunClean) fail("OBSERVATION", "CONNECTION_RUN_NOT_CLEAN");
-
-  // 7. Settled: finish the recorder here (a continuation, outside every callback), then stop.
-  try {
-    snapshot = recorder.finish({
-      report,
-      owner,
-      wrapper,
-      collector,
-      ledger,
-      session: opened,
-      sessionLedgerStart,
-      epoch: o.epoch,
-      fanOut,
+    observationSeal = sealCpmmObservationEvidence({
+      projectRoot: o.projectRoot,
+      runId: o.runId,
+      snapshot,
+      plan,
+      componentVersions: { ...o.componentVersions },
+      poolContext: {
+        target: { ...o.target },
+        poolAccount: account(acquired.input.poolAccount),
+        vault0Account: account(acquired.input.vault0Account),
+        vault1Account: account(acquired.input.vault1Account),
+        adaptedPool: acquired.adapted,
+        acquisition: "SUPPLIED_UNVERIFIED",
+      },
+      acquisitionDir,
+      credentials: { urls: [...o.credentials.urls], additional: [...o.credentials.additional] },
+      lateActivity: { ...recorder.lateActivity() },
     });
-  } catch {
-    fail("RECORDING", "FINISH_FAILED");
+    if (!observationSeal.ok) {
+      fail("OBSERVATION_EVIDENCE", `SEAL_FAILED:${observationSeal.code}`);
+      return;
+    }
+    observationVerification = verifyCpmmObservationEvidence(observationSeal.outDir, {
+      analysisSecrets: [...o.analysisSecrets],
+      acquisitionDir,
+    });
+    const binding = observationVerification.acquisitionBinding;
+    if (!observationVerification.integrity.ok) fail("OBSERVATION_EVIDENCE", "INTEGRITY_FAILED");
+    else if (observationVerification.manifestSha256 !== observationSeal.manifestSha256)
+      fail("OBSERVATION_EVIDENCE", "MANIFEST_DIGEST_MISMATCH");
+    else if (binding === undefined) fail("OBSERVATION_EVIDENCE", "ACQUISITION_BINDING_MISSING");
+    else if (binding.status !== "REPRODUCED")
+      fail("OBSERVATION_EVIDENCE", `ACQUISITION_BINDING:${binding.status}`);
+    else if (
+      binding.expectedManifestSha256 !== acquisitionManifest ||
+      binding.manifestSha256 !== acquisitionManifest
+    )
+      fail("OBSERVATION_EVIDENCE", "ACQUISITION_DEPENDENCY_MISMATCH");
   }
-  observationWindow = { start: sessionLedgerStart, end: opened.getLedgerLength() };
-  stopSession(CPMM_RUN_STOP_FINISHED);
-  if (snapshot === null) return result();
-
-  // 8. Seal the observation with its exact dependency, then verify both offline.
-  const plan = {
-    kinds: {
-      run: "CPMM_POOL_OBSERVATION_RUN",
-      acquisition: "CPMM_POOL_ACCOUNT_ACQUISITION",
-      owner: "CPMM_POOL_CONNECTION_OWNER",
-      wrapper: "CPMM_POOL_WEBSOCKET_TRANSPORT",
-      recorder: "CPMM_POOL_OBSERVATION_RECORDER",
-    },
-    limits: {
-      owner: { ...L.owner },
-      wrapper: { ...L.wrapper },
-      collector: { ...L.collector },
-      ledger: { ...L.ledger },
-      adapter: { ...L.adapter },
-      sessionLanes: Object.fromEntries(
-        PAPER_REQUEST_LANES.map((lane) => [lane, { ...L.session.lanes[lane] }]),
-      ),
-      recorder: { ...L.recorder },
-    },
-    binding: { ...o.target },
-    epoch: o.epoch,
-    subscribeRequestId: o.subscribeRequestId,
-    unsubscribeRequestId: o.unsubscribeRequestId,
-    endpointLabels: { rpc: "SOLANA_RPC_HTTP", stream: "SOLANA_RPC_WEBSOCKET" },
-  };
-  const account = (a: {
-    address: string;
-    ownerProgramId: string;
-    slot: number;
-    data: Uint8Array;
-  }) => ({
-    address: a.address,
-    ownerProgramId: a.ownerProgramId,
-    slot: a.slot,
-    data: a.data,
-  });
-  observationSeal = sealCpmmObservationEvidence({
-    projectRoot: o.projectRoot,
-    runId: o.runId,
-    snapshot,
-    plan,
-    componentVersions: { ...o.componentVersions },
-    poolContext: {
-      target: { ...o.target },
-      poolAccount: account(acquired.input.poolAccount),
-      vault0Account: account(acquired.input.vault0Account),
-      vault1Account: account(acquired.input.vault1Account),
-      adaptedPool: acquired.adapted,
-      acquisition: "SUPPLIED_UNVERIFIED",
-    },
-    acquisitionDir,
-    credentials: { urls: [...o.credentials.urls], additional: [...o.credentials.additional] },
-    lateActivity: { ...recorder.lateActivity() },
-  });
-  if (!observationSeal.ok) {
-    fail("OBSERVATION_EVIDENCE", `SEAL_FAILED:${observationSeal.code}`);
-    return result();
-  }
-  observationVerification = verifyCpmmObservationEvidence(observationSeal.outDir, {
-    analysisSecrets: [...o.analysisSecrets],
-    acquisitionDir,
-  });
-  const binding = observationVerification.acquisitionBinding;
-  if (!observationVerification.integrity.ok) fail("OBSERVATION_EVIDENCE", "INTEGRITY_FAILED");
-  else if (observationVerification.manifestSha256 !== observationSeal.manifestSha256)
-    fail("OBSERVATION_EVIDENCE", "MANIFEST_DIGEST_MISMATCH");
-  else if (binding === undefined) fail("OBSERVATION_EVIDENCE", "ACQUISITION_BINDING_MISSING");
-  else if (binding.status !== "REPRODUCED")
-    fail("OBSERVATION_EVIDENCE", `ACQUISITION_BINDING:${binding.status}`);
-  else if (
-    binding.expectedManifestSha256 !== acquisitionManifest ||
-    binding.manifestSha256 !== acquisitionManifest
-  )
-    fail("OBSERVATION_EVIDENCE", "ACQUISITION_DEPENDENCY_MISMATCH");
-  return result();
 }
