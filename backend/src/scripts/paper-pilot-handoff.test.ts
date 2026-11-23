@@ -1184,7 +1184,7 @@ describe("Watched-evidence handoff (offline integration)", () => {
     expect(watched(root, selected, now).refusals).toEqual(["PILOT_OUTPUT_EXISTS"]);
   });
 
-  it("H-12: the pin allows exactly the reviewed watch files and the watch entry point added since the runner, and nothing else", () => {
+  it("H-12: the pin allows exactly the reviewed additions since the runner", () => {
     const added = [
       "backend/src/candidate-scanner/BoundedAmmV4CreationWatch.ts",
       "backend/src/candidate-scanner/BoundedAmmV4CreationWatch.test.ts",
@@ -1221,6 +1221,8 @@ describe("Watched-evidence handoff (offline integration)", () => {
       "backend/src/candidate-scanner/CpmmPoolObservationRecorder.test.ts",
       "backend/src/scripts/cpmm-pool-observation-evidence.ts",
       "backend/src/scripts/cpmm-pool-observation-evidence.test.ts",
+      "backend/src/candidate-scanner/CpmmPoolAccountAcquisition.ts",
+      "backend/src/candidate-scanner/CpmmPoolAccountAcquisition.test.ts",
     ];
     // The wrapper and its sequence core are pinned (compared with the pinned commit, clean).
     expect(PIN_PATHS).toContain("scripts/paper-pilot-sequence.ps1");
@@ -1305,6 +1307,12 @@ describe("Watched-evidence handoff (offline integration)", () => {
       "backend/src/candidate-scanner/CpmmPoolObservationRecorderFactory.ts",
       "backend/src/candidate-scanner/CpmmObservationRecorder.ts",
       "backend/src/scripts/CpmmPoolObservationRecorder.ts",
+      "backend/src/candidate-scanner/CpmmPoolAccountAcquisition.test-support.ts",
+      "backend/src/candidate-scanner/CpmmPoolAccountAcquisitionFactory.ts",
+      "backend/src/scripts/CpmmPoolAccountAcquisition.ts",
+      "backend/src/scripts/cpmm-pool-acquisition-evidence.ts",
+      "backend/src/scripts/cpmm-pool-acquisition-evidence.test.ts",
+      "backend/src/scripts/cpmm-pool-acquisition-cli.ts",
       "backend/src/scripts/fresh-amm-v4-watch-evidence.test-support.ts",
       "backend/src/scripts/fresh-amm-v4-watch.test-support.ts",
       "backend/src/scripts/fresh-amm-v4-watch-handoff.ts",
