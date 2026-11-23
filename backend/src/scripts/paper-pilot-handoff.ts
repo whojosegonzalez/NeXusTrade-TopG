@@ -143,6 +143,9 @@ export const ALLOWED_ADDITIONS_SINCE_REVIEWED_RUNNER = Object.freeze([
   // In-memory CPMM account acquisition and its synthetic tests (section 8.38.17 item 17 S, step 1).
   "backend/src/candidate-scanner/CpmmPoolAccountAcquisition.ts",
   "backend/src/candidate-scanner/CpmmPoolAccountAcquisition.test.ts",
+  // Separate offline acquisition evidence and synthetic tests (section 8.38.17 item 17 S, step 2).
+  "backend/src/scripts/cpmm-pool-acquisition-evidence.ts",
+  "backend/src/scripts/cpmm-pool-acquisition-evidence.test.ts",
 ]);
 
 export interface ReviewedTreeEntry {

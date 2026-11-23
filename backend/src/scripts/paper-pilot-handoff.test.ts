@@ -1223,6 +1223,8 @@ describe("Watched-evidence handoff (offline integration)", () => {
       "backend/src/scripts/cpmm-pool-observation-evidence.test.ts",
       "backend/src/candidate-scanner/CpmmPoolAccountAcquisition.ts",
       "backend/src/candidate-scanner/CpmmPoolAccountAcquisition.test.ts",
+      "backend/src/scripts/cpmm-pool-acquisition-evidence.ts",
+      "backend/src/scripts/cpmm-pool-acquisition-evidence.test.ts",
     ];
     // The wrapper and its sequence core are pinned (compared with the pinned commit, clean).
     expect(PIN_PATHS).toContain("scripts/paper-pilot-sequence.ps1");
@@ -1310,8 +1312,9 @@ describe("Watched-evidence handoff (offline integration)", () => {
       "backend/src/candidate-scanner/CpmmPoolAccountAcquisition.test-support.ts",
       "backend/src/candidate-scanner/CpmmPoolAccountAcquisitionFactory.ts",
       "backend/src/scripts/CpmmPoolAccountAcquisition.ts",
-      "backend/src/scripts/cpmm-pool-acquisition-evidence.ts",
-      "backend/src/scripts/cpmm-pool-acquisition-evidence.test.ts",
+      "backend/src/scripts/cpmm-pool-acquisition-evidence.test-support.ts",
+      "backend/src/scripts/cpmm-pool-acquisition-evidence-extra.ts",
+      "backend/src/candidate-scanner/cpmm-pool-acquisition-evidence.ts",
       "backend/src/scripts/cpmm-pool-acquisition-cli.ts",
       "backend/src/scripts/fresh-amm-v4-watch-evidence.test-support.ts",
       "backend/src/scripts/fresh-amm-v4-watch.test-support.ts",

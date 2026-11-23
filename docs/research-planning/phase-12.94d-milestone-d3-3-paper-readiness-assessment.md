@@ -9785,7 +9785,7 @@ export function sanitizeEvidenceBytes(
 
 - **What establishes the decoder context**: the raw pool and two vault accounts (address, owner program, slot and data bytes, with `originalSha256`), plus the target pool address and candidate mint.
 - **What re-derivation checks**: it re-runs `adaptRaydiumCpmmPoolState` and requires a canonical match with the adapted pool the run used, and with the bindings of the owner, collector, ledger and adapter.
-- **How the accounts are acquired** (gap G3): item S step 1 implements the isolated shared-session acquisition with its own in-memory exchange evidence (ledger seq, request, response). Sealing and observation linkage are not implemented, so the observation's pool context is still a supplied assertion.
+- **How the accounts are acquired** (gap G3): item S step 1 implements the isolated shared-session acquisition, and step 2 seals and verifies the separate acquisition bundle offline. Observation linkage is not implemented, so the observation's pool context is still a supplied assertion.
 - **Until then**: pool context supplied without exchange evidence is sealed as `SUPPLIED_UNVERIFIED`. Response analysis can then be internally consistent, but not evidence-backed.
 
 ###### F. Evidence Layout, Manifest and Sealing (`cpmm-pool-observation-evidence.ts`)
@@ -11252,9 +11252,9 @@ A late owner message was caught, but only by item O's message counts. Each of th
 - **Later activity**: counted and labelled only; nothing after `finish()` is visible (the recorder's late counts).
 - **Remaining component**: runtime accounting (`RUNTIME_ACCOUNTING_NOT_REPRODUCED`).
 
-###### S. Gap G3: Evidence-Bound CPMM Pool-Account Acquisition (Step 1 Implemented, 2026-11-22)
+###### S. Gap G3: Evidence-Bound CPMM Pool-Account Acquisition (Step 1 Accepted, Step 2 Implemented)
 
-**Status**: independent review accepted the two-request architecture with the timing and evidence bounds below. Step 1 is implemented and tested offline with injected fetch, clock and timers. Steps 2 and 3 are not implemented. No production factory, CLI, provider request, socket, credential load, capture or wallet change was made. Item 17 and the observation evidence keep `SUPPLIED_UNVERIFIED`, `OPEN_G3` and the five false qualification flags.
+**Status**: independent review accepted step 1, including the lifecycle corrections in `fd88749`. Step 2 implements a separate offline sealer and verifier, tested only with synthetic acquisitions. Step 3 is not implemented. No production factory, CLI, provider request, socket, credential load, historical capture or wallet change was made. Item 17 and the observation evidence keep `SUPPLIED_UNVERIFIED`, `OPEN_G3` and the five false qualification flags.
 
 **Scope**: acquire the raw pool account and its two vault accounts for one explicitly supplied `{ poolAddress, candidateMint }` through the existing shared `PaperRequestSession`, with exchange evidence, and feed them to the accepted `adaptRaydiumCpmmPoolState`. No discovery, search, candidate selection or target inference. The reviewed boundaries stay where they are: the adapter alone decides canonical WSOL pairing, WSOL decimals 9, canonical SPL Token only (Token-2022 refused), auth bump 253, vault mints, authorities and states, equal slots and reserve solvency.
 
@@ -11314,6 +11314,10 @@ Owners, addresses, lengths and account bytes are decided by the accepted parser 
 
 **Binding for sealing and offline verification** (step 2): a separate bundle under `data/research/cpmm-acquisitions/<runId>/`, with exclusive-create writes and the manifest last, as in item N. Its files are the plan (target, limits, purposes, fixed endpoint label, component versions), the session ledger window, one file per exchange, the accounts, the adapter result and the report.
 
+- The sealer accepts the actual acquisition result, effective limits, a contiguous session ledger window with the acquisition's reserved purposes, and caller-supplied sanitizer inputs. It does not load credentials. It bounds the graph before copying and prepares all files before writing. The bundle has at most seven listed files plus the manifest, with a 256 KiB total, a 96 KiB per-file ceiling, and at most 256 ledger entries. A failed write reports the last attempted file and the completed prefix, leaving any partial file visible. It does not retry, overwrite or reuse the directory.
+- The read-only verifier requires the exact manifest inventory, byte counts and SHA-256 digests before comparing claims. It rejects alternate paths, links and unlisted entries. The checks are for a static bundle, not a guarantee against a concurrent process replacing its directories. The bundle is unsigned: hashes detect incomplete or inconsistent material, not a coherent rewrite of all claims or proof of on-chain state.
+- `NaN`, positive and negative infinity, and negative zero in ledger timestamps are stored as `{"$number":"NaN"}`, `{"$number":"+Infinity"}`, `{"$number":"-Infinity"}`, and `{"$number":"-0"}`. JSON `null` remains an absent completion. Finite invalid timestamps are not normalized. Adapter integers use `{"$bigint":"<decimal>"}`.
+
 | Link                        | Recorded                                                                                     | Checked offline                                                                                                                                |
 | --------------------------- | -------------------------------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------- |
 | Ledger entry and exchange   | seq, purpose, identity, JSON-RPC id, times, status, body completeness                        | Fields equal; exactly the acquisition's purposes, in order; dispatch times at least the recorded lane pacing apart; no third acquisition entry |
@@ -11324,11 +11328,11 @@ Owners, addresses, lengths and account bytes are decided by the accepted parser 
 | Discovery and snapshot keys | Response 1's pool bytes                                                                      | Parser re-run: vaults equal request 2's keys 1 and 2, and response 2's pool records the same vaults                                            |
 | Adapter input and result    | The three accounts at response 2's context slot; the adapted pool (bigints tagged)           | Accepted adapter re-run; canonical match; `consistentSlot` equals response 2's slot                                                            |
 
-- **Redaction**: request bodies, response bodies and account bytes pass through the item D sanitizer (text, JSON and binary scopes). Original digests are always kept. A redacted response or account cannot be decoded again, so its links are `LIMITED_BY_REDACTION`. A withheld payload is `MISSING_EVIDENCE`. Neither is ever upgraded, and no credential is persisted.
-- **Acquired evidence versus supplied assertions**: the target pair stays a supplied assertion (`SUPPLIED_TARGET`): acquisition shows what the provider returned for those addresses at one slot, not that the target is a correct candidate. The bundle reports `ACQUIRED_REPRODUCED` only when every link above reproduces, `ACQUIRED_LIMITED` when any link is limited or missing, and `ACQUISITION_FAILED` or `ACQUIRED_CONTEXT_REFUSED` as recorded. The provider is trusted for its response (no proof of chain state), commitment is `confirmed`, and freshness relative to an observation, deployed bytecode and activation time are not established.
+- **Redaction**: step 2 uses the item D sanitizer and scans decoded account bytes, including base64 tuples in returned JSON. A response is withheld if its decoded account material cannot safely be stored as received, including when the separate account file is redacted. It also withholds incomplete, unparsable or duplicate-key responses rather than risk keeping uninspected encoded material. It scans the complete rendered files, including metadata and the manifest, before writing. Original and stored digests are distinct. Redaction limits re-derivation (`LIMITED_BY_REDACTION`); unretained or withheld bytes are `MISSING_EVIDENCE`. Independent contradictions remain `MISMATCH`, even alongside those limitations.
+- **Acquired evidence versus supplied assertions**: the target pair stays `SUPPLIED_TARGET`. Reported outcome, file integrity, retention, and computed verification are separate. A recorded acquisition failure is never upgraded by successful decoding; runtime lifecycle execution is `NOT_REPLAYED`. `ACQUIRED_REPRODUCED` requires a recorded success and every required link to reproduce. `ACQUIRED_LIMITED` is a recorded success with missing or redacted links and no detected contradiction. The provider is trusted for its response, commitment is `confirmed`, and freshness relative to an observation, deployed bytecode and activation time are not established.
 - **Observation evidence** (step 3, a separate review of accepted modules): only then could `pool-context.json` reference an acquisition by manifest digest, and acquisition provenance become `ACQUIRED_BOUND`. That requires `ACQUIRED_REPRODUCED`, equal account addresses, owners, bytes digests and slots, and a canonically equal adapted pool. Until then the five item F flags stay `false`, and `SUPPLIED_UNVERIFIED` and `OPEN_G3` are unchanged.
 
-**Files and pin additions** (only step 1 added here):
+**Files and pin additions** (steps 1 and 2 only):
 
 | Step | Files                                                                        | Purpose                                                                                                                                                                                                     |
 | ---- | ---------------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
@@ -11336,7 +11340,7 @@ Owners, addresses, lengths and account bytes are decided by the accepted parser 
 | 2    | `backend/src/scripts/cpmm-pool-acquisition-evidence.ts` / `.test.ts`         | Offline sealing and verification of one acquisition bundle                                                                                                                                                  |
 | 3    | Changes to `cpmm-pool-observation-evidence.ts` / `.test.ts` (already pinned) | The `ACQUIRED_BOUND` link only; not part of this milestone's first two steps                                                                                                                                |
 
-`ALLOWED_ADDITIONS_SINCE_REVIEWED_RUNNER` in `paper-pilot-handoff.ts` gained exactly the two step-1 paths. The pin tests allow those exact additions and refuse lookalikes, the deferred sealer and a CLI.
+`ALLOWED_ADDITIONS_SINCE_REVIEWED_RUNNER` in `paper-pilot-handoff.ts` admits exactly the two step-1 paths and the two step-2 paths for this item. The pin tests refuse lookalikes and a CLI.
 
 **Synthetic test matrix** (a real `PaperRequestSession` with injected `fetchFn`, clock and timers, and fixture pool and vault bytes from the adapter's tests; no network):
 
@@ -11371,6 +11375,8 @@ Owners, addresses, lengths and account bytes are decided by the accepted parser 
 **Step 1 lifecycle follow-up**: against `c9027e9`, seven adverse cleanup and post-snapshot clock cases incorrectly returned `ACQUIRED` (regression run exit `1`); the harmless cleanup case passed. After the fix, all 114 acquisition tests passed (exit `0`), including the blocked-lane regression. Four focused mutations each caused assertion failures (exit `1`): removing the post-cleanup check, accepting invalid clock readings, ignoring clock regression, and forgetting the latched refusal on clock recovery. The source was restored and verified byte for byte. Each run had an external 60-second limit. The wallet hash and the qualification flags are unchanged.
 
 After restoration, eight offline suites passed (318 tests, exit `0`), as did the backend typecheck, affected-file ESLint and Prettier checks (exit `0` each), under external 60-second limits.
+
+**Step 2 verification**: ten offline suites passed (383 tests, including 44 acquisition-evidence tests), exit `0`. The backend typecheck, affected-file ESLint and Prettier checks exited `0`. Five isolated mutants caused assertion failures (exit `1` each): base64 account scanning, duplicate-key protection, recorded-vs-derived outcome separation, the discovery-slot binding, and manifest file hashing. The source was restored byte for byte before the passing suite run. The checks used external 60-second limits. The wallet hash and the five false qualification flags are unchanged.
 
 ---
 
