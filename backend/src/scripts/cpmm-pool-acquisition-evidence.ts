@@ -943,12 +943,14 @@ function loadFile(dir: string, file: string, maxBytes: number, expectedSize?: nu
   }
 }
 
-function loadBundle(dir: string) {
+function loadBundle(dir: string, onManifest: (digest: string) => void) {
   if (!rootPath.safeParse(dir).success) reject("INVALID_BUNDLE_PATH");
   const full = path.resolve(dir);
   if (!runId.safeParse(path.basename(full)).success) reject("INVALID_BUNDLE_PATH");
   safeAncestors(full);
   const manifestData = loadFile(full, MANIFEST, 4096);
+  const manifestSha256 = sha(manifestData);
+  onManifest(manifestSha256);
   const manifest = get(manifestSchema, document(manifestData), "MANIFEST_INVALID");
   const expected = [
     ...FIXED_FILES,
@@ -986,7 +988,7 @@ function loadBundle(dir: string) {
   const plan = get(planSchema, doc("plan.json"), "PLAN_INVALID");
   if (plan.runId !== manifest.runId) reject("PLAN_RUN_ID_MISMATCH");
   return {
-    manifestSha256: sha(manifestData),
+    manifestSha256,
     plan,
     ledger: get(z.array(ledgerEntry).max(MAX_LEDGER), doc("ledger.json"), "LEDGER_INVALID"),
     report: get(reportSchema, doc("report.json"), "REPORT_INVALID"),
@@ -1421,14 +1423,17 @@ function assess(bundle: ReturnType<typeof loadBundle>): CpmmPoolAcquisitionVerif
   };
 }
 
-/** Read-only; file integrity is checked before any semantic comparison. No runtime is replayed. */
-export function verifyCpmmPoolAcquisitionEvidence(dir: string): CpmmPoolAcquisitionVerification {
+function readAcquisitionEvidence(dir: string) {
+  let manifestSha256: string | undefined;
   try {
-    return assess(loadBundle(dir));
+    const bundle = loadBundle(dir, (digest) => {
+      manifestSha256 = digest;
+    });
+    return { verification: assess(bundle), bundle, manifestSha256 };
   } catch (e) {
     const integrityCode =
       e instanceof Refused ? e.message : isMissing(e) ? "FILE_MISSING" : "BUNDLE_UNREADABLE";
-    return {
+    const verification: CpmmPoolAcquisitionVerification = {
       integrity: "FAILED",
       integrityCode,
       recorded: null,
@@ -1439,7 +1444,37 @@ export function verifyCpmmPoolAcquisitionEvidence(dir: string): CpmmPoolAcquisit
       labels: LABELS,
       flags: FLAGS,
     };
+    return { verification, manifestSha256 };
   }
+}
+
+/** Read-only; file integrity is checked before any semantic comparison. No runtime is replayed. */
+export function verifyCpmmPoolAcquisitionEvidence(dir: string): CpmmPoolAcquisitionVerification {
+  return readAcquisitionEvidence(dir).verification;
+}
+
+/** No payloads or unverified context are exported. The digest, even on failure, is of bytes read. */
+export function verifyCpmmPoolAcquisitionForBinding(dir: string) {
+  const { verification, bundle, manifestSha256 } = readAcquisitionEvidence(dir);
+  const result = { verification, manifestSha256 };
+  if (
+    !bundle ||
+    verification.integrity !== "VERIFIED" ||
+    verification.computed !== "ACQUIRED_REPRODUCED"
+  )
+    return { ...result, context: null };
+  // assess() matched these fields to the replayed snapshot and adapter, with original bytes.
+  const accounts = bundle.accounts.flatMap(({ position, address, ownerProgramId, slot, data }) =>
+    data.state === "ORIGINAL"
+      ? [{ position, address, ownerProgramId, slot, originalSha256: data.originalSha256 }]
+      : [],
+  );
+  if (accounts.length !== POSITIONS.length || !bundle.adapter?.ok)
+    return { ...result, context: null };
+  return {
+    ...result,
+    context: { target: bundle.plan.target, accounts, adaptedPool: bundle.adapter },
+  };
 }
 
 function scrubFile(data: Buffer, secrets: readonly string[]) {

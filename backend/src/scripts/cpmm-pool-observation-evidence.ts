@@ -1,6 +1,7 @@
 /**
  * CPMM pool observation evidence: offline sealing and integrity verification (assessment §8.38.17
- * item 17 D–F). Component re-derivation (item G) is not implemented here and is reported as such.
+ * item 17 D–G and S). An optional acquisition dependency is verified offline, separately
+ * from observation integrity and re-derivation.
  *
  * - **Sealing** (`sealCpmmObservationEvidence`) consumes the accepted recorder's frozen snapshot
  *   and explicitly supplied plan, component versions, pool context and credentials. Inputs are
@@ -52,6 +53,10 @@ import {
   analyzeCpmmTransactionResponse,
 } from "../candidate-scanner/RaydiumCpmmTransactionSourceAdapter.js";
 import {
+  verifyCpmmPoolAcquisitionForBinding,
+  type CpmmPoolAcquisitionVerification,
+} from "./cpmm-pool-acquisition-evidence.js";
+import {
   EVIDENCE_SANITIZER_LIMITS,
   deriveEvidenceSecrets,
   sanitizeEvidenceBytes,
@@ -65,6 +70,13 @@ import {
 export const CPMM_EVIDENCE_MANIFEST_KIND = "CPMM_POOL_OBSERVATION_EVIDENCE_MANIFEST" as const;
 export const CPMM_EVIDENCE_MANIFEST_VERSION = 1 as const;
 export const CPMM_EVIDENCE_SCHEMA_VERSION = 1 as const;
+const BOUND_SCHEMA_VERSION = 2 as const;
+const ACQUIRED_BOUND = "ACQUIRED_BOUND" as const;
+const BINDING_POSITIONS = [
+  ["pool", "POOL"],
+  ["vault0", "VAULT0"],
+  ["vault1", "VAULT1"],
+] as const;
 /** Under the caller's project root: `data/research/cpmm-observations/<runId>/`. */
 export const CPMM_EVIDENCE_ROOT_SEGMENTS: readonly string[] = Object.freeze([
   "data",
@@ -370,7 +382,7 @@ export interface CpmmPoolContextInput {
   readonly vault1Account: CpmmPoolAccountInput;
   /** The adapted pool the run used (plain data; bigints are tagged on copy). */
   readonly adaptedPool: unknown;
-  /** No CPMM account acquisition exists yet (gap G3): supplied context is never verified here. */
+  /** Legacy input marker. Binding, if requested, is computed rather than supplied here. */
   readonly acquisition: "SUPPLIED_UNVERIFIED";
 }
 
@@ -404,6 +416,8 @@ export interface SealCpmmObservationInput {
   readonly plan: CpmmObservationPlanInput;
   readonly componentVersions: Readonly<Record<string, string>>;
   readonly poolContext: CpmmPoolContextInput;
+  /** Optional absolute path to a sealed acquisition bundle. Only its manifest digest is persisted. */
+  readonly acquisitionDir?: string;
   /** Endpoint URLs and extra secrets for redaction; never persisted. */
   readonly credentials: {
     readonly urls: readonly string[];
@@ -755,7 +769,7 @@ const render = (rel: string, value: unknown): RenderedFile => ({
   content: `${JSON.stringify(value, null, 2)}\n`,
 });
 
-/** Validates every input and renders every file in memory (no file system access). */
+/** Validates inputs (including any acquisition dependency) and renders before any writes. */
 function prepare(input: unknown): {
   outDir: string;
   files: RenderedFile[];
@@ -777,7 +791,7 @@ function prepare(input: unknown): {
       "lateActivity",
     ],
     "INPUT",
-    ["writeEvidenceFile"],
+    ["writeEvidenceFile", "acquisitionDir"],
   );
   if (typeof i.projectRoot !== "string" || !path.isAbsolute(i.projectRoot)) {
     invalid("PROJECT_ROOT_INVALID");
@@ -797,6 +811,18 @@ function prepare(input: unknown): {
   const plan = readPlan(i.plan, budget);
   const sealer = payloadSealer(secrets);
   const poolContext = readPoolContext(i.poolContext, budget, sealer);
+  let acquisitionManifestSha256: string | null = null;
+  if (i.acquisitionDir !== undefined) {
+    if (typeof i.acquisitionDir !== "string") invalid("ACQUISITION_DIRECTORY_INVALID");
+    const binding = checkAcquisitionBinding(poolContext, plan.binding, i.acquisitionDir, null);
+    if (binding.status !== "REPRODUCED" || binding.manifestSha256 === null) {
+      const cause = binding.findings.find((finding) => finding.startsWith(`${binding.status}:`));
+      refused(`ACQUISITION_BINDING:${cause ?? "MISSING_EVIDENCE:MANIFEST_UNAVAILABLE"}`);
+    }
+    acquisitionManifestSha256 = binding.manifestSha256;
+  }
+  const schemaVersion =
+    acquisitionManifestSha256 === null ? CPMM_EVIDENCE_SCHEMA_VERSION : BOUND_SCHEMA_VERSION;
   const late =
     i.lateActivity === null
       ? null
@@ -936,8 +962,11 @@ function prepare(input: unknown): {
     }),
     render(CPMM_EVIDENCE_FILES.poolContext, {
       kind: FILE_KINDS[CPMM_EVIDENCE_FILES.poolContext],
-      version: CPMM_EVIDENCE_SCHEMA_VERSION,
+      version: schemaVersion,
       ...poolContext,
+      ...(acquisitionManifestSha256 === null
+        ? {}
+        : { acquisition: ACQUIRED_BOUND, acquisitionManifestSha256 }),
     }),
     render(CPMM_EVIDENCE_FILES.ownerReport, {
       kind: FILE_KINDS[CPMM_EVIDENCE_FILES.ownerReport],
@@ -1013,7 +1042,7 @@ function prepare(input: unknown): {
   });
   const report = render(CPMM_EVIDENCE_FILES.report, {
     kind: FILE_KINDS[CPMM_EVIDENCE_FILES.report],
-    version: CPMM_EVIDENCE_SCHEMA_VERSION,
+    version: schemaVersion,
     runId: i.runId,
     runOutcome: {
       terminal: pick(reportValue, "terminal"),
@@ -1027,8 +1056,9 @@ function prepare(input: unknown): {
       recorderRetentionComplete: pick(plainRecord(snap.retention), "recorderRetentionComplete"),
       instrumentationComplete: pick(plainRecord(snap.instrumentation), "complete"),
     },
-    poolContextProvenance: "SUPPLIED_UNVERIFIED",
-    acquisitionProvenance: "OPEN_G3",
+    poolContextProvenance:
+      acquisitionManifestSha256 === null ? "SUPPLIED_UNVERIFIED" : ACQUIRED_BOUND,
+    acquisitionProvenance: acquisitionManifestSha256 === null ? "OPEN_G3" : ACQUIRED_BOUND,
     rederivation: { status: "NOT_IMPLEMENTED" },
     credentialsRecorded: false,
     endpointUrlsRecorded: false,
@@ -1040,7 +1070,7 @@ function prepare(input: unknown): {
   const manifest = render(CPMM_EVIDENCE_FILES.manifest, {
     kind: CPMM_EVIDENCE_MANIFEST_KIND,
     version: CPMM_EVIDENCE_MANIFEST_VERSION,
-    evidenceSchemaVersion: CPMM_EVIDENCE_SCHEMA_VERSION,
+    evidenceSchemaVersion: schemaVersion,
     componentVersions: versions,
     files: entries,
   });
@@ -1088,7 +1118,7 @@ export function sealCpmmObservationEvidence(
     return typeof v === "string" && ERRNO.test(v) ? v : "UNKNOWN";
   };
 
-  // 1. Validate, sanitize, render and scan everything in memory.
+  // 1. Validate, sanitize, render and scan everything before writes.
   let prepared: ReturnType<typeof prepare>;
   try {
     prepared = prepare(input);
@@ -1170,9 +1200,11 @@ export interface CpmmEvidenceVerification {
     readonly acquisitionProvenance: unknown;
     readonly runOutcome: unknown;
   } | null;
-  /** Always supplied, even when re-derivation matches (gap G3). */
-  readonly poolContextProvenance: "SUPPLIED_UNVERIFIED" | null;
-  readonly acquisitionProvenance: "OPEN_G3";
+  /** Null for an unverified bound claim or an observation integrity failure. */
+  readonly poolContextProvenance: "SUPPLIED_UNVERIFIED" | "ACQUIRED_BOUND" | null;
+  readonly acquisitionProvenance: "OPEN_G3" | "ACQUIRED_BOUND";
+  /** Only for version 2 after observation integrity passes. Never changes observation integrity. */
+  readonly acquisitionBinding?: CpmmAcquisitionBinding;
   readonly flags: typeof CPMM_EVIDENCE_FALSE_FLAGS;
 }
 
@@ -1181,6 +1213,15 @@ export type CpmmRederivationStatus =
   | "MISMATCH"
   | "MISSING_EVIDENCE"
   | "LIMITED_BY_REDACTION";
+
+interface CpmmAcquisitionBinding extends CpmmComponentRederivation {
+  readonly expectedManifestSha256: string | null;
+  readonly manifestSha256: string | null;
+  readonly dependency: Pick<
+    CpmmPoolAcquisitionVerification,
+    "integrity" | "integrityCode" | "computed"
+  > | null;
+}
 
 export interface CpmmComponentRederivation {
   readonly status: CpmmRederivationStatus;
@@ -1247,6 +1288,8 @@ export interface CpmmTransactionRederivation extends CpmmComponentRederivation {
 export interface CpmmEvidenceVerificationOptions {
   /** The credential values the run's adapter was given (the adapter's own `secrets` rule). */
   readonly analysisSecrets?: readonly string[];
+  /** Absolute path to the acquisition bundle for a version 2 observation. */
+  readonly acquisitionDir?: string;
 }
 
 /**
@@ -1928,9 +1971,10 @@ export function verifyCpmmObservationEvidence(
   let manifestSha256: string | null = null;
   const result = (
     retention: CpmmEvidenceVerification["retention"],
-    poolContextProvenance: "SUPPLIED_UNVERIFIED" | null,
+    poolContextProvenance: CpmmEvidenceVerification["poolContextProvenance"],
     rederivation: CpmmRederivation = NOT_ATTEMPTED,
     sealedClaims: CpmmEvidenceVerification["sealedClaims"] = null,
+    acquisitionBinding?: CpmmAcquisitionBinding,
   ): CpmmEvidenceVerification =>
     deepFreezeOwn({
       outDir,
@@ -1940,7 +1984,8 @@ export function verifyCpmmObservationEvidence(
       rederivation,
       sealedClaims,
       poolContextProvenance,
-      acquisitionProvenance: "OPEN_G3" as const,
+      acquisitionProvenance: poolContextProvenance === ACQUIRED_BOUND ? ACQUIRED_BOUND : "OPEN_G3",
+      ...(acquisitionBinding === undefined ? {} : { acquisitionBinding }),
       flags: CPMM_EVIDENCE_FALSE_FLAGS,
     });
   const integrityFailure = () => result({ status: "NOT_EVALUATED", reasons: [] }, null);
@@ -1979,7 +2024,8 @@ export function verifyCpmmObservationEvidence(
   const m = manifest as Record<string, unknown>;
   if (m.kind !== CPMM_EVIDENCE_MANIFEST_KIND) problems.push("MANIFEST_KIND_INVALID");
   if (m.version !== CPMM_EVIDENCE_MANIFEST_VERSION) problems.push("MANIFEST_VERSION_UNSUPPORTED");
-  if (m.evidenceSchemaVersion !== CPMM_EVIDENCE_SCHEMA_VERSION) {
+  const schemaVersion = m.evidenceSchemaVersion;
+  if (schemaVersion !== CPMM_EVIDENCE_SCHEMA_VERSION && schemaVersion !== BOUND_SCHEMA_VERSION) {
     problems.push("EVIDENCE_SCHEMA_VERSION_UNSUPPORTED");
   }
   if (
@@ -1995,6 +2041,8 @@ export function verifyCpmmObservationEvidence(
     return integrityFailure();
   }
   if (problems.length > 0) return integrityFailure();
+  const evidenceVersion =
+    schemaVersion === BOUND_SCHEMA_VERSION ? BOUND_SCHEMA_VERSION : CPMM_EVIDENCE_SCHEMA_VERSION;
 
   // 2. Entries: schema, confined unique sorted paths, bounded sizes, required files.
   const listed = new Map<string, { bytes: number; sha256: string }>();
@@ -2067,7 +2115,7 @@ export function verifyCpmmObservationEvidence(
   if (problems.length > 0) return integrityFailure();
 
   try {
-    checkDocuments(docs, listed, problems);
+    checkDocuments(docs, listed, problems, evidenceVersion);
   } catch {
     problems.push("EVIDENCE_STRUCTURE_INVALID");
   }
@@ -2091,11 +2139,26 @@ export function verifyCpmmObservationEvidence(
       acquisitionProvenance: report.acquisitionProvenance,
       runOutcome: copyJson(report.runOutcome),
     };
+    const ctx = docs.get(CPMM_EVIDENCE_FILES.poolContext)!;
+    const acquisitionBinding =
+      evidenceVersion === BOUND_SCHEMA_VERSION
+        ? checkAcquisitionBinding(
+            ctx,
+            get(docs.get(CPMM_EVIDENCE_FILES.plan), "plan", "binding"),
+            acquisitionDirectory(options),
+            ctx.acquisitionManifestSha256 as string,
+          )
+        : undefined;
     return result(
       { status: reasons.length === 0 ? "COMPLETE" : "INCOMPLETE", reasons },
-      "SUPPLIED_UNVERIFIED",
+      acquisitionBinding === undefined
+        ? "SUPPLIED_UNVERIFIED"
+        : acquisitionBinding.status === "REPRODUCED"
+          ? ACQUIRED_BOUND
+          : null,
       rederive(docs, credentials),
       claims,
+      acquisitionBinding,
     );
   } catch {
     problems.push("EVIDENCE_STRUCTURE_INVALID");
@@ -2140,13 +2203,17 @@ function checkDocuments(
   docs: Map<string, Record<string, unknown>>,
   listed: Map<string, { bytes: number; sha256: string }>,
   problems: string[],
+  schemaVersion: typeof CPMM_EVIDENCE_SCHEMA_VERSION | typeof BOUND_SCHEMA_VERSION,
 ): void {
   // Kinds and versions.
   for (const [p, doc] of docs) {
     const kind = EXCHANGE_FILE.test(p) ? EXCHANGE_FILE_KIND : FILE_KINDS[p];
     if (doc.kind !== kind) problems.push(`FILE_KIND_INVALID:${p}`);
-    if (doc.version !== CPMM_EVIDENCE_SCHEMA_VERSION)
-      problems.push(`FILE_VERSION_UNSUPPORTED:${p}`);
+    const version =
+      p === CPMM_EVIDENCE_FILES.poolContext || p === CPMM_EVIDENCE_FILES.report
+        ? schemaVersion
+        : CPMM_EVIDENCE_SCHEMA_VERSION;
+    if (doc.version !== version) problems.push(`FILE_VERSION_UNSUPPORTED:${p}`);
   }
   if (problems.length > 0) return;
 
@@ -2166,14 +2233,38 @@ function checkDocuments(
   }
   if (!sameKeys(report.rederivation, ["status"]))
     problems.push("REPORT_REDERIVATION_CLAIM_INVALID");
-  if (report.acquisitionProvenance !== "OPEN_G3")
+  const bound = schemaVersion === BOUND_SCHEMA_VERSION;
+  const provenance = bound ? ACQUIRED_BOUND : "SUPPLIED_UNVERIFIED";
+  if (report.acquisitionProvenance !== (bound ? ACQUIRED_BOUND : "OPEN_G3"))
     problems.push("REPORT_ACQUISITION_PROVENANCE_INVALID");
   if (!runOutcomeOk(report.runOutcome)) problems.push("REPORT_RUN_OUTCOME_MALFORMED");
-  if (report.poolContextProvenance !== "SUPPLIED_UNVERIFIED") {
+  if (report.poolContextProvenance !== provenance) {
     problems.push("REPORT_POOL_PROVENANCE_INVALID");
   }
-  if (docs.get(CPMM_EVIDENCE_FILES.poolContext)!.acquisition !== "SUPPLIED_UNVERIFIED") {
+  const ctx = docs.get(CPMM_EVIDENCE_FILES.poolContext)!;
+  if (ctx.acquisition !== provenance) {
     problems.push("POOL_CONTEXT_PROVENANCE_INVALID");
+  }
+  if (
+    bound
+      ? !sameKeys(ctx, [
+          "kind",
+          "version",
+          "target",
+          "accounts",
+          "adaptedPool",
+          "acquisition",
+          "acquisitionManifestSha256",
+        ]) ||
+        !sameKeys(
+          ctx.accounts,
+          BINDING_POSITIONS.map(([name]) => name),
+        ) ||
+        typeof ctx.acquisitionManifestSha256 !== "string" ||
+        !HEX64.test(ctx.acquisitionManifestSha256)
+      : Object.hasOwn(ctx, "acquisitionManifestSha256")
+  ) {
+    problems.push("POOL_CONTEXT_ACQUISITION_REFERENCE_INVALID");
   }
 
   // Structure: payload presence, component sections, recorder and collector accounting.
@@ -2517,10 +2608,103 @@ const sameBinding = (a: unknown, b: unknown): boolean =>
   get(a, "poolAddress") === get(b, "poolAddress") &&
   get(a, "candidateMint") === get(b, "candidateMint");
 
+function acquisitionDirectory(options: unknown): unknown {
+  if (options === undefined) return undefined;
+  const record = plainRecord(options);
+  if (record === null) return null;
+  const descriptor = getOwnDesc(record, "acquisitionDir");
+  return descriptor === undefined ? undefined : "value" in descriptor ? descriptor.value : null;
+}
+
+/** Compare the observation to the same bounded read used to verify the dependency. */
+function checkAcquisitionBinding(
+  ctx: Record<string, unknown>,
+  planBinding: unknown,
+  directory: unknown,
+  expectedManifestSha256: string | null,
+): CpmmAcquisitionBinding {
+  const f = new Findings();
+  const acquired =
+    typeof directory === "string" ? verifyCpmmPoolAcquisitionForBinding(directory) : null;
+  const manifestSha256 = acquired?.manifestSha256 ?? null;
+  const verification = acquired?.verification;
+  if (directory === undefined) f.add("MISSING_EVIDENCE", "ACQUISITION_DIRECTORY_NOT_SUPPLIED");
+  else if (acquired === null) f.add("MISMATCH", "ACQUISITION_DIRECTORY_INVALID");
+  if (
+    expectedManifestSha256 !== null &&
+    manifestSha256 !== null &&
+    manifestSha256 !== expectedManifestSha256
+  )
+    f.add("MISMATCH", "ACQUISITION_MANIFEST_DIGEST");
+  if (verification !== undefined) {
+    for (const { status, link } of verification.issues) f.add(status, `ACQUISITION:${link}`);
+    if (verification.integrity === "FAILED" && verification.integrityCode !== "FILE_MISSING") {
+      f.add("MISMATCH", `ACQUISITION_INTEGRITY:${verification.integrityCode}`);
+    } else if (verification.computed === "ACQUIRED_LIMITED") {
+      if (verification.issues.length === 0) f.add("MISSING_EVIDENCE", "ACQUIRED_LIMITED");
+    } else if (
+      verification.computed === "ACQUISITION_FAILED" ||
+      verification.computed === "ACQUIRED_CONTEXT_REFUSED"
+    ) {
+      f.add("MISMATCH", verification.computed);
+    } else if (verification.computed === "ACQUIRED_REPRODUCED" && !acquired?.context) {
+      f.add("MISSING_EVIDENCE", "ACQUISITION_VERIFIED_CONTEXT_UNAVAILABLE");
+    }
+  }
+
+  if (!sameBinding(ctx.target, planBinding)) f.add("MISMATCH", "OBSERVATION_TARGET_BINDING");
+  if (!sameBinding(ctx.adaptedPool, planBinding))
+    f.add("MISMATCH", "OBSERVATION_ADAPTED_POOL_BINDING");
+  const context = acquired?.context;
+  if (context) {
+    if (canonical(ctx.target) !== canonical(context.target))
+      f.add("MISMATCH", "ACQUISITION_TARGET");
+    if (canonical(ctx.adaptedPool) !== canonical(context.adaptedPool))
+      f.add("MISMATCH", "ACQUISITION_ADAPTED_POOL");
+  }
+  for (const [i, [name, position]] of BINDING_POSITIONS.entries()) {
+    const account = get(ctx, "accounts", name);
+    const payload = get(account, "data");
+    const bytes = exactBytes(payload);
+    if ("missing" in bytes) {
+      f.add(
+        bytes.missing === "REDACTED" ? "LIMITED_BY_REDACTION" : "MISSING_EVIDENCE",
+        `OBSERVATION_ACCOUNT_DATA_${bytes.missing}:${position}`,
+      );
+    }
+    if (!context) continue;
+    const expected = context.accounts[i]!;
+    if (expected.position !== position || get(account, "address") !== expected.address)
+      f.add("MISMATCH", `ACQUISITION_ACCOUNT_POSITION_ADDRESS:${position}`);
+    if (get(account, "ownerProgramId") !== expected.ownerProgramId)
+      f.add("MISMATCH", `ACQUISITION_ACCOUNT_OWNER:${position}`);
+    if (get(account, "slot") !== expected.slot)
+      f.add("MISMATCH", `ACQUISITION_ACCOUNT_SLOT:${position}`);
+    const digest = "bytes" in bytes ? sha256(bytes.bytes) : get(payload, "originalSha256");
+    if (typeof digest === "string" && digest !== expected.originalSha256)
+      f.add("MISMATCH", `ACQUISITION_ACCOUNT_BYTES:${position}`);
+  }
+  return {
+    status: f.status,
+    findings: f.list,
+    expectedManifestSha256,
+    manifestSha256,
+    dependency: verification
+      ? {
+          integrity: verification.integrity,
+          computed: verification.computed,
+          ...(verification.integrityCode === undefined
+            ? {}
+            : { integrityCode: verification.integrityCode }),
+        }
+      : null,
+  };
+}
+
 /**
  * Pool context: the accepted adapter over the stored raw accounts and their recorded identities,
  * owners and slots, compared canonically (bigints tagged as sealed) with the recorded adapted pool
- * and with every recorded binding. Provenance stays SUPPLIED_UNVERIFIED whatever the result.
+ * and with every recorded binding. Acquisition provenance is computed separately.
  */
 function rederivePoolContext(docs: Map<string, Record<string, unknown>>): {
   readonly result: CpmmComponentRederivation;
@@ -3138,9 +3322,10 @@ function readAnalysisCredentials(options: unknown): AnalysisCredentials {
     const o = plainRecord(options);
     if (o === null) return { status: "INVALID" };
     const keys = reflectOwnKeys(o);
-    if (keys.length === 0) return { status: "NOT_SUPPLIED" };
-    if (keys.length !== 1 || keys[0] !== "analysisSecrets") return { status: "INVALID" };
-    const d = getOwnDesc(o, "analysisSecrets")!;
+    if (keys.some((k) => k !== "analysisSecrets" && k !== "acquisitionDir"))
+      return { status: "INVALID" };
+    const d = getOwnDesc(o, "analysisSecrets");
+    if (d === undefined) return { status: "NOT_SUPPLIED" };
     if (!("value" in d)) return { status: "INVALID" };
     const list = d.value as unknown;
     if (list === undefined) return { status: "NOT_SUPPLIED" };

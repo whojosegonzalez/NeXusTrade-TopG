@@ -27,7 +27,7 @@ import { tmpdir } from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { PublicKey } from "@solana/web3.js";
-import { afterAll, describe, expect, it } from "vitest";
+import { afterAll, describe, expect, it, vi } from "vitest";
 import { encodeBase58 } from "../providers/solana-rpc/SolanaRpcMintAccountParser.js";
 import {
   FIXTURE_CPMM_POOL_ADDRESS,
@@ -36,6 +36,7 @@ import {
   createAuthoritativeCpmmSplVaultBuffer,
   createAuthoritativeRaydiumCpmmBuffer,
 } from "../research/pilot/fixtures/AuthoritativeCpmmFixtures.js";
+import { CpmmPoolAccountAcquisition } from "../candidate-scanner/CpmmPoolAccountAcquisition.js";
 import {
   CpmmPoolConnectionOwner,
   type CpmmConnectionOwnerLimits,
@@ -86,6 +87,7 @@ import {
   createCpmmExchangeEvidenceRecorder,
 } from "../candidate-scanner/RaydiumCpmmTransactionSourceAdapter.js";
 import { RollingTradeFlowTracker } from "../candidate-scanner/RollingTradeFlowTracker.js";
+import { sealCpmmPoolAcquisitionEvidence } from "./cpmm-pool-acquisition-evidence.js";
 import {
   CPMM_EVIDENCE_FALSE_FLAGS,
   CPMM_EVIDENCE_FILES,
@@ -1029,6 +1031,382 @@ const shared = (async () => {
   return { run, input, result, dir: result.outDir };
 })();
 
+/** The acquisition and the observation independently consume the same authoritative fixture. */
+async function sealAcquisition(
+  mode: "success" | "failed" | "redacted" = "success",
+  runId = "acquisition",
+) {
+  vi.useFakeTimers({ toFake: ["Date", "setTimeout", "clearTimeout"] });
+  vi.setSystemTime(OBS_START - 10_000);
+  const acquirer = new CpmmPoolAccountAcquisition();
+  const limits = {
+    pacingMs: 2500,
+    timeoutMs: 1000,
+    maxResponseBytes: 4096,
+    deadlineMs: Date.now() + 8000,
+  };
+  const { target, poolAccount, vault0Account, vault1Account } = FIXTURE;
+  const accounts = [poolAccount, vault0Account, vault1Account];
+  const session = new PaperRequestSession({
+    executionContext: "PAPER_SIMULATION",
+    clock: () => Date.now(),
+    timers: { setTimeout, clearTimeout },
+    limits: {
+      lifetimeMs: 10_000,
+      maxHttpAttempts: 2,
+      requestTimeoutMs: limits.timeoutMs,
+      lanes: {
+        ...LANES,
+        SOLANA_RPC: {
+          pacingMs: limits.pacingMs,
+          maxResponseBytes: limits.maxResponseBytes,
+          maxAttempts: 2,
+        },
+      },
+    },
+    fetchFn: async (_url, init) => {
+      if (mode === "failed") return new Response(null, { status: 500 });
+      const { id, params } = JSON.parse(String(init?.body)) as { id: number; params: [string[]] };
+      return Response.json({
+        jsonrpc: "2.0",
+        id,
+        result: {
+          context: {
+            slot: poolAccount.slot,
+            apiVersion: mode === "redacted" && params[0].length === 3 ? SECRET : "2.0.0",
+          },
+          value: params[0].map((address) => {
+            const a = accounts.find((entry) => entry.address === address)!;
+            return {
+              data: [a.data.toString("base64"), "base64"],
+              owner: a.ownerProgramId,
+              lamports: 1,
+              executable: false,
+              rentEpoch: 0,
+              space: a.data.length,
+            };
+          }),
+        },
+      });
+    },
+    onExchangeComplete: (e) => acquirer.onExchangeComplete(e),
+  });
+  try {
+    session.open();
+    const pending = acquirer.acquire({
+      session,
+      target,
+      url: RPC_URL,
+      deadlineMs: limits.deadlineMs,
+      timeoutMs: limits.timeoutMs,
+      maxResponseBytes: limits.maxResponseBytes,
+      timers: { setTimeout, clearTimeout },
+    });
+    await vi.advanceTimersByTimeAsync(3000);
+    const result = await pending;
+    expect(result.outcome, result.code).toBe(mode === "failed" ? "ACQUISITION_FAILED" : "ACQUIRED");
+    const sealed = sealCpmmPoolAcquisitionEvidence({
+      projectRoot: freshRoot(),
+      runId,
+      target,
+      limits,
+      ledger: session.getLedgerSince(0),
+      result,
+      credentials: CREDENTIALS,
+    });
+    if (!sealed.ok) throw new Error(`acquisition fixture seal failed: ${sealed.code}`);
+    return sealed;
+  } finally {
+    session.stop("TEST_DONE");
+    vi.useRealTimers();
+  }
+}
+
+describe("item S step 3: acquisition-bound observation evidence", () => {
+  let fixture: Awaited<ReturnType<typeof createBound>>;
+  async function createBound() {
+    const { input } = await shared;
+    const acquisition = await sealAcquisition();
+    const boundInput = { ...input, projectRoot: freshRoot(), acquisitionDir: acquisition.outDir };
+    const sealed = sealCpmmObservationEvidence(boundInput);
+    if (!sealed.ok) throw new Error(`bound observation fixture seal failed: ${sealed.code}`);
+    return { acquisition, boundInput, dir: sealed.outDir };
+  }
+  async function bound() {
+    return (fixture ??= await createBound());
+  }
+
+  it("reproduces the binding from genuine bundles with an explicit, relocatable dependency", async () => {
+    const { acquisition, dir } = await bound();
+    const digest = sha(readFileSync(path.join(acquisition.outDir, "evidence-manifest.json")));
+    expect(digest).toBe(acquisition.manifestSha256);
+    expect(readJson(dir, CPMM_EVIDENCE_FILES.manifest)).toMatchObject({ evidenceSchemaVersion: 2 });
+    expect(readJson(dir, CPMM_EVIDENCE_FILES.poolContext)).toMatchObject({
+      version: 2,
+      acquisition: "ACQUIRED_BOUND",
+      acquisitionManifestSha256: digest,
+    });
+    for (const file of listAll(dir)) {
+      const content = readFileSync(path.join(dir, file), "utf8");
+      expect(content.includes(JSON.stringify(acquisition.outDir).slice(1, -1))).toBe(false);
+    }
+    const moved = path.join(freshRoot(), path.basename(acquisition.outDir));
+    cpSync(acquisition.outDir, moved, { recursive: true });
+    const v = verifyCpmmObservationEvidence(dir, { ...ANALYSIS, acquisitionDir: moved });
+    expect(v).toMatchObject({
+      integrity: { ok: true, problems: [] },
+      retention: { status: "COMPLETE" },
+      poolContextProvenance: "ACQUIRED_BOUND",
+      acquisitionProvenance: "ACQUIRED_BOUND",
+      acquisitionBinding: {
+        status: "REPRODUCED",
+        findings: [],
+        expectedManifestSha256: digest,
+        manifestSha256: digest,
+        dependency: { integrity: "VERIFIED", computed: "ACQUIRED_REPRODUCED" },
+      },
+      rederivation: { components: { poolContext: { status: "REPRODUCED" } } },
+    });
+    expect(v.flags).toEqual(CPMM_EVIDENCE_FALSE_FLAGS);
+    const supplied = verifyCpmmObservationEvidence((await shared).dir, { acquisitionDir: moved });
+    expect(supplied.poolContextProvenance).toBe("SUPPLIED_UNVERIFIED");
+    expect(supplied.acquisitionBinding).toBeUndefined();
+    unlinkSync(path.join(moved, "accounts.json"));
+    expect(verifyCpmmObservationEvidence(dir, { acquisitionDir: moved })).toMatchObject({
+      integrity: { ok: true },
+      poolContextProvenance: null,
+      acquisitionBinding: {
+        status: "MISSING_EVIDENCE",
+        expectedManifestSha256: digest,
+        manifestSha256: digest,
+        findings: ["MISSING_EVIDENCE:ACQUISITION:BUNDLE"],
+      },
+    });
+  });
+
+  it("rejects a different exact manifest digest, even if that dependency reproduces the same context", async () => {
+    const { dir } = await bound();
+    const { outDir: rewritten } = await sealAcquisition("success", "other-acquisition");
+    expect(verifyCpmmObservationEvidence(dir, { acquisitionDir: rewritten })).toMatchObject({
+      integrity: { ok: true },
+      poolContextProvenance: null,
+      acquisitionBinding: {
+        status: "MISMATCH",
+        findings: ["MISMATCH:ACQUISITION_MANIFEST_DIGEST"],
+        dependency: { integrity: "VERIFIED", computed: "ACQUIRED_REPRODUCED" },
+      },
+    });
+    unlinkSync(path.join(rewritten, "accounts.json"));
+    expect(verifyCpmmObservationEvidence(dir, { acquisitionDir: rewritten })).toMatchObject({
+      integrity: { ok: true },
+      poolContextProvenance: null,
+      acquisitionBinding: {
+        status: "MISMATCH",
+        findings: ["MISMATCH:ACQUISITION_MANIFEST_DIGEST", "MISSING_EVIDENCE:ACQUISITION:BUNDLE"],
+        dependency: { integrity: "FAILED", integrityCode: "FILE_MISSING" },
+      },
+    });
+  });
+
+  it("keeps forged sealed claims and missing dependencies separate from computed provenance", async () => {
+    const { boundInput, dir } = await bound();
+    for (const [options, finding] of [
+      [undefined, "MISSING_EVIDENCE:ACQUISITION_DIRECTORY_NOT_SUPPLIED"],
+      [{ acquisitionDir: path.join(freshRoot(), "absent") }, "MISSING_EVIDENCE:ACQUISITION:BUNDLE"],
+    ] as const) {
+      expect(verifyCpmmObservationEvidence(dir, options)).toMatchObject({
+        integrity: { ok: true },
+        sealedClaims: { poolContextProvenance: "ACQUIRED_BOUND" },
+        poolContextProvenance: null,
+        acquisitionProvenance: "OPEN_G3",
+        acquisitionBinding: { status: "MISSING_EVIDENCE", findings: [finding] },
+      });
+    }
+    const projectRoot = freshRoot();
+    expect(
+      sealCpmmObservationEvidence({
+        ...boundInput,
+        projectRoot,
+        poolContext: { ...boundInput.poolContext, acquisition: "ACQUIRED_BOUND" as never },
+      }),
+    ).toMatchObject({ ok: false, code: "POOL_CONTEXT_ACQUISITION_UNSUPPORTED" });
+    expect(existsSync(outDirOf(projectRoot))).toBe(false);
+    const supplied = copyOf((await shared).dir);
+    reseal(supplied, CPMM_EVIDENCE_FILES.report, (report) => {
+      report.poolContextProvenance = report.acquisitionProvenance = "ACQUIRED_BOUND";
+    });
+    expect(
+      verifyCpmmObservationEvidence(supplied, { acquisitionDir: boundInput.acquisitionDir }),
+    ).toMatchObject({
+      integrity: {
+        ok: false,
+        problems: expect.arrayContaining(["REPORT_POOL_PROVENANCE_INVALID"]),
+      },
+      poolContextProvenance: null,
+      acquisitionProvenance: "OPEN_G3",
+    });
+  });
+
+  it("refuses failed, limited and corrupt dependencies independently of observation integrity", async () => {
+    const { boundInput, dir, acquisition } = await bound();
+    for (const [mode, status, computed, finding] of [
+      ["failed", "MISMATCH", "ACQUISITION_FAILED", "MISMATCH:ACQUISITION_FAILED"],
+      [
+        "redacted",
+        "LIMITED_BY_REDACTION",
+        "ACQUIRED_LIMITED",
+        "LIMITED_BY_REDACTION:ACQUISITION:SNAPSHOT_RESPONSE",
+      ],
+    ] as const) {
+      const other = await sealAcquisition(mode);
+      const projectRoot = freshRoot();
+      expect(
+        sealCpmmObservationEvidence({ ...boundInput, projectRoot, acquisitionDir: other.outDir }),
+      ).toMatchObject({ ok: false, code: `ACQUISITION_BINDING:${finding}` });
+      expect(existsSync(outDirOf(projectRoot))).toBe(false);
+      const forged = copyOf(dir);
+      reseal(forged, CPMM_EVIDENCE_FILES.poolContext, (ctx) => {
+        ctx.acquisitionManifestSha256 = other.manifestSha256;
+      });
+      expect(verifyCpmmObservationEvidence(forged, { acquisitionDir: other.outDir })).toMatchObject(
+        {
+          integrity: { ok: true },
+          poolContextProvenance: null,
+          acquisitionBinding: {
+            status,
+            findings: expect.arrayContaining([finding]),
+            dependency: { integrity: "VERIFIED", computed },
+          },
+        },
+      );
+    }
+    const corrupt = path.join(freshRoot(), "acquisition");
+    cpSync(acquisition.outDir, corrupt, { recursive: true });
+    const accountsPath = path.join(corrupt, "accounts.json");
+    const bytes = readFileSync(accountsPath);
+    bytes[1] = 0x20;
+    writeFileSync(accountsPath, bytes);
+    expect(verifyCpmmObservationEvidence(dir, { acquisitionDir: corrupt })).toMatchObject({
+      integrity: { ok: true },
+      poolContextProvenance: null,
+      acquisitionBinding: {
+        status: "MISMATCH",
+        findings: ["MISMATCH:ACQUISITION_INTEGRITY:FILE_HASH_MISMATCH"],
+        dependency: { integrity: "FAILED", integrityCode: "FILE_HASH_MISMATCH" },
+      },
+    });
+  });
+
+  it("rejects independently changed target, position, address, owner, slot, bytes and adapted pool", async () => {
+    const { acquisition, dir } = await bound();
+    const rec = (o: unknown) => o as Record<string, unknown>;
+    const cases: [string, (ctx: Record<string, unknown>) => void][] = [
+      [
+        "ACQUISITION_TARGET",
+        (c) => {
+          rec(c.target).candidateMint = key(91);
+        },
+      ],
+      [
+        "ACQUISITION_ACCOUNT_POSITION_ADDRESS:VAULT0",
+        (c) => {
+          const a = rec(c.accounts);
+          [a.vault0, a.vault1] = [a.vault1, a.vault0];
+        },
+      ],
+      [
+        "ACQUISITION_ACCOUNT_POSITION_ADDRESS:POOL",
+        (c) => {
+          rec(get(c, "accounts", "pool")).address = key(91);
+        },
+      ],
+      [
+        "ACQUISITION_ACCOUNT_OWNER:VAULT1",
+        (c) => {
+          rec(get(c, "accounts", "vault1")).ownerProgramId = key(91);
+        },
+      ],
+      [
+        "ACQUISITION_ACCOUNT_SLOT:VAULT0",
+        (c) => {
+          rec(get(c, "accounts", "vault0")).slot = FIXTURE.poolAccount.slot + 1;
+        },
+      ],
+      [
+        "ACQUISITION_ACCOUNT_BYTES:POOL",
+        (c) => {
+          const bytes = Buffer.from(FIXTURE.poolAccount.data);
+          bytes[bytes.length - 1] = bytes[bytes.length - 1]! ^ 1;
+          Object.assign(rec(get(c, "accounts", "pool", "data")), {
+            stored: bytes.toString("base64"),
+            originalSha256: sha(bytes),
+            storedSha256: sha(bytes),
+          });
+        },
+      ],
+      [
+        "ACQUISITION_ADAPTED_POOL",
+        (c) => {
+          rec(c.adaptedPool).baseVaultRaw = { $bigint: "42" };
+        },
+      ],
+    ];
+    for (const [finding, mutate] of cases) {
+      const copy = copyOf(dir);
+      reseal(copy, CPMM_EVIDENCE_FILES.poolContext, mutate);
+      expect(
+        verifyCpmmObservationEvidence(copy, { acquisitionDir: acquisition.outDir }),
+        finding,
+      ).toMatchObject({
+        integrity: { ok: true },
+        poolContextProvenance: null,
+        acquisitionBinding: {
+          status: "MISMATCH",
+          findings: expect.arrayContaining([`MISMATCH:${finding}`]),
+        },
+      });
+    }
+  });
+
+  it("does not bind withheld observation bytes and still reports a known owner contradiction", async () => {
+    const { dir, acquisition } = await bound();
+    const copy = copyOf(dir);
+    reseal(copy, CPMM_EVIDENCE_FILES.poolContext, (c) => {
+      const a = get(c, "accounts", "pool") as Record<string, unknown>;
+      Object.assign(a.data as object, {
+        withheldReason: "CREDENTIAL_SCAN_INCONCLUSIVE",
+        stored: null,
+        storedEncoding: null,
+        storedBytes: null,
+        storedSha256: null,
+      });
+    });
+    const options = { acquisitionDir: acquisition.outDir };
+    expect(verifyCpmmObservationEvidence(copy, options)).toMatchObject({
+      integrity: { ok: true },
+      poolContextProvenance: null,
+      acquisitionBinding: {
+        status: "MISSING_EVIDENCE",
+        findings: ["MISSING_EVIDENCE:OBSERVATION_ACCOUNT_DATA_UNAVAILABLE:POOL"],
+      },
+    });
+    reseal(copy, CPMM_EVIDENCE_FILES.poolContext, (c) => {
+      (get(c, "accounts", "pool") as Record<string, unknown>).ownerProgramId = key(91);
+    });
+    expect(verifyCpmmObservationEvidence(copy, options)).toMatchObject({
+      integrity: { ok: true },
+      poolContextProvenance: null,
+      acquisitionBinding: {
+        status: "MISMATCH",
+        findings: [
+          "MISSING_EVIDENCE:OBSERVATION_ACCOUNT_DATA_UNAVAILABLE:POOL",
+          "MISMATCH:ACQUISITION_ACCOUNT_OWNER:POOL",
+        ],
+      },
+    });
+  });
+});
+
 // ---------------------------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------------------------
@@ -1724,6 +2102,8 @@ describe("CPMM observation evidence: verification", () => {
       "../candidate-scanner/CpmmResolutionAccountingLedger.js",
       "../candidate-scanner/ExactPoolHistoryEnumerator.js",
       "../candidate-scanner/RaydiumCpmmTransactionSourceAdapter.js",
+      // Offline verifier only; the observation module never calls acquisition or dispatch.
+      "./cpmm-pool-acquisition-evidence.js",
       "./evidence-credential-sanitizer.js",
     ]);
     for (const banned of [
