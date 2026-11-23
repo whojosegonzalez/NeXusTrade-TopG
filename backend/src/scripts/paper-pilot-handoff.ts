@@ -149,6 +149,9 @@ export const ALLOWED_ADDITIONS_SINCE_REVIEWED_RUNNER = Object.freeze([
   // The offline composition core (roadmap step 3) and its synthetic tests (section 8.38.17 item 17 T).
   "backend/src/scripts/cpmm-pool-observation-run.ts",
   "backend/src/scripts/cpmm-pool-observation-run.test.ts",
+  // The offline-testable observation entry point (roadmap step 3) and its tests (item 17 T).
+  "backend/src/scripts/cpmm-pool-observation.ts",
+  "backend/src/scripts/cpmm-pool-observation.test.ts",
 ]);
 
 export interface ReviewedTreeEntry {
