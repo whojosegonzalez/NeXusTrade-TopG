@@ -90,7 +90,7 @@ export interface SealCpmmPoolAcquisitionInput {
     readonly maxResponseBytes: number;
     readonly pacingMs: number;
   };
-  /** Contiguous slice containing the acquisition's two purposes and any interleaved activity. */
+  /** Contiguous slice containing the acquisition's dispatches and any foreign activity. */
   readonly ledger: readonly PaperRequestLedgerEntry[];
   readonly result: CpmmPoolAccountAcquisitionResult;
   /** Caller-supplied only; nothing reads the environment or configuration. */
@@ -637,21 +637,21 @@ function responseContainsOpaqueOrSensitiveAccounts(
   parsed: unknown,
   secrets: readonly string[],
 ): boolean {
-  const scan = (v: unknown, accountData = false): boolean => {
-    if (Array.isArray(v)) {
-      if (v[1] === "base64" || accountData) {
-        if (typeof v[0] !== "string" || v[1] !== "base64") return true;
-        // Node's decoder also recognizes unpadded and URL-safe forms that the RPC validator refuses.
-        const decoded = Buffer.from(v[0], "base64");
-        if (scrub(decoded, secrets, BINARY_SCOPE).state !== "ORIGINAL") return true;
-      }
-      return v.some((item: unknown) => scan(item));
-    }
+  const opaqueOrSensitive = (v: unknown): boolean => {
+    if (!Array.isArray(v) || v.length !== 2 || typeof v[0] !== "string" || v[1] !== "base64")
+      return true;
+    const decoded = Buffer.from(v[0], "base64");
+    return (
+      decoded.toString("base64") !== v[0] ||
+      scrub(decoded, secrets, BINARY_SCOPE).state !== "ORIGINAL"
+    );
+  };
+  const scan = (v: unknown): boolean => {
+    if (Array.isArray(v))
+      return v[1] === "base64" ? opaqueOrSensitive(v) : v.some((item: unknown) => scan(item));
     if (v !== null && typeof v === "object")
-      return Object.entries(v).some(
-        ([key, item]) =>
-          (key === "data" && typeof item === "string") ||
-          scan(item, key === "data" && Array.isArray(item)),
+      return Object.entries(v).some(([key, item]) =>
+        key === "data" ? opaqueOrSensitive(item) : scan(item),
       );
     return false;
   };
@@ -1043,6 +1043,15 @@ function assess(bundle: ReturnType<typeof loadBundle>): CpmmPoolAcquisitionVerif
     return t !== null && typeof t === "object" && t.$number === "-0" ? 0 : undefined;
   };
   const contextExpected = report.outcome !== "ACQUISITION_FAILED";
+  const pureFailure =
+    /^(RPC_ERROR|NOT_UTF8|NOT_JSON|ENVELOPE_.*|ID_.*|RESULT_SHAPE|CONTEXT_.*|VALUE_LENGTH_MISMATCH|ACCOUNT_.*|DISCOVERY_POOL_REFUSED:.*|DISCOVERY_VAULTS_INVALID|SNAPSHOT_POOL_REFUSED:.*|POOL_VAULTS_CHANGED)$/.test(
+      report.code,
+    );
+  const failureNeedsExchange =
+    pureFailure ||
+    /^(EVIDENCE_.*|HTTP_429_RECEIVED|HTTP_REDIRECT_REJECTED|HTTP_STATUS_NOT_200|REQUEST_(ABORTED|TIMED_OUT)|NETWORK_ERROR|RESPONSE_(TOO_LARGE|INCOMPLETE)|.*_IN_FLIGHT)$/.test(
+      report.code,
+    );
   const validTarget =
     address.safeParse(plan.target.poolAddress).success &&
     address.safeParse(plan.target.candidateMint).success &&
@@ -1050,42 +1059,74 @@ function assess(bundle: ReturnType<typeof loadBundle>): CpmmPoolAcquisitionVerif
     plan.target.poolAddress !== WSOL_MINT &&
     plan.target.candidateMint !== plan.target.poolAddress;
   if (ledger.some((e, i) => i > 0 && e.seq !== ledger[i - 1]!.seq + 1)) mismatch("LEDGER_WINDOW");
-  const owned = ledger.filter((e) => e.purpose === DISCOVERY || e.purpose === SNAPSHOT);
+
+  // Lane limits describe the whole shared lane, regardless of acquisition ownership.
+  const rpcEntries = ledger.filter((e) => e.lane === "SOLANA_RPC");
+  for (let i = 1; i < rpcEntries.length; i++) {
+    const previous = rpcEntries[i - 1]!;
+    const start = validTime(previous.dispatchedAtMs);
+    const end = validTime(previous.completedAtMs);
+    const next = validTime(rpcEntries[i]!.dispatchedAtMs);
+    if (start === undefined || next === undefined) missing("LANE_PACING_TIMING");
+    else check(next - start >= plan.limits.pacingMs, "LANE_PACING");
+    if (end === undefined || next === undefined) missing("LANE_SERIALIZATION_TIMING");
+    else check(next >= end, "LANE_SERIALIZATION");
+  }
+
+  // The acquisition's observer bound each retained exchange to onDispatched's sequence.
+  // Labels, even combined with lane/owner/target, cannot assign an unbound sequence.
+  const owned = exchanges.map(({ entry }) => entry);
+  const discoveryEntry = owned.find((e) => e.purpose === DISCOVERY);
+  const snapshotEntry = owned.find((e) => e.purpose === SNAPSHOT);
+  const requestedIdentityMatches = (e: Ledger) =>
+    e.owner === "FLOW" &&
+    e.lane === "SOLANA_RPC" &&
+    e.requestedIdentity === plan.target.poolAddress &&
+    typeof e.jsonRpcId === "number";
   check(
-    owned.length <= 2 && owned.every((e, i) => e.purpose === plan.purposes[i]),
+    owned.length <= plan.purposes.length &&
+      owned.every((e) => e.purpose === DISCOVERY || e.purpose === SNAPSHOT) &&
+      new Set(owned.map((e) => e.purpose)).size === owned.length &&
+      (!discoveryEntry || !snapshotEntry || discoveryEntry.seq < snapshotEntry.seq),
     "OWNED_LEDGER_ORDER",
   );
   if (owned.length || contextExpected) check(validTarget, "SUPPLIED_TARGET");
-  if (owned.length === 2) {
-    const [first, second] = owned as [Ledger, Ledger];
+  if (discoveryEntry && snapshotEntry) {
     check(
-      typeof first.jsonRpcId === "number" &&
-        typeof second.jsonRpcId === "number" &&
-        second.jsonRpcId > first.jsonRpcId,
+      typeof discoveryEntry.jsonRpcId === "number" &&
+        typeof snapshotEntry.jsonRpcId === "number" &&
+        snapshotEntry.jsonRpcId > discoveryEntry.jsonRpcId,
       "LEDGER_IDS",
     );
-    const afterFirst = [...ledger]
-      .reverse()
-      .find((entry) => entry.seq < second.seq && entry.lane === "SOLANA_RPC");
-    if (afterFirst) {
-      const prior = validTime(afterFirst.dispatchedAtMs);
-      const end = validTime(afterFirst.completedAtMs);
-      const next = validTime(second.dispatchedAtMs);
-      if (prior !== undefined && next !== undefined)
-        check(next - prior >= plan.limits.pacingMs, "LANE_PACING");
-      if (end !== undefined && next !== undefined) check(next >= end, "LANE_SERIALIZATION");
-    }
   }
   check(exchanges.length === report.retainedExchanges, "REPORT_RETENTION");
-  for (const entry of owned) {
-    if (!exchanges.some((e) => e.entry.seq === entry.seq)) missing(`${entry.purpose}_EXCHANGE`);
-    check(
-      entry.owner === "FLOW" &&
-        entry.lane === "SOLANA_RPC" &&
-        entry.requestedIdentity === plan.target.poolAddress &&
-        typeof entry.jsonRpcId === "number",
-      "LEDGER_IDENTITY",
+  for (const purpose of plan.purposes) {
+    if (owned.some((e) => e.purpose === purpose)) continue;
+    const possible =
+      purpose === DISCOVERY
+        ? report.stage !== "SETUP"
+        : report.stage === "SNAPSHOT" || report.stage === "ADAPTATION";
+    if (!possible) continue;
+    const candidate = ledger.some(
+      (e) =>
+        e.purpose === purpose &&
+        !owned.some((entry) => entry.seq === e.seq) &&
+        requestedIdentityMatches(e) &&
+        (purpose === DISCOVERY
+          ? !snapshotEntry || e.seq < snapshotEntry.seq
+          : !discoveryEntry || e.seq > discoveryEntry.seq),
     );
+    const required =
+      contextExpected ||
+      report.stage === "ADAPTATION" ||
+      (report.stage === "SNAPSHOT" && purpose === DISCOVERY) ||
+      (report.stage === (purpose === DISCOVERY ? "DISCOVERY" : "SNAPSHOT") && failureNeedsExchange);
+    if (candidate) missing(`${purpose}_OWNERSHIP_UNCERTAIN`);
+    if (required || candidate) missing(`${purpose}_EXCHANGE`);
+    if (required && !candidate) missing(`${purpose}_LEDGER`);
+  }
+  for (const entry of owned) {
+    check(requestedIdentityMatches(entry), "LEDGER_IDENTITY");
     const start = validTime(entry.dispatchedAtMs);
     const end = validTime(entry.completedAtMs);
     if (start === undefined || end === undefined) {
@@ -1121,7 +1162,9 @@ function assess(bundle: ReturnType<typeof loadBundle>): CpmmPoolAcquisitionVerif
     const isDiscovery = entry.purpose === DISCOVERY;
     const step = isDiscovery ? "DISCOVERY" : "SNAPSHOT";
     check(
-      owned.some((e) => equal(e, entry)) && !seen.has(entry.seq) && entry.seq > lastSeq,
+      ledger.some((e) => e.seq === entry.seq && equal(e, entry)) &&
+        !seen.has(entry.seq) &&
+        entry.seq > lastSeq,
       `${step}_LEDGER_BINDING`,
     );
     seen.add(entry.seq);
@@ -1203,8 +1246,6 @@ function assess(bundle: ReturnType<typeof loadBundle>): CpmmPoolAcquisitionVerif
   }
 
   if (contextExpected) {
-    for (const purpose of plan.purposes)
-      if (!owned.some((e) => e.purpose === purpose)) missing(`${purpose}_LEDGER`);
     if (accounts.length !== 3) missing("SNAPSHOT_ACCOUNTS");
     const shape = exchanges.find((e) => e.entry.purpose === SNAPSHOT)?.requestShape;
     const slots = accounts.map((a) => a.slot);
@@ -1320,9 +1361,7 @@ function assess(bundle: ReturnType<typeof loadBundle>): CpmmPoolAcquisitionVerif
   } else {
     check(accounts.length === 0 && adapter === null, "FAILED_REPORT_CONTEXT");
     // Reproduce deterministic failures, not the timing/cancellation path that chose the outcome.
-    const pureFailure =
-      /^(RPC_ERROR|NOT_UTF8|NOT_JSON|ENVELOPE_.*|ID_.*|RESULT_SHAPE|CONTEXT_.*|VALUE_LENGTH_MISMATCH|ACCOUNT_.*|DISCOVERY_POOL_REFUSED:.*|DISCOVERY_VAULTS_INVALID|SNAPSHOT_POOL_REFUSED:.*|POOL_VAULTS_CHANGED)$/;
-    if (pureFailure.test(report.code) && derivedCode !== undefined)
+    if (pureFailure && derivedCode !== undefined)
       check(
         derivedCode === report.code &&
           derivedStage === report.stage &&
@@ -1330,7 +1369,7 @@ function assess(bundle: ReturnType<typeof loadBundle>): CpmmPoolAcquisitionVerif
         "REPORT_REFUSAL_BINDING",
       );
     if (
-      pureFailure.test(report.code) &&
+      pureFailure &&
       derivedCode === undefined &&
       exchanges.some(
         (e) =>

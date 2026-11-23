@@ -94,12 +94,16 @@ type Mode =
   | "redact"
   | "encoded"
   | "encodedDuplicate"
+  | "encodedObject"
   | "429"
   | "observerMissing"
   | "malformed"
   | "overflow";
 
-async function genuine(mode: Mode = "success", options: { foreign?: boolean } = {}) {
+async function genuine(
+  mode: Mode = "success",
+  options: { foreign?: boolean | "same-purpose" | "interleaved" } = {},
+) {
   const projectRoot = root();
   const target = { poolAddress: POOL, candidateMint: MINT };
   const limits = {
@@ -143,6 +147,21 @@ async function genuine(mode: Mode = "success", options: { foreign?: boolean } = 
     expect(url).toBe(URL);
     const request = JSON.parse(init!.body as string) as { id: number; params: [string[]] };
     const discovery = request.params[0].length === 1;
+    if (discovery && mode === "encodedObject") {
+      return Response.json({
+        jsonrpc: "2.0",
+        id: request.id,
+        result: {
+          context: { slot: S1 },
+          value: [
+            {
+              ...account(pool, RAYDIUM_CPMM_PROGRAM_ID),
+              data: { encoded: Buffer.from(SECRET).toString("base64") },
+            },
+          ],
+        },
+      });
+    }
     if (!discovery) {
       if (mode === "clockNaN") nextClock = NaN;
       if (mode === "clockInf") nextClock = Infinity;
@@ -171,6 +190,25 @@ async function genuine(mode: Mode = "success", options: { foreign?: boolean } = 
     }
     return new Response(result);
   });
+  let interleaved: ReturnType<PaperRequestSession["dispatch"]> | undefined;
+  const foreignRpc = (session: PaperRequestSession) => {
+    const id = session.nextJsonRpcId();
+    return session.dispatch({
+      lane: "SOLANA_RPC",
+      owner: "FLOW",
+      purpose: "CPMM_POOL_VAULT_DISCOVERY",
+      requestedIdentity: POOL,
+      method: "POST",
+      url: "https://rpc.invalid/foreign",
+      jsonRpcId: id,
+      body: JSON.stringify({
+        jsonrpc: "2.0",
+        id,
+        method: "getMultipleAccounts",
+        params: [[POOL], { commitment: "confirmed", encoding: "base64" }],
+      }),
+    });
+  };
   const session = new PaperRequestSession({
     executionContext: "PAPER_SIMULATION",
     fetchFn,
@@ -197,11 +235,20 @@ async function genuine(mode: Mode = "success", options: { foreign?: boolean } = 
     },
     onExchangeComplete(evidence) {
       if (mode !== "observerMissing") acquisition.onExchangeComplete(evidence);
+      if (
+        options.foreign === "interleaved" &&
+        evidence.url === URL &&
+        evidence.entry.purpose === "CPMM_POOL_VAULT_DISCOVERY"
+      )
+        interleaved = foreignRpc(session);
     },
   });
   sessions.push(session);
   session.open();
-  if (options.foreign) {
+  if (options.foreign === "same-purpose") {
+    await foreignRpc(session);
+    await vi.advanceTimersByTimeAsync(2500);
+  } else if (options.foreign === true) {
     await session.dispatch({
       lane: "RUGCHECK",
       owner: "SECURITY",
@@ -231,8 +278,9 @@ async function genuine(mode: Mode = "success", options: { foreign?: boolean } = 
       },
     },
   });
-  await vi.advanceTimersByTimeAsync(3000);
+  await vi.advanceTimersByTimeAsync(options.foreign === "interleaved" ? 6000 : 3000);
   const result = await running;
+  if (interleaved) expect((await interleaved).dispatched).toBe(true);
   return {
     fetchFn,
     snapshotPool,
@@ -301,6 +349,7 @@ interface Payload {
 interface Exchange {
   entry: {
     seq: number;
+    lane: string;
     purpose: string;
     jsonRpcId: number;
     dispatchedAtMs: number;
@@ -338,7 +387,196 @@ function replaceResponse(
 }
 const issues = (status: string, link: string) => expect.arrayContaining([{ status, link }]);
 
+// Decode persisted payload wrappers and base64 strings in their JSON, including opaque objects.
+// Assertions use only booleans/digests, never the sensitive bytes or the decoded JSON.
+function persistedContainsSecret(dir: string): boolean {
+  const has = (bytes: Buffer) => bytes.includes(SECRET) || bytes.includes(ENDPOINT_SECRET);
+  function inspect(value: unknown): boolean {
+    if (typeof value === "string")
+      return has(Buffer.from(value)) || has(Buffer.from(value, "base64"));
+    if (Array.isArray(value)) return value.some(inspect);
+    if (value === null || typeof value !== "object") return false;
+    const record = value as Record<string, unknown>;
+    if (
+      typeof record.stored === "string" &&
+      (record.encoding === "utf8" || record.encoding === "base64")
+    ) {
+      const decoded = Buffer.from(record.stored, record.encoding);
+      if (has(decoded)) return true;
+      let parsed: unknown;
+      try {
+        parsed = JSON.parse(decoded.toString("utf8")) as unknown;
+      } catch {
+        return false;
+      } // Stored binary account bytes have already been checked.
+      return inspect(parsed);
+    }
+    return Object.values(record).some(inspect);
+  }
+  return readdirSync(dir).some((name) => {
+    const bytes = readFileSync(path.join(dir, name));
+    return has(bytes) || inspect(JSON.parse(bytes.toString("utf8")) as unknown);
+  });
+}
+
 describe("item S acquisition evidence", () => {
+  it("opaque account-data object does not persist a decodable secret", async () => {
+    const { input } = await genuine("encodedObject");
+    expect(input.result).toMatchObject({
+      outcome: "ACQUISITION_FAILED",
+      code: "ACCOUNT_ENCODING:POOL",
+    });
+    const raw = input.result.exchanges[0]!.body!;
+    const { outDir } = sealed(input);
+    expect(persistedContainsSecret(outDir)).toBe(false);
+    const { state, originalBytes, originalSha256 } = read<Exchange>(
+      outDir,
+      "exchange-1.json",
+    ).response;
+    expect({ state, originalBytes, originalSha256 }).toEqual({
+      state: "WITHHELD",
+      originalBytes: raw.length,
+      originalSha256: digest(raw),
+    });
+    expect(verifyCpmmPoolAcquisitionEvidence(outDir)).toMatchObject({
+      integrity: "VERIFIED",
+      recorded: { outcome: "ACQUISITION_FAILED", code: "ACCOUNT_ENCODING:POOL" },
+      computed: "ACQUISITION_FAILED",
+      issues: issues("MISSING_EVIDENCE", "DISCOVERY_RESPONSE"),
+    });
+  });
+
+  it("a preceding same-purpose foreign RPC is not acquisition-owned", async () => {
+    const { input } = await genuine("success", { foreign: "same-purpose" });
+    expect(input.result.outcome).toBe("ACQUIRED");
+    expect(input.result.exchanges.map((e) => e.entry.seq)).toEqual([2, 3]);
+    expect(input.ledger.map((e) => [e.seq, e.purpose, e.jsonRpcId])).toEqual([
+      [1, "CPMM_POOL_VAULT_DISCOVERY", 1],
+      [2, "CPMM_POOL_VAULT_DISCOVERY", 2],
+      [3, "CPMM_POOL_ACCOUNT_SNAPSHOT", 3],
+    ]);
+    const { outDir } = sealed(input);
+    expect(read(outDir, "ledger.json")).toEqual(input.ledger);
+    expect(verifyCpmmPoolAcquisitionEvidence(outDir)).toMatchObject({
+      integrity: "VERIFIED",
+      computed: "ACQUIRED_REPRODUCED",
+      issues: [],
+    });
+  });
+
+  it("a preceding entry rewritten to RPC contradicts first-request pacing", async () => {
+    const { input } = await genuine("success", { foreign: true });
+    const { outDir } = sealed(input);
+    rewrite<Exchange["entry"][]>(outDir, "ledger.json", (rows) => {
+      expect(rows[0]!.dispatchedAtMs).toBe(rows[1]!.dispatchedAtMs);
+      rows[0]!.lane = "SOLANA_RPC";
+    });
+    expect(verifyCpmmPoolAcquisitionEvidence(outDir)).toMatchObject({
+      integrity: "VERIFIED",
+      computed: "MISMATCH",
+      issues: issues("MISMATCH", "LANE_PACING"),
+    });
+  });
+
+  it("ambiguous same-purpose rows do not become owned when the observer retained nothing", async () => {
+    const { input } = await genuine("observerMissing", { foreign: "same-purpose" });
+    expect(input.ledger).toHaveLength(2);
+    expect(input.result).toMatchObject({ code: "EVIDENCE_NOT_RECORDED", exchanges: [] });
+    const { outDir } = sealed(input);
+    expect(verifyCpmmPoolAcquisitionEvidence(outDir)).toMatchObject({
+      integrity: "VERIFIED",
+      computed: "ACQUISITION_FAILED",
+      issues: [
+        { status: "MISSING_EVIDENCE", link: "CPMM_POOL_VAULT_DISCOVERY_OWNERSHIP_UNCERTAIN" },
+        { status: "MISSING_EVIDENCE", link: "CPMM_POOL_VAULT_DISCOVERY_EXCHANGE" },
+      ],
+    });
+  });
+
+  it("a recorded success with a missing snapshot exchange does not reproduce", async () => {
+    const { input } = await genuine("success", { foreign: "same-purpose" });
+    const { outDir } = sealed(input);
+    const manifest = read<Manifest>(outDir, MANIFEST);
+    manifest.files.pop();
+    rmSync(path.join(outDir, "exchange-2.json"));
+    put(outDir, MANIFEST, manifest);
+    expect(verifyCpmmPoolAcquisitionEvidence(outDir)).toMatchObject({
+      integrity: "VERIFIED",
+      computed: "MISMATCH",
+      issues: issues("MISMATCH", "REPORT_RETENTION"),
+    });
+    rewrite<{ retainedExchanges: number }>(outDir, "report.json", (report) => {
+      report.retainedExchanges = 1;
+    });
+    expect(verifyCpmmPoolAcquisitionEvidence(outDir)).toMatchObject({
+      integrity: "VERIFIED",
+      computed: "ACQUIRED_LIMITED",
+      issues: [
+        { status: "MISSING_EVIDENCE", link: "CPMM_POOL_ACCOUNT_SNAPSHOT_OWNERSHIP_UNCERTAIN" },
+        { status: "MISSING_EVIDENCE", link: "CPMM_POOL_ACCOUNT_SNAPSHOT_EXCHANGE" },
+      ],
+    });
+  });
+
+  it("a second sequence-correlated discovery violates the acquisition's one-dispatch-per-purpose bound", async () => {
+    const { input } = await genuine();
+    const { outDir } = sealed(input);
+    const change = (entry: Exchange["entry"]) => {
+      entry.purpose = "CPMM_POOL_VAULT_DISCOVERY";
+    };
+    rewrite<Exchange["entry"][]>(outDir, "ledger.json", (rows) => change(rows[1]!));
+    rewrite<Exchange>(outDir, "exchange-2.json", (file) => change(file.entry));
+    expect(verifyCpmmPoolAcquisitionEvidence(outDir)).toMatchObject({
+      integrity: "VERIFIED",
+      computed: "MISMATCH",
+      issues: issues("MISMATCH", "OWNED_LEDGER_ORDER"),
+    });
+  });
+
+  it("valid interleaved RPC activity reproduces, but every adjacent RPC pair is checked", async () => {
+    const { input } = await genuine("success", { foreign: "interleaved" });
+    expect(input.result.outcome).toBe("ACQUIRED");
+    expect(input.result.exchanges.map((e) => e.entry.seq)).toEqual([1, 3]);
+    const { outDir } = sealed(input);
+    expect(verifyCpmmPoolAcquisitionEvidence(outDir)).toMatchObject({
+      integrity: "VERIFIED",
+      computed: "ACQUIRED_REPRODUCED",
+      issues: [],
+    });
+    rewrite<Exchange["entry"][]>(outDir, "ledger.json", (rows) => {
+      rows[1]!.dispatchedAtMs -= 1;
+      rows[1]!.completedAtMs = null;
+    });
+    expect(verifyCpmmPoolAcquisitionEvidence(outDir)).toMatchObject({
+      integrity: "VERIFIED",
+      computed: "MISMATCH",
+      issues: expect.arrayContaining([
+        { status: "MISMATCH", link: "LANE_PACING" },
+        { status: "MISSING_EVIDENCE", link: "LANE_SERIALIZATION_TIMING" },
+      ]),
+    });
+  });
+
+  it("unavailable RPC dispatch time does not hide an independently provable serialization violation", async () => {
+    const { input } = await genuine("success", { foreign: "same-purpose" });
+    const { outDir } = sealed(input);
+    rewrite<(Omit<Exchange["entry"], "dispatchedAtMs"> & { dispatchedAtMs: unknown })[]>(
+      outDir,
+      "ledger.json",
+      (rows) => {
+        rows[0]!.dispatchedAtMs = { $number: "NaN" };
+        rows[0]!.completedAtMs = Number(rows[1]!.dispatchedAtMs) + 1;
+      },
+    );
+    expect(verifyCpmmPoolAcquisitionEvidence(outDir)).toMatchObject({
+      integrity: "VERIFIED",
+      computed: "MISMATCH",
+      issues: expect.arrayContaining([
+        { status: "MISSING_EVIDENCE", link: "LANE_PACING_TIMING" },
+        { status: "MISMATCH", link: "LANE_SERIALIZATION" },
+      ]),
+    });
+  });
   it("AE1: real success reproduces in a separate unsigned bundle with an interleaved ledger window", async () => {
     const { input, fetchFn } = await genuine("success", { foreign: true });
     expect(input.result.outcome).toBe("ACQUIRED");
@@ -677,7 +915,9 @@ describe("item S acquisition evidence", () => {
       const rawResponse = input.result.exchanges[1]!.body!;
       expect(rawResponse.toString()).toContain(snapshotPool.toString("base64"));
       expect(rawResponse.includes(SECRET)).toBe(false);
-      expect(response).toEqual({
+      expect(persistedContainsSecret(outDir)).toBe(false);
+      const { state, originalBytes, originalSha256 } = response;
+      expect({ state, originalBytes, originalSha256 }).toEqual({
         state: "WITHHELD",
         originalBytes: rawResponse.length,
         originalSha256: digest(rawResponse),
