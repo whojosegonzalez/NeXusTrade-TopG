@@ -122,6 +122,7 @@ function harness(
     ) => void;
     reply?: Reply;
     foreign?: (signal: AbortSignal) => Response | Promise<Response>;
+    clock?: () => number;
     limits?: Partial<PaperRequestSessionLimits>;
     laneMax?: number;
     open?: boolean;
@@ -164,7 +165,7 @@ function harness(
   const session = new PaperRequestSession({
     executionContext: "PAPER_SIMULATION",
     fetchFn,
-    clock: Date.now,
+    clock: config.clock ?? Date.now,
     timers: { setTimeout, clearTimeout },
     limits: {
       lifetimeMs: 60_000,
@@ -833,6 +834,170 @@ describe("CpmmPoolAccountAcquisition", () => {
       exchanges: [{ bodyState: "COMPLETE" }, { bodyState: "COMPLETE" }],
     });
     expect(spy).toHaveBeenCalledTimes(1);
+    h.assertClean();
+  });
+
+  it.each([
+    ["harmless", "ACQUIRED"],
+    ["cancel", "CALLER_CANCELLED"],
+    ["session", "REQUEST_SESSION_STOPPED"],
+    ["deadline", "ACQUISITION_DEADLINE_EXCEEDED"],
+    ["invalid clock", "ACQUISITION_CLOCK_INVALID"],
+    ["regressing clock", "ACQUISITION_CLOCK_REGRESSED"],
+  ] as const)("AQ10: finalization with %s precedes the success decision", async (cause, code) => {
+    const abort = new AbortController();
+    const deadlineMs = START + 7000;
+    let clockOverride: number | undefined;
+    const h = harness({
+      clock: () => clockOverride ?? Date.now(),
+      options: { signal: abort.signal, deadlineMs },
+    });
+    using removeListener = vi.spyOn(AbortSignal.prototype, "removeEventListener");
+    const { timers } = h.options;
+    const cleanup = vi.fn((handle: unknown) => {
+      timers.clearTimeout(handle);
+      if (cause === "cancel") abort.abort();
+      if (cause === "session") h.session.stop("STOP_DURING_CLEANUP");
+      if (cause === "deadline") vi.setSystemTime(deadlineMs);
+      if (cause === "invalid clock") clockOverride = NaN;
+      if (cause === "regressing clock") clockOverride = START;
+    });
+    h.options.timers = { ...timers, clearTimeout: cleanup };
+    const result = await h.finish(2500);
+    expect(result).toMatchObject({
+      outcome: cause === "harmless" ? "ACQUIRED" : "ACQUISITION_FAILED",
+      code,
+      stage: "ADAPTATION",
+      exchanges: [{ bodyState: "COMPLETE" }, { bodyState: "COMPLETE" }],
+    });
+    if (cause === "session")
+      expect(result).toHaveProperty("sessionStopReason", "STOP_DURING_CLEANUP");
+    expect(cleanup).toHaveBeenCalledTimes(1);
+    expect(removeListener.mock.contexts).toContain(abort.signal);
+    expect(h.fetchFn).toHaveBeenCalledTimes(2);
+    h.assertClean();
+  });
+
+  it.each([
+    ["invalid", NaN, "ACQUISITION_CLOCK_INVALID"],
+    ["regressing", START + 2499, "ACQUISITION_CLOCK_REGRESSED"],
+  ] as const)(
+    "AQ10: %s clock after snapshot completion fails closed",
+    async (_cause, reading, code) => {
+      let clockOverride: number | undefined;
+      const h = harness({
+        clock: () => clockOverride ?? Date.now(),
+        observe: (evidence, forward) => {
+          forward(evidence);
+          if (evidence.entry.purpose === SNAPSHOT) clockOverride = reading;
+        },
+      });
+      expect(await h.finish()).toMatchObject({
+        outcome: "ACQUISITION_FAILED",
+        code,
+        stage: "SNAPSHOT",
+        exchanges: [{ bodyState: "COMPLETE" }, { bodyState: "COMPLETE" }],
+      });
+      expect(h.fetchFn).toHaveBeenCalledTimes(2);
+      h.assertClean();
+    },
+  );
+
+  it.each([NaN, Infinity, -Infinity, -1, START + 0.5, Number.MAX_SAFE_INTEGER + 1, String(START)])(
+    "AQ10: unsupported initial clock reading %s allocates no timer or request",
+    async (reading) => {
+      let initial = true;
+      const h = harness({ clock: () => (initial ? Date.now() : (reading as number)) });
+      initial = false;
+      using setTimer = vi.spyOn(h.options.timers, "setTimeout");
+      expect(await h.run()).toMatchObject({
+        outcome: "ACQUISITION_FAILED",
+        code: "ACQUISITION_CLOCK_INVALID",
+        stage: "SETUP",
+        exchanges: [],
+      });
+      expect(setTimer).not.toHaveBeenCalled();
+      expect(h.fetchFn).not.toHaveBeenCalled();
+      h.assertClean();
+    },
+  );
+
+  it("AQ10: a throwing initial clock refuses without starting work", async () => {
+    let throwOnRead = false;
+    const h = harness({
+      clock: () => {
+        if (throwOnRead) {
+          throwOnRead = false;
+          throw new Error("injected clock failure");
+        }
+        return Date.now();
+      },
+    });
+    throwOnRead = true;
+    expect(await h.run()).toMatchObject({
+      code: "ACQUISITION_CLOCK_INVALID",
+      stage: "SETUP",
+      exchanges: [],
+    });
+    expect(h.fetchFn).not.toHaveBeenCalled();
+    h.assertClean();
+  });
+
+  it.each([
+    [NaN, "ACQUISITION_CLOCK_INVALID"],
+    [START + 2499, "ACQUISITION_CLOCK_REGRESSED"],
+  ] as const)(
+    "AQ10: a bad owned completion timestamp %s is not erased by clock recovery",
+    async (reading, code) => {
+      let nextReading: number | undefined;
+      const h = harness({
+        clock: () => {
+          const now = nextReading ?? Date.now();
+          nextReading = undefined;
+          return now;
+        },
+        reply: (call) => {
+          if (call.purpose === SNAPSHOT) nextReading = reading;
+          return h.ordinary(call);
+        },
+      });
+      expect(await h.finish()).toMatchObject({
+        code,
+        stage: "SNAPSHOT",
+        exchanges: [
+          { bodyState: "COMPLETE" },
+          { bodyState: "COMPLETE", entry: { completedAtMs: reading } },
+        ],
+      });
+      expect(h.session.now()).toBe(Date.now());
+      expect(h.fetchFn).toHaveBeenCalledTimes(2);
+      h.assertClean();
+    },
+  );
+
+  it("AQ10: cleanup cannot replace an earlier RPC refusal or discard its evidence", async () => {
+    const abort = new AbortController();
+    const h = harness({
+      options: { signal: abort.signal },
+      reply: ({ id }) => Response.json({ jsonrpc: "2.0", id, error: { code: -32602 } }),
+    });
+    const { timers } = h.options;
+    h.options.timers = {
+      ...timers,
+      clearTimeout(handle) {
+        timers.clearTimeout(handle);
+        abort.abort();
+        h.session.stop("STOP_DURING_CLEANUP");
+      },
+    };
+    expect(await h.finish()).toMatchObject({
+      outcome: "ACQUISITION_FAILED",
+      code: "RPC_ERROR",
+      rpcErrorCode: -32602,
+      stage: "DISCOVERY",
+      exchanges: [{ bodyState: "COMPLETE" }],
+    });
+    expect(h.fetchFn).toHaveBeenCalledTimes(1);
     h.assertClean();
   });
 

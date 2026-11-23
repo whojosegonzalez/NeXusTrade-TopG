@@ -49,6 +49,7 @@ export type CpmmPoolAccountExchange = Readonly<
 type Refusal = { readonly code: string; readonly rpcErrorCode?: number };
 type Stage = "SETUP" | "DISCOVERY" | "SNAPSHOT" | "ADAPTATION";
 type TimedRefusal = "CALLER_CANCELLED" | "ACQUISITION_DEADLINE_EXCEEDED";
+type ClockRefusal = "ACQUISITION_CLOCK_INVALID" | "ACQUISITION_CLOCK_REGRESSED";
 type Completion = { readonly exchange: PaperRequestExchange } | { readonly refused: Refusal };
 
 export type CpmmPoolAccountAcquisitionResult =
@@ -381,7 +382,27 @@ export class CpmmPoolAccountAcquisition {
       options.maxResponseBytes ?? MAX_RESPONSE_BYTES,
       session.limits.lanes.SOLANA_RPC.maxResponseBytes,
     );
-    if (deadlineMs - session.now() > MAX_DURATION_MS) return fail({ code: "OPTIONS_INVALID" });
+    let lastClockMs: number | undefined;
+    let clockRefusal: ClockRefusal | undefined;
+    const observeClock = (now: unknown): number | ClockRefusal => {
+      if (clockRefusal) return clockRefusal;
+      if (!safeInteger(now)) return (clockRefusal = "ACQUISITION_CLOCK_INVALID");
+      if (lastClockMs !== undefined && now < lastClockMs)
+        return (clockRefusal = "ACQUISITION_CLOCK_REGRESSED");
+      lastClockMs = now;
+      return now;
+    };
+    const readClock = (): number | ClockRefusal => {
+      if (clockRefusal) return clockRefusal;
+      try {
+        return observeClock(session.now());
+      } catch {
+        return observeClock(undefined);
+      }
+    };
+    const startedAtMs = readClock();
+    if (typeof startedAtMs !== "number") return fail({ code: startedAtMs }, session);
+    if (deadlineMs - startedAtMs > MAX_DURATION_MS) return fail({ code: "OPTIONS_INVALID" });
 
     const abort = new AbortController();
     let interrupted: TimedRefusal | "REQUEST_SESSION_STOPPED" | undefined;
@@ -393,17 +414,14 @@ export class CpmmPoolAccountAcquisition {
     };
     const cancel = () => interrupt("CALLER_CANCELLED");
 
-    const checkTime = (beforeDispatch: boolean, now = session.now()): string | null => {
+    const checkState = (boundary: "DISPATCH" | "STATE", now = readClock()): string | null => {
       if (interrupted) return interrupted;
       if (signal && signalAborted(signal)) return "CALLER_CANCELLED";
-      if (now >= deadlineMs || (beforeDispatch && timeoutMs > deadlineMs - now))
+      if (typeof now !== "number") return now;
+      if (now >= deadlineMs || (boundary === "DISPATCH" && timeoutMs > deadlineMs - now))
         return "ACQUISITION_DEADLINE_EXCEEDED";
-      return null;
-    };
-    const checkState = (): string | null => {
-      const now = session.now();
-      const timeRefusal = checkTime(false, now);
-      if (timeRefusal) return timeRefusal;
+      // The session evaluates its own dispatch refusals, including terminal ones.
+      if (boundary === "DISPATCH") return null;
       if (!session.isOpen())
         return session.getStopReason() === null
           ? "REQUEST_SESSION_NOT_OPEN"
@@ -418,7 +436,7 @@ export class CpmmPoolAccountAcquisition {
       minContextSlot?: number,
     ): Promise<ResponseCheck> => {
       const reject = (code: string): ResponseCheck => ({ ok: false, code });
-      const prior = checkTime(true);
+      const prior = checkState("DISPATCH");
       if (prior) return reject(prior);
       const id = session.nextJsonRpcId();
       const requestBody = JSON.stringify({
@@ -456,11 +474,12 @@ export class CpmmPoolAccountAcquisition {
         jsonRpcId: id,
         timeoutMs,
         maxResponseBytes,
-        refusal: () => queueRefusal ?? checkTime(true),
+        refusal: () => queueRefusal ?? checkState("DISPATCH"),
         waitSignals: [abort.signal],
         linkSignals: () => [abort.signal],
         onDispatched: (entry) => {
           slot.dispatched = { ...entry };
+          observeClock(entry.dispatchedAtMs);
         },
       };
       // The session may still be awaiting a previous request in its lane. Bound our own wait,
@@ -475,7 +494,9 @@ export class CpmmPoolAccountAcquisition {
       try {
         const completion = await Promise.race([queue, complete()]);
         if (slot.record) exchanges.push(slot.record);
-        const late = checkState();
+        if ("exchange" in completion && completion.exchange.entry)
+          observeClock(completion.exchange.entry.completedAtMs);
+        const late = checkState("STATE");
         if ("refused" in completion) return reject(late ?? completion.refused.code);
         const { exchange } = completion;
         if (exchange.error === "REQUEST_ABORTED") {
@@ -510,19 +531,23 @@ export class CpmmPoolAccountAcquisition {
       }
     };
 
-    const setupRefusal = checkState();
+    const setupRefusal = checkState("STATE", startedAtMs);
     if (setupRefusal) return fail({ code: setupRefusal }, session);
     const timer = timers.setTimeout(
       () => interrupt("ACQUISITION_DEADLINE_EXCEEDED"),
-      Math.max(0, deadlineMs - session.now()),
+      deadlineMs - startedAtMs,
     );
+    let candidate: Pick<
+      Extract<CpmmPoolAccountAcquisitionResult, { outcome: "ACQUIRED" }>,
+      "contextSlot" | "discoveryPoolBytesEqual" | "input" | "adapted"
+    >;
     try {
       if (signal)
         AbortSignal.prototype.addEventListener.call(signal, "abort", cancel, { once: true });
       stage = "DISCOVERY";
       const discovery = await request(DISCOVERY, [target.poolAddress]);
       if (!discovery.ok) return fail(discovery, session);
-      const afterDiscovery = checkState();
+      const afterDiscovery = checkState("STATE");
       if (afterDiscovery) return fail({ code: afterDiscovery }, session);
       const pool = discovery.accounts[0]!;
       const parsed = parseRaydiumCpmmAccount(
@@ -544,7 +569,7 @@ export class CpmmPoolAccountAcquisition {
         discovery.slot,
       );
       if (!snapshot.ok) return fail(snapshot, session);
-      const afterSnapshot = checkState();
+      const afterSnapshot = checkState("STATE");
       if (afterSnapshot) return fail({ code: afterSnapshot }, session);
       const [poolAccount, vault0Account, vault1Account] = snapshot.accounts;
       const confirmed = parseRaydiumCpmmAccount(
@@ -572,22 +597,30 @@ export class CpmmPoolAccountAcquisition {
       if (!adapted.ok) return fail({ code: adapted.refusalCode }, session, true);
       if (adapted.verification.slotProvenance.consistentSlot !== snapshot.slot)
         return fail({ code: "SLOT_BINDING_MISMATCH" }, session);
-      const discoveryPoolBytesEqual = pool.data.equals(poolAccount!.data);
-      const beforeSuccess = checkState();
-      if (beforeSuccess) return fail({ code: beforeSuccess }, session);
-      return {
-        outcome: "ACQUIRED",
-        code: "ACQUIRED",
-        stage,
-        exchanges: Object.freeze(exchanges),
+      const beforeCleanup = checkState("STATE");
+      if (beforeCleanup) return fail({ code: beforeCleanup }, session);
+      candidate = {
         contextSlot: snapshot.slot,
-        discoveryPoolBytesEqual,
+        discoveryPoolBytesEqual: pool.data.equals(poolAccount!.data),
         input: adapterInput,
         adapted,
       };
     } finally {
-      timers.clearTimeout(timer);
-      if (signal) AbortSignal.prototype.removeEventListener.call(signal, "abort", cancel);
+      try {
+        timers.clearTimeout(timer);
+      } finally {
+        if (signal) AbortSignal.prototype.removeEventListener.call(signal, "abort", cancel);
+      }
     }
+    // Cleanup can run injected code. Only promote a candidate after cleanup and another state check.
+    const beforeSuccess = checkState("STATE");
+    if (beforeSuccess) return fail({ code: beforeSuccess }, session);
+    return {
+      outcome: "ACQUIRED",
+      code: "ACQUIRED",
+      stage,
+      exchanges: Object.freeze(exchanges),
+      ...candidate,
+    };
   }
 }
