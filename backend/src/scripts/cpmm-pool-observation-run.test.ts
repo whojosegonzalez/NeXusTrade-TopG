@@ -158,6 +158,12 @@ const flush = async (rounds = 8) => {
   for (let i = 0; i < rounds; i++) await new Promise((r) => setImmediate(r));
 };
 
+/** Runs `fn` after `n` chained microtasks, without waiting for any macrotask. */
+const afterHops = (n: number, fn: () => void): void => {
+  if (n === 0) fn();
+  else queueMicrotask(() => afterHops(n - 1, fn));
+};
+
 const TMP = mkdtempSync(path.join(tmpdir(), "cpmm-run-test-"));
 afterAll(() => {
   rmSync(TMP, { recursive: true, force: true });
@@ -1113,6 +1119,7 @@ describe("CPMM observation run: composition core (item 17 T)", () => {
     const r1 = await p1;
     expect(r1.firstFailure!.stage).toBe("ACQUISITION");
     expect(r1.firstFailure!.code).toMatch(/^CALLER_CANCELLED/);
+    expect(r1.finalizationCancelled).toBe(false);
     expect(r1.acquisitionEvidence.verification).toMatchObject({ computed: "ACQUISITION_FAILED" });
     expect(during.calls).toHaveLength(1);
     expectNotObserved(during, r1);
@@ -1129,6 +1136,7 @@ describe("CPMM observation run: composition core (item 17 T)", () => {
     const r2 = await p2;
     expect(r2.acquisitionEvidence.verification).toMatchObject({ computed: "ACQUIRED_REPRODUCED" });
     expect(r2.firstFailure).toEqual({ stage: "STAGE_BOUNDARY", code: "CANCELLED" });
+    expect(r2.finalizationCancelled).toBe(false);
     expect(r2.session.stopReason).toBe(CPMM_RUN_STOP_ABANDONED);
     expectNotObserved(boundary, r2);
 
@@ -1154,6 +1162,8 @@ describe("CPMM observation run: composition core (item 17 T)", () => {
     expect(r3.observation.report!.terminal.cause).toBe("CANCELLED");
     expect(r3.firstFailure!).toMatchObject({ stage: "OBSERVATION" });
     expect(r3.firstFailure!.code).toMatch(/^CANCELLED/);
+    // The owner already reported this cancellation; finalization was not cancelled separately.
+    expect(r3.finalizationCancelled).toBe(false);
     // Partial evidence is still sealed, verified and bound.
     expect(r3.observationEvidence.verification!.integrity.ok).toBe(true);
     expect(r3.observationEvidence.verification!.acquisitionBinding!.status).toBe("REPRODUCED");
@@ -1471,8 +1481,9 @@ describe("CPMM observation run: composition core (item 17 T)", () => {
     );
     await observe(h);
     const r = await pending;
-    expect(cleanupReadings).toHaveLength(2);
-    expect(cleanupReadings[0]).toBe(cleanupReadings[1]);
+    // Cleanup may read the clock any number of times; equal readings are never a regression.
+    expect(cleanupReadings.length).toBeGreaterThanOrEqual(2);
+    expect(new Set(cleanupReadings).size).toBe(1);
     expect(r).toMatchObject({
       status: "SUCCEEDED",
       firstFailure: null,
@@ -1678,5 +1689,138 @@ describe("CPMM observation run: composition core (item 17 T)", () => {
     expect(h.queue.size).toBe(0);
     expect(r.status).toBe("FAILED");
     expectNoCredential(h.root, r);
+  });
+
+  it.each([2, 3, 4])(
+    "RN22: cancellation queued %i microtasks after the lifetime clear prevents success",
+    async (hops) => {
+      const controller = new AbortController();
+      const h = harness();
+      const { clearTimeout } = h.timers;
+      h.timers.clearTimeout = (handle) => {
+        clearTimeout(handle);
+        if (handle === 1) afterHops(hops, () => controller.abort(new Error(SECRET)));
+      };
+      const pending = runCpmmPoolObservation(h.options({ signal: controller.signal }));
+      await observe(h);
+      const r = await pending;
+      expect(controller.signal.aborted).toBe(true);
+      expect(r).toMatchObject({
+        status: "FAILED",
+        firstFailure: { stage: "FINALIZATION", code: "CANCELLED" },
+        finalizationCancelled: true,
+        clockFailure: null,
+        cleanupFailures: [],
+        observation: {
+          report: {
+            terminal: { cause: "OBSERVATION_COMPLETED" },
+            connectionRunClean: true,
+            cancellation: { requestedAtMs: null },
+          },
+        },
+        recording: { finished: true },
+        acquisitionEvidence: { verification: { computed: "ACQUIRED_REPRODUCED" } },
+        observationEvidence: {
+          seal: { ok: true },
+          verification: { integrity: { ok: true }, acquisitionBinding: { status: "REPRODUCED" } },
+        },
+        session: { stopReason: CPMM_RUN_STOP_FINISHED },
+        flags: CPMM_EVIDENCE_FALSE_FLAGS,
+      });
+      expect(h.queue.size).toBe(0);
+      expectNoCredential(h.root, r);
+    },
+  );
+
+  it.each([2, 3, 4])(
+    "RN23: a clock fault queued %i microtasks after the lifetime clear prevents success",
+    async (hops) => {
+      let broken = false;
+      const h = harness();
+      const { clearTimeout } = h.timers;
+      h.timers.clearTimeout = (handle) => {
+        clearTimeout(handle);
+        if (handle === 1) afterHops(hops, () => (broken = true));
+      };
+      const clock = () => (broken ? Number.NaN : h.state.now);
+      const pending = runCpmmPoolObservation(h.options({ clock }));
+      await observe(h);
+      const r = await pending;
+      expect(broken).toBe(true);
+      expect(r).toMatchObject({
+        status: "FAILED",
+        firstFailure: { stage: "FINALIZATION", code: "CLOCK_INVALID" },
+        clockFailure: { stage: "FINALIZATION", code: "CLOCK_INVALID" },
+        finalizationCancelled: false,
+        cleanupFailures: [],
+        observation: { report: { terminal: { cause: "OBSERVATION_COMPLETED" } } },
+        observationEvidence: { verification: { integrity: { ok: true } } },
+      });
+      expect(h.queue.size).toBe(0);
+      expectNoCredential(h.root, r);
+    },
+  );
+
+  it("RN24: queued cancellation after an earlier failure keeps that failure and the evidence", async () => {
+    const controller = new AbortController();
+    const h = harness();
+    const { clearTimeout } = h.timers;
+    h.timers.clearTimeout = (handle) => {
+      clearTimeout(handle);
+      if (handle === 1) afterHops(3, () => controller.abort());
+    };
+    const pending = runCpmmPoolObservation(h.options({ signal: controller.signal }));
+    await h.to(OBS_START + 10);
+    h.client.emit("error", new Error("offline test transport failure"));
+    await h.to(AFTER_ALL);
+    const r = await pending;
+    expect(controller.signal.aborted).toBe(true);
+    expect(r.firstFailure).toMatchObject({
+      stage: "OBSERVATION",
+      code: expect.stringMatching(/^TRANSPORT_ERROR/),
+    });
+    expect(r.status).toBe("FAILED");
+    expect(r.finalizationCancelled).toBe(true);
+    expect(r.clockFailure).toBeNull();
+    expect(r.cleanupFailures).toEqual([]);
+    expect(r.observation.report!.terminal.cause).toBe("TRANSPORT_ERROR");
+    expect(r.recording.finished).toBe(true);
+    expect(r.observationEvidence.verification!.integrity.ok).toBe(true);
+    expect(r.acquisitionEvidence.verification).toMatchObject({ computed: "ACQUIRED_REPRODUCED" });
+    expect(h.queue.size).toBe(0);
+    expectNoCredential(h.root, r);
+  });
+
+  it("RN25: cancellation and a clock fault after the result returns never rewrite it", async () => {
+    const controller = new AbortController();
+    let broken = false;
+    const h = harness();
+    const pending = runCpmmPoolObservation(
+      h.options({
+        signal: controller.signal,
+        clock: () => (broken ? Number.NaN : h.state.now),
+      }),
+    );
+    await observe(h);
+    const r = await pending;
+    const before = structuredClone(r);
+    expect(r).toMatchObject({ status: "SUCCEEDED", firstFailure: null });
+    broken = true;
+    controller.abort(new Error(SECRET));
+    await h.to(AFTER_ALL + 60_000);
+    expect(r).toEqual(before);
+    expect(r).toMatchObject({
+      status: "SUCCEEDED",
+      firstFailure: null,
+      clockFailure: null,
+      finalizationCancelled: false,
+      cleanupFailures: [],
+    });
+    for (const part of [r, r.observation, r.observationEvidence, r.session, r.cleanupFailures])
+      expect(Object.isFrozen(part)).toBe(true);
+    expect(() => {
+      (r as { status: string }).status = "FAILED";
+    }).toThrow(TypeError);
+    expect(h.queue.size).toBe(0);
   });
 });

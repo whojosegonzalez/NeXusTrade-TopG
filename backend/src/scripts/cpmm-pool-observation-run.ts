@@ -750,17 +750,19 @@ export async function runCpmmPoolObservation(
     clearTimeout: o.timers.clearTimeout,
   };
 
+  let abortedAtFinalization = false;
+  const checkCancellation = (): void => {
+    const ownCancellation = abortedAtFinalization && report?.cancellation.requestedAtMs !== null;
+    if (!ownCancellation && aborted(o.signal)) {
+      finalizationCancelled = true;
+      fail("FINALIZATION", "CANCELLED");
+    }
+  };
   const finalizeSession = async (reason: string): Promise<void> => {
     if (session === null || finalizing) return;
     finalizing = true;
     stage = "FINALIZATION";
-    const wasAborted = aborted(o.signal);
-    const checkCancellation = (): void => {
-      if ((!wasAborted || report?.cancellation.requestedAtMs === null) && aborted(o.signal)) {
-        finalizationCancelled = true;
-        fail("FINALIZATION", "CANCELLED");
-      }
-    };
+    abortedAtFinalization = aborted(o.signal);
     checkCancellation();
     stopSession(reason);
     checkCancellation();
@@ -778,9 +780,23 @@ export async function runCpmmPoolObservation(
     fail(stage, "COMPONENT_FAILED");
   } finally {
     await finalizeSession(CPMM_RUN_STOP_ABANDONED);
-    finished = true;
   }
-  return result();
+  return decide();
+
+  /**
+   * The terminal decision boundary, after cleanup and evidence processing. Nothing awaits after
+   * it: a cancellation or clock fault that lands before it fails the run, and nothing that lands
+   * later can rewrite the frozen result.
+   */
+  function decide(): CpmmObservationRunResult {
+    if (finalizing) {
+      stage = "FINALIZATION";
+      clock();
+      checkCancellation();
+    }
+    finished = true;
+    return result();
+  }
 
   async function execute(): Promise<void> {
     // 2. Every exchange observer exists before the session can dispatch.
