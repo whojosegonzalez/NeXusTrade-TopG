@@ -1,6 +1,6 @@
 # CPMM Pool Observation — Operator Runbook
 
-**Status:** Roadmap Step 4 (offline rehearsal) was accepted for a single bounded capture, and Roadmap Step 5 (`cpmm-observation-01`) was executed under separate operator approval and accepted by independent review. Both sealed bundles and all 18 manifest-listed files match and verify offline (exit 0). Live execution remains **NOT_APPROVED** for any further run: earlier approvals are consumed and do not cover further captures. Roadmap Step 6 (extended-observation proposal) is under review. Nothing in this runbook approves a live run. Only `--help`, the dry run and read-only verification may be used.
+**Status:** Roadmap Step 4 (offline rehearsal) was accepted for a single bounded capture, Roadmap Step 5 (`cpmm-observation-01`) passed under separate operator approval and independent review, and Roadmap Step 6 (`cpmm-observation-02`, `--profile extended` at commit `0002d0b18e3337d23ee813c058c783a3e4341925`) passed as a bounded extended transport/evidence observation and was independently verified offline. For both `cpmm-observation-01` and `cpmm-observation-02`, all 18 manifest-listed files match and offline verification exits `0`, with zero notifications received and all five qualification flags `false`. Live transaction-processing coverage remains outstanding. Live execution remains **NOT_APPROVED** for any further run: earlier approvals are consumed and do not cover further captures. Nothing in this runbook approves a live run. Only `--help`, the dry run and read-only verification may be used.
 
 Entry point: `backend/src/scripts/cpmm-pool-observation.ts` (assessment §8.38.17 item 17 T, roadmap Step 3). It runs the accepted composition core (`cpmm-pool-observation-run.ts`) once for one explicit Raydium CPMM pool and candidate mint. It adds no acquisition, observation, sealing or verification logic of its own. It is observation only: no purchase, order, position, strategy, admission, daemon or paper trading.
 
@@ -28,13 +28,14 @@ It prints the profile label and status, the live status, the plan digest (SHA-25
 node backend/node_modules/tsx/dist/cli.mjs backend/src/scripts/cpmm-pool-observation.ts --verify data/research/cpmm-observations/<RUN_ID> --acquisition-dir data/research/cpmm-acquisitions/<RUN_ID>
 ```
 
-Example (verifying the accepted Step 5 capture `cpmm-observation-01`):
+Examples (verifying the accepted Step 5 and Step 6 captures):
 
 ```bash
 node backend/node_modules/tsx/dist/cli.mjs backend/src/scripts/cpmm-pool-observation.ts --verify data/research/cpmm-observations/cpmm-observation-01 --acquisition-dir data/research/cpmm-acquisitions/cpmm-observation-01
+node backend/node_modules/tsx/dist/cli.mjs backend/src/scripts/cpmm-pool-observation.ts --verify data/research/cpmm-observations/cpmm-observation-02 --acquisition-dir data/research/cpmm-acquisitions/cpmm-observation-02
 ```
 
-For an empty-transaction capture like `cpmm-observation-01`, this verification exits `0` (complete evidence).
+For empty-transaction captures like `cpmm-observation-01` and `cpmm-observation-02`, this verification exits `0` (complete evidence).
 
 **Live mode**: `--live` exists so that the acquiring path can be tested offline with injected dependencies. This runbook gives no live command. A live command is to be written only after the profile, or a revised one, is approved in Step 4. `--live` only selects the acquiring mode; it is not, and does not record, operator approval.
 
@@ -139,7 +140,7 @@ A sealing failure takes precedence over evidence that does not verify, which tak
 
 `--verify` reads both bundles and writes nothing. It loads no configuration or credential.
 
-- **Empty-transaction capture**: when an observation captures zero transaction responses (e.g. `cpmm-observation-01`, where zero pool notifications arrived and no transaction retrievals were dispatched), no transaction re-analysis is required. All implemented components (collector, ledger, transport, owner report, pool context) are reproduced, retention is complete, and offline verification exits `0` (`complete evidence`).
+- **Empty-transaction capture**: when an observation captures zero transaction responses (e.g. `cpmm-observation-01` or `cpmm-observation-02`, where zero pool notifications arrived and no transaction retrievals were dispatched), no transaction re-analysis is required. All implemented components (collector, ledger, transport, owner report, pool context) are reproduced, retention is complete, and offline verification exits `0` (`complete evidence`).
 - **Capture with transaction responses**: when an observation contains transaction responses, re-analysing them without the run's provider credentials is unavailable (`ANALYSIS_CREDENTIALS_NOT_SUPPLIED`). Because transaction outcomes are not re-decoded offline, an otherwise intact bundle verifies as limited (exit `2`).
 
 Integrity, retention and the acquisition binding are checked in both cases. A missing, altered or different acquisition bundle does not bind (exit 4).
@@ -164,3 +165,18 @@ Roadmap Step 5 was executed under explicit operator approval for run ID `cpmm-ob
 - **Requests & budget**: exactly 2 HTTP account requests (discovery and paced snapshot), 0 transaction retrievals, 1 WebSocket connection. No retries, no secondary requests.
 - **Activity**: 0 pool notifications were received during the 60-second observation window. All 5 qualification flags remain `false`.
 - **Wallet & verification**: virtual wallet unchanged (`7f2c2353ac2f62cac1bb98703742ab19c74ac5521635af6f49bbe777ad020ed9`). Offline credential-free verification (`--verify`) exits `0`.
+
+## 10. Verified Step 6 Capture: `cpmm-observation-02`
+
+Roadmap Step 6 was executed under separate operator approval for run ID `cpmm-observation-02` (`--profile extended`) via `.tmp/runbooks/cpmm-observation-02-operator.ps1` (SHA-256 `4d92f7825e91eb7ad7749afb78e362ced4a7e9d8338c886832ce53ef3ab92b8d`) at commit `0002d0b18e3337d23ee813c058c783a3e4341925`, and passed independent verification as a bounded extended transport/evidence observation.
+
+- **Target**: Raydium CPMM WSOL/USDC pool `47hq28mcL7q5GhBg7epyGF2dnuJd4MKFt8QhT7CzYUp4`, candidate mint `EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v` (USDC).
+- **Bundles & manifests**:
+  - Acquisition bundle: `data/research/cpmm-acquisitions/cpmm-observation-02`, manifest SHA-256 `960b66a19d8a7a74e5391af896febe546d8558b90f0c5852798a8a5e49a0af5f` (7 files). Outcome `ACQUIRED`, integrity `VERIFIED`, re-derivation `ACQUIRED_REPRODUCED`, snapshot slot `473455432`.
+  - Observation bundle: `data/research/cpmm-observations/cpmm-observation-02`, manifest SHA-256 `ee813da654c2fc7c090d789827f93cc1acfceab827cb15257adb58afa2fbaaeb` (11 files). Binding `REPRODUCED`, retention `COMPLETE`.
+  - Total: 18 manifest-listed files, byte-identical.
+- **Protocol execution**: 300-second nominal window (`startedAtMs: 1795547184385`, nominal end `1795547484385`, `UNSUBSCRIBE_RESPONSE` at `1795547484531`, settled `1795547484667`), acknowledged `logsSubscribe` (`{ mentions: ["47hq28mcL7q5GhBg7epyGF2dnuJd4MKFt8QhT7CzYUp4"] }`, `confirmed` commitment; subscription ID `55625496`), acknowledged `logsUnsubscribe`, 14 client pings matched by 14 pongs (recorder control `42/42`), normal `1000` close, zero cleanup failures.
+- **Requests & budget**: exactly 2 HTTP account requests (`getMultipleAccounts` on `SOLANA_RPC`), 0 transaction retrievals, 1 WebSocket connection. No retries, reconnects, or secondary requests.
+- **Activity & remaining gap**: 0 pool notifications received, 0 transaction retrievals, 0 decoded swaps; all 5 qualification flags remain `false`. Live transaction-processing coverage remains outstanding.
+- **Offline binding audit & next prerequisite**: Offline inspection confirms the wire subscription matches `poolAddress` (which `RaydiumCpmmSwapDecoder` requires at swap instruction account index 3) and that cumulative protocol fees/reserves shifted on this pool between `01` (slot `473283318`) and `02` (slot `473455432`), while effective depth remained small (`~163.06` USDC / `~2.35` WSOL). Zero notifications establishes only that no matching events arrived during the window (not pool dormancy or provider fault). Before another capture is proposed, a bounded single-page activity/target check (assessment §8.38.20) is needed to screen for quiet-to-moderate recent cadence (`~1`–`4`/min, burst `<= 4`) while strictly separating activity metadata, received notifications, and verified swaps.
+- **Wallet & verification**: virtual wallet unchanged (`7f2c2353ac2f62cac1bb98703742ab19c74ac5521635af6f49bbe777ad020ed9`). Both sealed operator scripts (`01` and `02`) remain preserved and consumed. Offline credential-free `--verify` exits `0`.

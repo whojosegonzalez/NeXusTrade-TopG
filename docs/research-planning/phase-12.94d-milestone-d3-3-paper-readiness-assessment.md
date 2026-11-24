@@ -11512,9 +11512,9 @@ Output directories that already exist are refused at setup (`OUTPUT_EXISTS:<bund
 
 **Remaining for Step 4**: independent review accepted the rehearsal for ONE bounded diagnostic capture (`cpmm-observation-01`), completing Roadmap Step 4. Step 5 (the single authorized capture) was executed under separate operator approval and accepted by independent review (see item U below).
 
-###### U. Roadmap Step 5: Bounded CPMM Observation Capture `cpmm-observation-01` (Accepted) and Step 6 Proposal (Extended Observation; Offline Only)
+###### U. Roadmap Step 5: Bounded CPMM Observation Capture `cpmm-observation-01` (Accepted) and Step 6 Extended Implementation
 
-**Status**: Roadmap Step 4 (offline rehearsal) was accepted by independent review for ONE bounded diagnostic capture. Step 5 (`cpmm-observation-01`) was authorized by separate operator approval, executed with the reviewed operator runbook script at commit `ac9d6f2d3836ba2605059c0e7df713e07fa1435c`, and accepted by independent review. Both sealed bundles and all 18 manifest-listed files match and verify offline (exit `0`). Step 6 (extended-observation proposal) is drafted offline (record: `docs/research-planning/cpmm-pool-observation-step6-proposal.md`). Live execution remains **NOT_APPROVED** for Step 6 or any further capture.
+**Status**: Roadmap Step 4 (offline rehearsal) was accepted by independent review for ONE bounded diagnostic capture. Step 5 (`cpmm-observation-01`) was authorized by separate operator approval, executed with the reviewed operator runbook script `.tmp/runbooks/cpmm-observation-01-operator.ps1` at commit `ac9d6f2d3836ba2605059c0e7df713e07fa1435c`, and accepted by independent review. Step 6 offline implementation (`--profile extended`) and rehearsal (`OC30`–`OC39`) were accepted at commit `0002d0b18e3337d23ee813c058c783a3e4341925`, and Step 6 capture `cpmm-observation-02` was executed under separate operator approval and independently verified (see §8.38.20). Both `cpmm-observation-01` and `cpmm-observation-02` verify offline (exit `0`). Because both windows received zero pool notifications, live transaction-processing coverage remains outstanding, and live execution remains **NOT_APPROVED** for any further capture.
 
 **Step 5 Execution and Independent Verification (`cpmm-observation-01`)**:
 
@@ -11551,7 +11551,7 @@ A detailed proposal for a single bounded extended observation is recorded in `do
 - **Handoffs, retention & drain**: Preserves the 4-outstanding-handoff model (`maxOutstandingResolutions = 4`, counting raw envelopes before ledger deduplication; no queue of 10 retrievals). The 25,000 ms drain window is a deliberate cutoff that bounds post-observation wait without settling assumptions; in-flight requests or network delays exceeding this window expire fail-closed as `DRAIN_EXPIRED` (exit 3) and record pending work truthfully. Expanded retention limits (256 epoch frames, 2 MB epoch bytes, 64 control records, 32 exchange records, 8 MB exchange bodies).
 - **Outcome matrix**: Rigorously separates notifications $\ne$ signatures $\ne$ retrieval attempts $\ne$ decoded swaps. Outcome conclusions are strictly conditional on actual evidence files (`report.json`, `owner-report.json`, `ledger.json`, `session-ledger.json`, `transport-diagnostics.json`, manifests) and do not promise full replayability, reconciliation, sealing, or complete retention from an exit code alone.
 - **Narrow implementation and offline rehearsal**: Implements a separately selected extended profile (`PROPOSED_EXTENDED_OBSERVATION_PROFILE_V1`) via an explicit CLI selector (`--profile extended`), preserving `PROPOSED_SHORT_OBSERVATION_PROFILE_V1` (SHA-256 `8cd48f31a9dd8a157c91341dbee0acb0f773fbf2b29eef20ea4fb978f533cf78`) and its frozen plan digests byte-identical. Rehearsed and verified offline across test cases OC30–OC39 in `backend/src/scripts/cpmm-pool-observation.test.ts`. Supported literal, URL, and decoded binary credentials are redacted, while retaining the recognized architectural limitation that arbitrary re-encoded credentials are not detected. No accepted-component refactoring.
-- **Governance**: Step 6 is documentation and proposal only. Live execution is NOT approved.
+- **Governance**: Earlier Step 6 approval is consumed by `cpmm-observation-02`. Live execution remains NOT approved for any further run.
 
 ---
 
@@ -11668,3 +11668,63 @@ A detailed proposal for a single bounded extended observation is recorded in `do
 | W12    | No shutdown backstop                                   | R-22                                                                                                |
 
 - **Results**: the affected suites pass under external 60 s limits: retrospective 24, capability 18, Stage B runner 18, watch 11, handoff 13 and pilot sequence 10 (94); watch evidence 12, precheck 6, watch validation 19 and creation watch 33 (70); 164 in all. The backend typecheck, ESLint and Prettier pass. No pin change was needed: the pin policy, baseline and exact-version exceptions are unchanged. The wallet (`7f2c2353…ed9`), the precheck 01, watch 01 and watch 02 manifests, the two capability-check manifests, and all three files of `amm-v4-watch-02-01` (manifest `71f05220…eabeeb`) are unchanged. No credential was read, and no request, socket, rerun, watch or pilot was started.
+
+---
+
+#### 8.38.20 Step 6 Extended Capture `cpmm-observation-02` Result, Offline Binding Audit, and Bounded Pre-Capture Check Proposal
+
+**Status**: Roadmap Step 6 (`cpmm-observation-02`, using `--profile extended` at commit `0002d0b18e3337d23ee813c058c783a3e4341925`) passed as a bounded extended transport/evidence observation and was independently verified offline. Both sealed bundles and all 18 manifest-listed files match byte-identical and verify offline (exit `0`). Zero pool notifications were received during the 300-second window, so live transaction-processing coverage (non-zero `logsNotification` handling, paced `getTransaction` retrieval, and live CPMM swap decoding/reconciliation) remains **outstanding**. Live execution remains **NOT_APPROVED** for any further capture.
+
+##### 1. Independently Verified Step 6 Result (`cpmm-observation-02`)
+
+- **Target**: Raydium CPMM pool `47hq28mcL7q5GhBg7epyGF2dnuJd4MKFt8QhT7CzYUp4` (WSOL/USDC), candidate mint `EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v` (USDC). Fixed public inputs; no discovery or target selection was performed.
+- **Commit & Profile**: `0002d0b18e3337d23ee813c058c783a3e4341925`, `--profile extended` (`PROPOSED_EXTENDED_OBSERVATION_PROFILE_V1`, limits SHA-256 `bbe536836408e23d7885739f016416de47db6eb395a48f0eb612efe847a0b587`), executed via the consumed operator wrapper `.tmp/runbooks/cpmm-observation-02-operator.ps1` (SHA-256 `4d92f7825e91eb7ad7749afb78e362ced4a7e9d8338c886832ce53ef3ab92b8d`).
+- **Sealed Bundles & Manifest Integrity**:
+  - **Acquisition bundle**: `data/research/cpmm-acquisitions/cpmm-observation-02/evidence-manifest.json`, SHA-256 `960b66a19d8a7a74e5391af896febe546d8558b90f0c5852798a8a5e49a0af5f` (7 files). Outcome `ACQUIRED`, integrity `VERIFIED`, re-derivation `ACQUIRED_REPRODUCED`, discovery slot `473455423`, consistent snapshot slot `473455432` (`discoveryPoolBytesEqual: true`).
+  - **Observation bundle**: `data/research/cpmm-observations/cpmm-observation-02/cpmm-observation-manifest.json`, SHA-256 `ee813da654c2fc7c090d789827f93cc1acfceab827cb15257adb58afa2fbaaeb` (11 files). Binding `ACQUIRED_BOUND` / `REPRODUCED`, retention `COMPLETE` (0 dropped records across all categories, 35 stored payloads, 0 redacted/withheld/omitted).
+  - All 18 manifest-listed files across both bundles match byte for byte.
+- **Protocol & Transport Execution**:
+  - **Observation window**: nominal 300,000 ms (`startedAtMs: 1795547184385`, `nominalEndMs: 1795547484385`), WebSocket opened at `1795547184735` ms, subscription acknowledged at `1795547184874` ms, `UNSUBSCRIBE_RESPONSE` received at `1795547484531` ms, settled cleanly at `1795547484667` ms.
+  - **Sockets & subscription**: 1 WebSocket connection (`closeCode: 1000`, `cleanup.status: "SETTLED"`, `cleanupFailures: []`, `connectionRunClean: true`). Outgoing `logsSubscribe` (`id: 1`, `{ mentions: ["47hq28mcL7q5GhBg7epyGF2dnuJd4MKFt8QhT7CzYUp4"] }`, `confirmed` commitment) acknowledged with subscription ID `55625496`; outgoing `logsUnsubscribe` (`id: 2`, `[55625496]`) acknowledged (`result: true`).
+  - **Control frames**: 14 client keepalive pings reserved and completed, matched by 14 received pongs (`pongsMatched: 14`, `pongsUnmatched: 0`, `pingsReceived: 0`, `pongsReceived: 14`, `incoming.controlFrames: 14`, recorder `control` observed/retained: `42/42`).
+- **Requests & Budget**:
+  - Exactly 2 HTTP account requests (`getMultipleAccounts` on `SOLANA_RPC`, discovery and paced snapshot).
+  - 0 transaction retrievals dispatched (`exchanges/index.json` empty), 0 requests on other lanes; total HTTP attempts: 2 (of 30 ceiling). No retries, reconnects, fallbacks, or follow-up requests.
+- **Activity & Qualification**:
+  - 0 pool notifications received, 0 transaction retrievals, 0 decoded swaps.
+  - All five qualification flags remain strictly `false`: `notificationCompletenessEstablished: false`, `quietWindowEstablished: false`, `qualificationEligible: false`, `replayableCaptureEstablished: false`, `admissionEligible: false`.
+  - No trading, orders, positions, strategies, or admissions.
+- **Wallet Invariant & Offline Verification**:
+  - Virtual wallet balance (7.9259 SOL) and SHA-256 (`7F2C2353AC2F62CAC1BB98703742AB19C74AC5521635AF6F49BBE777AD020ED9`) confirmed unchanged.
+  - Read-only credential-free `--verify data/research/cpmm-observations/cpmm-observation-02 --acquisition-dir data/research/cpmm-acquisitions/cpmm-observation-02` exits `0`. Because zero transaction responses were captured, all implemented components reproduce and evidence verification succeeds without provider credentials.
+
+##### 2. Offline Audit of Subscription, Filter, and Target Binding
+
+An offline audit of the sealed evidence artifacts (`transport-records.json`, `collector.json`, `owner-report.json`, `pool-context.json`, `adapter.json`, and `exchange-1.json` / `exchange-2.json`) establishes the following:
+
+1. **Exact Wire Subscription & Clean Matching (`transport-records.json`)**:
+   - Outgoing `logsSubscribe` frame (ordinal `10`, `149` bytes, SHA-256 `4d1b1b1d23851e1c6a0eea62797f3396b9fb7073a541acc5765f3e8acecd27b4`):
+     `{"jsonrpc":"2.0","id":1,"method":"logsSubscribe","params":[{"mentions":["47hq28mcL7q5GhBg7epyGF2dnuJd4MKFt8QhT7CzYUp4"]},{"commitment":"confirmed"}]}`
+   - Incoming acknowledgement (ordinal `13`, `42` bytes, SHA-256 `667b0ae0b5c1914c9d6f1cd2a60d43829eed1cb3f928b91a5695bc203e94392e`): `{"jsonrpc":"2.0","id":1,"result":55625496}`.
+   - Outgoing `logsUnsubscribe` (ordinal `70`, `38` bytes): `{"jsonrpc":"2.0","id":2,"method":"logsUnsubscribe","params":[55625496]}`, acknowledged by `{"jsonrpc":"2.0","id":2,"result":true}` (ordinal `73`, `38` bytes).
+   - Collector and owner bindings both match `47hq28mcL7q5GhBg7epyGF2dnuJd4MKFt8QhT7CzYUp4` and `EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v`, with 0 mismatched response IDs, 0 foreign subscriptions, and 0 blocking frames.
+2. **On-Chain Target Identity & Filter Soundness (`pool-context.json`, `RaydiumCpmmSwapDecoder.ts`)**:
+   - Account `47hq28mcL7q5GhBg7epyGF2dnuJd4MKFt8QhT7CzYUp4` is owned by Raydium CPMM (`CPMMoo8L3F4NbTegBCKVNunggL7H1ZpdTHKxQB5qKP1C`) and verified across all four adapter checks (`ownerVerified`, `vaultAuthoritiesVerified`, `tokenProgramsVerified`, `authBumpVerified`) with `poolStatus: 0` (`swapEnabledByStatus: true`).
+   - `RaydiumCpmmSwapDecoder.ts` enforces that every Raydium CPMM `swap_base_input` / `swap_base_output` invocation passes the pool account at instruction account index `3` (`n.ix.accounts[3] === pv.poolAddress`), ensuring `mentions: [poolAddress]` matches swap transactions targeting that pool at `confirmed` commitment.
+3. **Inter-Run Pool State Comparison (`cpmm-observation-01` vs `cpmm-observation-02`)**:
+   - Comparing `pool-context.json` from Step 5 (slot `473283318`) with Step 6 (slot `473455432`) shows cumulative protocol fees increased (`baseTotalFeesRaw`: `2,661,105` $\to$ `2,662,836`; `quoteTotalFeesRaw`: `36,634,707` $\to$ `36,675,171`) and effective reserves moved (`165.291769` USDC / `2.318237182` SOL $\to$ `163.060874` USDC / `2.350299991` SOL), while LP supply stayed `6654795`.
+   - At Step 6, total effective liquidity remained small (`~163.06` USDC and `~2.35` WSOL), consistent with sporadic swap intervals over multi-hour spans that can produce zero events inside a single 60 s or 300 s window.
+   - **No Dormancy or Provider-Fault Inference**: Zero received notifications across `01` and `02` demonstrates only that zero `logsNotification` frames matching the confirmed `mentions` filter were delivered during those two intervals; it proves neither pool dormancy nor any WebSocket provider fault. However, re-running extended captures on a low-depth pool without first checking recent activity cadence carries high probability of another zero-notification capture, leaving live transaction-processing coverage unexercised.
+
+##### 3. Proposed Smallest Bounded Activity / Target Check Before Another Capture (Offline Proposal Only)
+
+Before authorizing another extended CPMM observation run intended to exercise live transaction retrieval and swap decoding, perform the smallest bounded pre-capture check **reusing existing repository tooling** (`PaperRequestSession`, `ExactPoolHistoryEnumerator` signature validation/page schema, `RaydiumCpmmPoolStateAdapter`, and `DexScreenerCpmmCandidateMarketParser`):
+
+- **Minimal Bounded Shape (0 WebSockets, 0 Retries, 0 Loops, Fixed Bounds)**:
+  1. **1 HTTP `getSignaturesForAddress` call on `SOLANA_RPC`** (`limit: 20`, `commitment: "confirmed"`, 10,000 ms timeout, 64 KiB response cap, 0 `getTransaction` calls, 0 pagination, mirroring the single-request bound in `amm-v4-watch-retrospective.ts` `RETROSPECTIVE_LIMITS` — or optionally paired with **1** DexScreener `/latest/dex/tokens/<mint>` request parsed by `DexScreenerCpmmCandidateMarketParser.ts` if selecting a replacement active WSOL-paired Raydium CPMM pool, for a maximum of 2 HTTP attempts across separate lanes).
+  2. **Deterministic Read-Only Screening Criterion**: Inspect the single `getSignaturesForAddress` page (`limit: 20`) to verify recent non-errored (`err === null`) address activity cadence (block-time spacing between consecutive recent signatures consistent with the accepted owner's quiet-to-moderate operating envelope: roughly 1–4 events/minute and burst density $\le 4$ transactions per slot, without saturating 4 outstanding handoffs or exhausting 28 retrievals prematurely).
+- **Strict Evidence Separation (Do Not Conflate Categories)**:
+  1. **Activity Metadata** (`DexScreener` `txns.m5` provider counts or `getSignaturesForAddress` `slot`/`blockTime`/`err`): Provider-reported rolling 5-minute counters or validator-estimated second-granular timestamps of transactions referencing the pool account. Shows recent address cadence only; it does **not** prove swap instruction semantics, amounts, or notification completeness.
+  2. **Received Notifications** (`logsSubscribe` `logsNotification` frames during live observation): Real-time JSON-RPC stream deliveries for `mentions: [poolAddress]` at `confirmed` commitment; bounded by handoff (`4`), frame size (`65,536` bytes), and window duration (`300,000` ms).
+  3. **Verified Swaps** (`getTransaction` responses decoded offline/online by `RaydiumCpmmSwapDecoder` against verified `RaydiumCpmmPoolStateSuccess`): Only successful (`meta.err === null`) `swap_base_input`/`swap_base_output` calls with account index `3 == poolAddress`, two direct-child `TransferChecked` transfers on verified vaults, and corroborated `SwapEvent`.
+- **No Auto-Chain & No Live Execution**: Any pre-capture check script/adapter plan must be reviewed separately, remain dry-run by default with zero credentials, seal its own single-page evidence, and never trigger a live observation automatically. Neither this check nor another observation run is currently approved.
