@@ -139,7 +139,7 @@ Roadmap Step 5 was executed under explicit operator approval for run ID `cpmm-ob
   - Acquisition bundle: `data/research/cpmm-acquisitions/cpmm-observation-01`, manifest SHA-256 `49273a4fa5b1dfb55c9d8184e3e2e0a711e28d778ea99a5581db68f2d2df8d83` (7 files). Outcome `ACQUIRED`, integrity `VERIFIED`, re-derivation `ACQUIRED_REPRODUCED`.
   - Observation bundle: `data/research/cpmm-observations/cpmm-observation-01`, manifest SHA-256 `f8026f11a99b6a548f91437d2763f01c43836cb8664f5bec21a209e80ec3b845` (11 files). Observation binding `REPRODUCED`.
   - Total: 18 manifest-listed files, byte-identical.
-- **Protocol execution**: 60-second observation (`startedAtMs: 1795510166545`, nominal end `1795510226545`, settled `1795510226815`), acknowledged subscribe and unsubscribe, 2 pings matched by 2 pongs, clean transport closure.
+- **Protocol execution**: 60-second observation (`startedAtMs: 1795510166545`, nominal end `1795510226545`, settled `1795510226815`), acknowledged `logsSubscribe` (`{ mentions: ["47hq28mcL7q5GhBg7epyGF2dnuJd4MKFt8QhT7CzYUp4"] }`, `confirmed` commitment), acknowledged `logsUnsubscribe`, 2 pings matched by 2 pongs, clean transport closure.
 - **Requests & budget**: exactly 2 HTTP account requests (discovery and paced snapshot), 0 transaction retrievals, 1 WebSocket connection. No retries, no secondary requests.
-- **Activity**: 0 pool notifications arrived during the 60-second observation window. All 5 qualification flags remain `false`.
+- **Activity**: 0 pool notifications were received during the 60-second observation window. All 5 qualification flags remain `false`.
 - **Wallet & verification**: virtual wallet unchanged (`7f2c2353ac2f62cac1bb98703742ab19c74ac5521635af6f49bbe777ad020ed9`). Offline credential-free verification (`--verify`) exits `0`.

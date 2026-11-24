@@ -11526,14 +11526,14 @@ Output directories that already exist are refused at setup (`OUTPUT_EXISTS:<bund
   - All 18 manifest-listed files across both bundles match byte for byte.
 - **Protocol & transport execution**:
   - Observation window: nominal 60,000 ms (`startedAtMs: 1795510166545`, `nominalEndMs: 1795510226545`), settled cleanly at `1795510226815` ms.
-  - Sockets & messages: exactly 1 WebSocket connection, acknowledged `accountSubscribe`, acknowledged `accountUnsubscribe`, normal clean close (`cause: OBSERVATION_COMPLETED`, `code: UNSUBSCRIBE_RESPONSE`, `connectionRunClean: true`).
+  - Sockets & messages: exactly 1 WebSocket connection, acknowledged `logsSubscribe` (`{ mentions: ["47hq28mcL7q5GhBg7epyGF2dnuJd4MKFt8QhT7CzYUp4"] }`, `confirmed` commitment), acknowledged `logsUnsubscribe`, normal clean close (`cause: OBSERVATION_COMPLETED`, `code: UNSUBSCRIBE_RESPONSE`, `connectionRunClean: true`).
   - Control frames: 2 pings dispatched, both matched by received pongs, 0 unmatched pongs, 0 control frame overflows.
 - **Requests & budget**:
   - Exactly 2 HTTP account requests on `SOLANA_RPC` (discovery and paced snapshot).
   - 0 transaction retrievals dispatched; 0 requests on other lanes. Total HTTP attempts: 2 (well within the 10-attempt ceiling).
   - No retries, reconnects, fallbacks, or follow-up requests.
 - **Activity & qualification**:
-  - 0 pool notifications arrived during the 60-second observation window (the target pool had zero on-chain swap events during this interval).
+  - 0 pool notifications were received during the 60-second observation window.
   - All five qualification flags remain strictly `false`: `notificationCompletenessEstablished: false`, `quietWindowEstablished: false`, `qualificationEligible: false`, `replayableCaptureEstablished: false`, `admissionEligible: false`.
   - No trading, orders, positions, strategies, or admissions.
 - **Virtual wallet invariant**:
@@ -11545,11 +11545,12 @@ Output directories that already exist are refused at setup (`OUTPUT_EXISTS:<bund
 **Step 6 Extended-Observation Proposal Summary**:
 A detailed proposal for a single bounded extended observation is recorded in `docs/research-planning/cpmm-pool-observation-step6-proposal.md`.
 
-- **Target rationale**: Analyzes why `cpmm-observation-01` saw zero notifications (60s was a quiet interval on WSOL/USDC), balances extending observation duration against the accepted owner's 4-outstanding-hand-off limit (finding F1), and proposes observing a pool with expected swap rate < 8 swaps/min and burst <= 4 swaps.
-- **Duration & lifetime**: 300 s (5 min) observation window (`observationMs = 300,000`), bounded session lifetime of 350,000 ms (`15,000` acq + `300,000` obs + `5,000` unsub + `25,000` drain + `5,000` margin).
-- **Ceilings & pacing**: 30 total HTTP attempts (2 acquisition, up to 28 retrievals), 2,500 ms `SOLANA_RPC` pacing, 1 WebSocket connection, 1 subscription, up to 15 pings and 16 pong replies.
-- **Handoffs & retention**: Enforces the 4-outstanding limit, expanded retention limits (256 epoch frames, 2 MB epoch bytes, 32 exchange records, 8 MB exchange bodies), and a 25 s drain window.
-- **Outcome matrix**: Rigorously defines evidentiary value of an empty capture (proves extended 5m transport health, zero pool activity), an active capture (proves live on-chain streaming, deduplication, exchange storage, and decoding), a failed capture (proves fail-closed boundaries under live conditions without leaking requests), and a budget-exhausted capture (proves strict halting at attempt ceiling).
+- **Target rationale**: Analyzes that `cpmm-observation-01` received zero notifications during its 60 s window. Balances extending observation duration against the accepted owner's 4-outstanding-handoff limit (finding F1) and serialized minimum 2,500 ms dispatch spacing (finding F4). Proposes observing a pool with an expected notification arrival rate of 1 to 4 notifications per minute and an expected burst density of $\le 4$ notifications per block.
+- **Duration & lifetime**: Derived from `CpmmPoolConnectionOwner`'s absolute deadlines ($t_0$, `ackDeadlineMs`, `nominalEndMs`, `intakeEndMs`, `drainDeadlineMs`, `runCeilingMs`). 300 s (5 min) nominal observation window (`observationMs = 300,000`), bounded session lifetime of 350,000 ms (`15,000` acq + `300,000` obs + `5,000` unsub + `25,000` drain + `5,000` margin), satisfying $\text{runCeilingMs} \le \text{sessionDeadlineMs}$.
+- **Ceilings & pacing**: 30 total HTTP attempts on `SOLANA_RPC` (2 acquisition, up to 28 transaction retrievals; 0 on other lanes). Minimum dispatch spacing of 2,500 ms on `SOLANA_RPC`, accounting for request timeouts (up to 10,000 ms) and network RTT. Exactly 1 WebSocket connection, acknowledged `logsSubscribe` with pool-address mentions filter at `confirmed` commitment, acknowledged `logsUnsubscribe`. In a clean 300 s run, exactly 14 client pings are dispatched (at 20s, 40s, ..., 280s; at 300s nominalEndMs is reached and pongBy would exceed nominalEndMs); limits are 16 pings, 16 pong replies, and 36 control frames.
+- **Handoffs, retention & drain**: Preserves the 4-outstanding-handoff model (`maxOutstandingResolutions = 4`, counting raw envelopes before ledger deduplication; no queue of 10 retrievals). The 25,000 ms drain window is a deliberate cutoff that bounds post-observation settling time; in-flight requests or network delays exceeding this window expire fail-closed as `DRAIN_EXPIRED` (exit 3) and record pending work truthfully. Expanded retention limits (256 epoch frames, 2 MB epoch bytes, 32 exchange records, 8 MB exchange bodies).
+- **Outcome matrix**: Rigorously separates notifications $\ne$ signatures $\ne$ retrieval attempts $\ne$ decoded swaps. Outcome conclusions are strictly conditional on actual evidence files (`report.json`, `owner-report.json`, `ledger.json`, `session-ledger.json`, `transport-diagnostics.json`, manifests) and do not promise full replayability, reconciliation, sealing, or complete retention from an exit code alone.
+- **Narrow implementation plan**: Proposes a separately selected extended profile (`PROPOSED_EXTENDED_OBSERVATION_PROFILE_V1`) via an explicit CLI selector (`--profile extended`), preserving `PROPOSED_SHORT_OBSERVATION_PROFILE_V1` and its frozen digests byte-identical. Proposes files (`backend/src/scripts/cpmm-pool-observation.ts`, `backend/src/scripts/cpmm-pool-observation.test.ts`) and offline rehearsal test cases OC30–OC39. No accepted-component refactoring.
 - **Governance**: Step 6 is documentation and proposal only. Live execution is NOT approved.
 
 ---
