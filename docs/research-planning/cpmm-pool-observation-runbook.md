@@ -1,6 +1,6 @@
 # CPMM Pool Observation — Operator Runbook
 
-**Status:** the live limits are not approved. The profile `PROPOSED_SHORT_OBSERVATION_PROFILE_V1` has status `PROPOSED_FOR_REVIEW_LIVE_LIMITS_NOT_APPROVED`, and live execution is `NOT_APPROVED` until independent review and the operator-limit review (roadmap Step 4) approve it. Nothing in this runbook approves a live run. Only `--help`, the dry run and the read-only verification may be used.
+**Status:** the live limits are not approved. The profile `PROPOSED_SHORT_OBSERVATION_PROFILE_V1` has status `PROPOSED_FOR_REVIEW_LIVE_LIMITS_NOT_APPROVED`, and live execution is `NOT_APPROVED` until independent review and the operator-limit review (roadmap Step 4) approve it. Nothing in this runbook approves a live run. Only `--help`, the dry run and the read-only verification may be used. The offline Step 4 rehearsal of this profile is recorded in `cpmm-pool-observation-step4-rehearsal.md`; Step 4 stays under review, and the rehearsal is not approval.
 
 Entry point: `backend/src/scripts/cpmm-pool-observation.ts` (assessment §8.38.17 item 17 T, roadmap Step 3). It runs the accepted composition core (`cpmm-pool-observation-run.ts`) once for one explicit Raydium CPMM pool and candidate mint. It adds no acquisition, observation, sealing or verification logic of its own. It is observation only: no purchase, order, position, strategy, admission, daemon or paper trading.
 
@@ -73,10 +73,12 @@ Values in the offline tests are test inputs, not approved live limits.
 | Use                    | Attempts                                                                 |
 | ---------------------- | ------------------------------------------------------------------------ |
 | Account acquisition    | 2 `getMultipleAccounts` (discovery, then the paced snapshot)             |
-| Transaction retrievals | at most 8 `getTransaction` (what remains), at most 4 outstanding         |
+| Transaction retrievals | at most 8 `getTransaction` (what remains), serialized on the lane        |
 | Other lanes            | 0                                                                        |
 | **Session ceiling**    | **10**                                                                   |
 | WebSocket              | 1 connection, 1 subscription; no reconnect, retry, fallback or follow-up |
+
+**Outstanding limit** (the owner's 4 outstanding retrievals): the owner reserves a slot for every notification it hands to the ledger, before the ledger knows whether the signature is a duplicate. The limit therefore counts hand-offs that have not settled, not requests. A fifth hand-off while four are unsettled ends the run with `PROCESSING_OVERFLOW:OUTSTANDING_LIMIT` (exit 3), even if all five are duplicates that need no request. Notifications that arrive in the same tick count together. With retrievals serialized and paced at 2,500 ms, a run can finish cleanly only on a quiet pool: at most 8 distinct swaps in the observation window, and never a fifth hand-off while four are unsettled. A busy pool ends with truthful, sealed evidence and no excess request (rehearsal findings F1 and F4).
 
 **Local sealing and verification** (file writes and offline re-derivation; no request or connection):
 
@@ -107,6 +109,8 @@ A sealing failure takes precedence over evidence that does not verify, which tak
 ## 7. Verification and its limitation
 
 `--verify` reads both bundles and writes nothing. It loads no configuration or credential, so the observation's transaction responses are not re-analysed: transaction analysis is reported as unavailable and the implemented components are not reproduced. An intact bundle therefore verifies with exit code 2 (limited), not 0. Integrity, retention and the acquisition binding are still checked. A missing, altered or different acquisition bundle does not bind (exit 4).
+
+Retention covers only what reached the recorder. A frame that the WebSocket wrapper or the `ws` client refuses (an oversized frame or control payload) is never recorded, so retention can read complete while the run failed. Such a refusal shows in `transport-diagnostics.json` (`refusedPayloadLimit`, `control.refused`) and in the owner's terminal cause, and the run exits 3 (rehearsal finding F2).
 
 ## 8. After a run
 

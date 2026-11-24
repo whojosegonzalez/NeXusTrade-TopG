@@ -206,6 +206,11 @@ class FakeClient implements CpmmWsClientLike {
   message(data: unknown): void {
     this.emit("message", data, false);
   }
+  /** The connection ends with `code`, as the ws client reports a protocol-level close. */
+  closeWith(code: number): void {
+    this.#rs = 3;
+    this.emit("close", code, Buffer.alloc(0));
+  }
 }
 
 // --- pool, transactions and frames ---------------------------------------------------------------
@@ -426,7 +431,8 @@ const UNSUB_REQ = CPMM_OBSERVATION_RUN_CONSTANTS.unsubscribeRequestId;
 const enc = (v: unknown) => Buffer.from(JSON.stringify(v));
 const ackFrame = () => enc({ jsonrpc: "2.0", id: SUB_REQ, result: SUB });
 const unsubAck = () => enc({ jsonrpc: "2.0", id: UNSUB_REQ, result: true });
-const notif = (n: number) =>
+/** With `filler`, one more log line carrying it (to size the frame exactly). */
+const notif = (n: number, filler?: string) =>
   enc({
     jsonrpc: "2.0",
     method: "logsNotification",
@@ -434,7 +440,14 @@ const notif = (n: number) =>
       subscription: SUB,
       result: {
         context: { slot: SLOT },
-        value: { signature: signatureOf(n), err: null, logs: ["Program log: swap"] },
+        value: {
+          signature: signatureOf(n),
+          err: null,
+          logs:
+            filler === undefined
+              ? ["Program log: swap"]
+              : ["Program log: swap", `Program log: ${filler}`],
+        },
       },
     },
   });
@@ -448,8 +461,11 @@ interface RpcRequest {
 }
 
 function accountsResponse(req: RpcRequest): Response {
+  return Response.json(accountsBody(req));
+}
+function accountsBody(req: RpcRequest): unknown {
   const keys = req.params[0] as string[];
-  return Response.json({
+  return {
     jsonrpc: "2.0",
     id: req.id,
     result: {
@@ -466,7 +482,7 @@ function accountsResponse(req: RpcRequest): Response {
         };
       }),
     },
-  });
+  };
 }
 const txResponse = (req: RpcRequest) =>
   new Response(
@@ -477,6 +493,14 @@ const txResponse = (req: RpcRequest) =>
 interface HarnessOptions {
   /** Per getMultipleAccounts call (1-based); undefined falls through to the fixture. */
   acquisition?: (n: number, req: RpcRequest, h: Harness) => Response | undefined;
+  /** Per getTransaction call (1-based); undefined falls through to the fixture. */
+  transaction?: (
+    n: number,
+    req: RpcRequest,
+    h: Harness,
+  ) => Response | Promise<Response> | undefined;
+  /** Called before each timer is queued (it may move the virtual clock first). */
+  onSetTimeout?: (ms: number, h: Harness) => void;
   /** Runs inside the client constructor. */
   onClient?: (h: Harness) => void;
   /** Called for each listener the CLI installs; may throw to refuse it. */
@@ -531,6 +555,8 @@ function harness(o: HarnessOptions = {}) {
   let nextTimer = 0;
   const queue = new Map<number, { at: number; fn: () => void }>();
   const calls: RpcRequest[] = [];
+  /** The virtual time at which each request reached the fake provider. */
+  const callTimes: number[] = [];
   const urls: string[] = [];
   const instances: FakeClient[] = [];
   const logs: string[] = [];
@@ -538,9 +564,11 @@ function harness(o: HarnessOptions = {}) {
   const captured: (() => void)[] = [];
   const counters = { loadEnvironment: 0, loadWebSocketConstructor: 0, installs: 0, removals: 0 };
   let acquisitionCalls = 0;
+  let transactionCalls = 0;
   const root = freshRoot();
   const timers: PaperRequestSessionTimers = {
     setTimeout: (fn, ms) => {
+      o.onSetTimeout?.(ms, h as Harness);
       const id = ++nextTimer;
       queue.set(id, { at: state.now + Math.max(0, ms), fn });
       return id;
@@ -553,6 +581,7 @@ function harness(o: HarnessOptions = {}) {
     state,
     queue,
     calls,
+    callTimes,
     urls,
     instances,
     logs,
@@ -588,11 +617,15 @@ function harness(o: HarnessOptions = {}) {
     urls.push(String(url));
     const req = JSON.parse(String(init?.body)) as RpcRequest;
     calls.push(req);
+    callTimes.push(state.now);
     if (req.method === "getMultipleAccounts") {
       const n = ++acquisitionCalls;
       return o.acquisition?.(n, req, h as Harness) ?? accountsResponse(req);
     }
-    if (req.method === "getTransaction") return txResponse(req);
+    if (req.method === "getTransaction") {
+      const n = ++transactionCalls;
+      return (await o.transaction?.(n, req, h as Harness)) ?? txResponse(req);
+    }
     throw new Error("UNSCRIPTED_REQUEST");
   }) as unknown as typeof fetch;
   const ctor = class extends FakeClient {
@@ -636,7 +669,7 @@ function harness(o: HarnessOptions = {}) {
     log: (line) => logs.push(line),
     ...over,
   });
-  return Object.assign(h, { deps, fetchFn, ctor });
+  return Object.assign(h, { deps, fetchFn, ctor, timers });
 }
 
 const LIVE_ARGS = (runId = "run-1") => [
@@ -715,18 +748,40 @@ const snapshot = (dir: string) =>
     return `${f}:${s.size}:${s.mtimeMs}`;
   });
 
-function expectCredentialFree(h: Harness, r?: CpmmObservationCliResult): void {
+/**
+ * Checks the printed lines, the result and every persisted file, including each payload stored as
+ * base64 after decoding it. Returns how many base64 payloads were decoded and checked.
+ */
+function expectCredentialFree(h: Harness, r?: CpmmObservationCliResult): number {
   const out = h.logs.join("\n");
   for (const banned of [SECRET, HOST, "https://", "wss://", "api-key"]) {
     expect(out.includes(banned), banned).toBe(false);
     if (r !== undefined) expect(JSON.stringify(r).includes(banned), banned).toBe(false);
   }
+  let decoded = 0;
+  const walk = (v: unknown, f: string): void => {
+    if (Array.isArray(v)) {
+      for (const x of v) walk(x, f);
+    } else if (typeof v === "object" && v !== null) {
+      const o = v as Record<string, unknown>;
+      if (o.storedEncoding === "base64" && typeof o.stored === "string") {
+        const bytes = Buffer.from(o.stored, "base64");
+        decoded++;
+        for (const banned of [SECRET, "https://", "wss://"]) {
+          expect(bytes.includes(banned), `${f}: decoded base64 ${banned}`).toBe(false);
+        }
+      }
+      for (const x of Object.values(o)) walk(x, f);
+    }
+  };
   for (const f of listAll(h.root)) {
     const content = readFileSync(path.join(h.root, ...f.split("/")), "utf8");
     expect(content.includes(SECRET), f).toBe(false);
     expect(content.includes("https://"), f).toBe(false);
     expect(content.includes("wss://"), f).toBe(false);
+    if (f.endsWith(".json")) walk(JSON.parse(content), f);
   }
+  return decoded;
 }
 
 const acquisitionRel = (runId = "run-1") => [...CPMM_ACQUISITION_ROOT_SEGMENTS, runId].join("/");
@@ -2049,5 +2104,886 @@ describe("CPMM pool observation CLI (item 17 T, roadmap step 3)", () => {
     expect(seen[0]!.observation).toBe(false);
     expect(existsSync(observationDirOf(h.root, "run-t"))).toBe(true);
     expect(r.report!.execution.sessionStopReason).not.toBeNull();
+  });
+});
+
+// ---------------------------------------------------------------------------------------------
+// Roadmap step 4: offline rehearsal of the proposed profile through the CLI
+// ---------------------------------------------------------------------------------------------
+
+/** A provider answer that arrives `ms` later on the virtual clock. */
+const later = (h: Harness, ms: number, make: () => Response): Promise<Response> =>
+  new Promise((resolve) => {
+    h.timers.setTimeout(() => resolve(make()), ms);
+  });
+/** A provider that never answers: only the session's timeout or abort ends the request. */
+const stalled = (): Promise<Response> => new Promise<Response>(() => undefined);
+/** `text` followed by spaces to exactly `bytes` bytes (JSON allows trailing whitespace). */
+function padded(text: string, bytes: number): string {
+  const n = Buffer.byteLength(text);
+  if (n > bytes) throw new Error(`fixture is already ${n} bytes`);
+  return text + " ".repeat(bytes - n);
+}
+const txBody = (req: RpcRequest) =>
+  JSON.stringify({ jsonrpc: "2.0", id: req.id, result: txResult(req.params[0] as string) });
+/** A notification of exactly `bytes` bytes. */
+function notifOfSize(n: number, bytes: number): Buffer {
+  const base = notif(n, "").length;
+  if (bytes < base) throw new Error(`a notification needs at least ${base} bytes`);
+  return notif(n, "x".repeat(bytes - base));
+}
+
+/** Opens the connection and acknowledges the subscription; `shift` moves the whole timeline. */
+async function connect(h: Harness, shift = 0): Promise<FakeClient> {
+  await h.to(OBS_START + shift + 10);
+  expect(h.instances).toHaveLength(1);
+  const c = h.client;
+  c.open();
+  await h.to(OBS_START + shift + 20);
+  c.message(ackFrame());
+  await flush();
+  return c;
+}
+/** The nominal end: the unsubscribe response, then past every owner deadline. */
+async function conclude(h: Harness, c: FakeClient, shift = 0): Promise<void> {
+  await h.to(NOMINAL_END + shift);
+  c.message(unsubAck());
+  await flush();
+  await h.to(AFTER_ALL + shift);
+}
+/** One CLI run with `script` as the client's side after the acknowledgement. */
+async function rehearse(
+  o: HarnessOptions,
+  script: (h: Harness, c: FakeClient) => Promise<void>,
+  runId = "run-1",
+) {
+  const h = harness(o);
+  const pending = start(h, LIVE_ARGS(runId));
+  const c = await connect(h);
+  await script(h, c);
+  const r = await pending;
+  await h.to(AFTER_ALL + 60_000);
+  return { h, r, obs: observationDirOf(h.root, runId), acq: acquisitionDirOf(h.root, runId) };
+}
+
+const bundle = (dir: string, file: string): unknown =>
+  JSON.parse(readFileSync(path.join(dir, ...file.split("/")), "utf8"));
+const dig = (v: unknown, ...keys: (string | number)[]): unknown =>
+  keys.reduce<unknown>(
+    (o, k) =>
+      typeof o === "object" && o !== null ? (o as Record<string | number, unknown>)[k] : undefined,
+    v,
+  );
+
+type Rec = Record<string, unknown>;
+/** What the sealed observation bundle shows: outcome, accounting and observed maxima. */
+function measure(dir: string) {
+  if (!existsSync(path.join(dir, "owner-report.json"))) return null;
+  const owner = dig(bundle(dir, "owner-report.json"), "report", "value") as Rec;
+  const window = dig(bundle(dir, "session-ledger.json"), "window", "value") as Rec[];
+  const ledger = bundle(dir, "ledger.json");
+  const records = dig(ledger, "records", "value") as Rec[];
+  const calls = [...(dig(ledger, "calls") as Rec[])].sort(
+    (a, b) => Number(a.ordinal) - Number(b.ordinal),
+  );
+  const collector = bundle(dir, "collector.json");
+  const epoch = dig(collector, "epochReport", "value") as Rec;
+  const frames = dig(collector, "frameRecords", "value") as Rec[];
+  const recording = bundle(dir, "recording.json");
+  // Outstanding retrievals, as the owner counts them: account calls not yet settled.
+  let open = 0;
+  let peakOutstanding = 0;
+  for (const call of calls) {
+    if (call.kind === "ACCOUNT_CALL") peakOutstanding = Math.max(peakOutstanding, ++open);
+    else if (call.kind === "ACCOUNT_SETTLEMENT") open--;
+  }
+  const nonZero = (o: unknown) =>
+    Object.fromEntries(Object.entries(o as Rec).filter(([, v]) => v !== 0));
+  return {
+    terminal: { cause: dig(owner, "terminal", "cause"), code: dig(owner, "terminal", "code") },
+    uncertainties: owner.uncertainties as string[],
+    drain: owner.drain as Rec,
+    cleanup: dig(owner, "cleanup", "status"),
+    handoff: owner.handoff as Rec,
+    incoming: owner.incoming as Rec,
+    pings: dig(owner, "outgoing", "pings", "reserved"),
+    pongReplies: dig(owner, "outgoing", "pongReplies", "reserved"),
+    retrievals: window.map((e) => ({
+      purpose: e.purpose,
+      at: Number(e.dispatchedAtMs) - OBS_START,
+      done: e.completedAtMs === null ? null : Number(e.completedAtMs) - OBS_START,
+      error: e.error,
+      bodyComplete: e.bodyComplete,
+    })),
+    records: records.map((r) => ({
+      disposition: r.disposition,
+      factKind: r.factKind,
+      factCode: r.factCode,
+      duplicates: r.duplicateOccurrences,
+      detailsDropped: r.duplicateDetailsDropped,
+    })),
+    peakOutstanding,
+    epoch: {
+      frames: epoch.frames,
+      bytes: epoch.bytes,
+      latched: epoch.acquisitionLimitLatched,
+      byDisposition: nonZero(epoch.byDisposition),
+    },
+    maxFrameBytes: Math.max(0, ...frames.map((f) => Number(f.byteLength))),
+    wrapper: nonZero(
+      dig(bundle(dir, "transport-diagnostics.json"), "diagnostics", "value", "messages"),
+    ),
+    retention: dig(recording, "retention") as Rec,
+    payloads: dig(recording, "payloads") as Rec,
+  };
+}
+
+const FLAG_KEYS = Object.keys(CPMM_EVIDENCE_FALSE_FLAGS);
+/**
+ * Each part of the outcome on its own line, once; the machine-readable report last; flags false
+ * everywhere, listeners detached, no timer left and nothing credential-like anywhere (base64
+ * payloads decoded). Returns how many base64 payloads were decoded.
+ */
+function expectReported(h: Harness, r: CpmmObservationCliResult): number {
+  const rep = r.report!;
+  for (const prefix of [
+    "[LIVE] Profile:",
+    "[LIVE] Plan digest (sha256):",
+    "[LIVE] Execution:",
+    "[LIVE] Clock failure:",
+    "[LIVE] Cleanup failures:",
+    "[LIVE] Entry-point cleanup failures:",
+    "[LIVE] Session stop:",
+    "[LIVE] Requests:",
+    "[LIVE] Acquisition bundle:",
+    "[LIVE] Acquisition integrity:",
+    "[LIVE] Observation bundle:",
+    "[LIVE] Observation integrity:",
+    "[LIVE] Retention:",
+    "[LIVE] Re-derivation:",
+    "[LIVE] Acquisition binding:",
+    "[LIVE] Qualification flags (all false):",
+    `[LIVE] Exit code ${r.exitCode}.`,
+  ]) {
+    expect(
+      h.logs.filter((l) => l.startsWith(prefix)),
+      prefix,
+    ).toHaveLength(1);
+  }
+  const e = rep.execution;
+  expect(h.logs).toContain(
+    `[LIVE] Execution: ${e.status}; first failure: ${e.firstFailure ?? "none"}`,
+  );
+  const ret = rep.evidence.observation.retention;
+  if (ret !== null) {
+    expect(h.logs).toContain(
+      `[LIVE] Retention: ${ret.status}${ret.reasons.length ? ` (${ret.reasons.join(", ")})` : ""}`,
+    );
+  }
+  expect(JSON.parse(h.logs.at(-1)!)).toEqual(JSON.parse(JSON.stringify(rep)));
+  expect(rep.flags).toEqual(CPMM_EVIDENCE_FALSE_FLAGS);
+  expect(FLAG_KEYS).toHaveLength(5);
+  for (const f of listAll(h.root)) {
+    const content = readFileSync(path.join(h.root, ...f.split("/")), "utf8");
+    for (const k of FLAG_KEYS)
+      expect(content, `${f}: ${k}`).not.toMatch(new RegExp(`"${k}":\\s*true`));
+  }
+  expect([...h.installed.values()].flat()).toEqual([]);
+  expect(h.queue.size).toBe(0);
+  return expectCredentialFree(h, r);
+}
+
+const FRAME = P.wrapper.maxFrameBytes;
+const PACING = P.session.lanes.SOLANA_RPC.pacingMs;
+/** The fake provider's latency in the ceiling run: longer than the pacing, so serialization shows. */
+const LATENCY = 3_000;
+const DRAIN_DEADLINE = NOMINAL_END + P.owner.unsubscribeAckTimeoutMs + P.owner.drainMs;
+const rel = (t: number) => t - OBS_START;
+
+describe("CPMM observation profile rehearsal (roadmap step 4)", () => {
+  it("OC20: the exact profile at its ceilings succeeds: 2 + 8 requests, 4 outstanding, 1 MiB of frames", async () => {
+    const x = await rehearse(
+      { transaction: (_n, req, h) => later(h, LATENCY, () => new Response(txBody(req))) },
+      async (h, c) => {
+        // 16 notification frames: 15 at the frame limit and one sized so that, with the
+        // acknowledgement and the unsubscribe response, the epoch carries exactly its byte limit.
+        const last = FRAME - ackFrame().length - unsubAck().length;
+        let k = 0;
+        const deliver = (n: number) => c.message(notifOfSize(n, ++k === 16 ? last : FRAME));
+        await h.to(RECEIVED_AT);
+        for (const n of [1, 2, 3, 4]) deliver(n);
+        await flush();
+        await h.to(RECEIVED_AT + 4 * LATENCY + 500);
+        for (const n of [5, 6, 7, 8]) deliver(n);
+        await flush();
+        await h.to(RECEIVED_AT + 8 * LATENCY + 1_000);
+        for (const n of [1, 2, 3, 4, 5, 6, 7, 8]) {
+          deliver(n);
+          await flush();
+        }
+        await conclude(h, c);
+      },
+    );
+    const { h, r } = x;
+    expect(r.exitCode).toBe(X.OK);
+    expect(r.report!.execution).toMatchObject({
+      status: "SUCCEEDED",
+      firstFailure: null,
+      cleanupFailures: [],
+      ownerTerminalCause: "OBSERVATION_COMPLETED",
+      connectionRunClean: true,
+    });
+    expect(r.report!.requests).toEqual({
+      httpAttempts: P.session.maxHttpAttempts,
+      acquisitionRequests: 2,
+      observationRequests: 8,
+      webSocketConnections: 1,
+    });
+    expect(r.report!.evidence.acquisition).toMatchObject({
+      integrity: "VERIFIED",
+      computed: "ACQUIRED_REPRODUCED",
+    });
+    expect(r.report!.evidence.observation).toMatchObject({
+      integrity: { ok: true, problems: [] },
+      retention: { status: "COMPLETE", reasons: [] },
+      rederivation: { implementedComponents: "REPRODUCED", transactionAnalysis: "AVAILABLE" },
+      acquisitionBinding: "REPRODUCED",
+    });
+    // One connection, one subscription; the acquisition pair is paced.
+    expect(h.instances).toHaveLength(1);
+    expect(h.client.sent.map((s) => (JSON.parse(s) as { id: number }).id)).toEqual([
+      SUB_REQ,
+      UNSUB_REQ,
+    ]);
+    expect(h.calls.map((c) => c.method)).toEqual([
+      "getMultipleAccounts",
+      "getMultipleAccounts",
+      ...Array<string>(8).fill("getTransaction"),
+    ]);
+    expect(h.callTimes.slice(0, 2).map(rel)).toEqual([-PACING, 0]);
+    // The session ledger: serialized (each dispatch after the previous completion) and paced.
+    const m = measure(x.obs)!;
+    expect(m.retrievals.map((e) => [e.at, e.done])).toEqual([
+      [21_500, 24_500],
+      [24_500, 27_500],
+      [27_500, 30_500],
+      [30_500, 33_500],
+      [34_000, 37_000],
+      [37_000, 40_000],
+      [40_000, 43_000],
+      [43_000, 46_000],
+    ]);
+    for (let i = 1; i < m.retrievals.length; i++) {
+      const prev = m.retrievals[i - 1]!;
+      const cur = m.retrievals[i]!;
+      expect(cur.at).toBeGreaterThanOrEqual(prev.done!);
+      expect(cur.at - prev.at).toBeGreaterThanOrEqual(PACING);
+    }
+    expect(
+      m.retrievals.every(
+        (e) => e.purpose === "CPMM_GET_TRANSACTION" && e.error === null && e.bodyComplete,
+      ),
+    ).toBe(true);
+    expect(m.records.map((rec) => rec.disposition)).toEqual(Array<string>(8).fill("INGESTED"));
+    // Observed maxima at the limits, none past them.
+    expect(m.peakOutstanding).toBe(P.owner.maxOutstandingResolutions);
+    expect(m.handoff).toMatchObject({
+      envelopesAccepted: 16,
+      unprocessed: { capacity: 0, intakeStopped: 0, dropped: 0 },
+      settled: { recorded: 8, duplicate: 8 },
+      outstandingAtSettlement: 0,
+    });
+    expect(m.epoch).toEqual({
+      frames: 18,
+      bytes: P.collector.maxEpochBytes,
+      latched: false,
+      byDisposition: {
+        SUBSCRIBE_ACKNOWLEDGED: 1,
+        NOTIFICATION_ACCEPTED: 16,
+        UNSUBSCRIBE_ACKNOWLEDGED: 1,
+      },
+    });
+    expect(m.maxFrameBytes).toBe(P.wrapper.maxFrameBytes);
+    expect(m.wrapper).toEqual({
+      received: 18,
+      delivered: 18,
+      deliveredBytes: P.collector.maxEpochBytes,
+    });
+    expect(m.retention.incoming).toMatchObject({
+      observed: 18,
+      retained: 18,
+      dropped: 0,
+      payloadsOmitted: 0,
+      retainedPayloadBytes: P.recorder.maxIncomingPayloadBytes,
+    });
+    expect(m.pings).toBe(2);
+    expect(m.drain).toEqual({ status: "COMPLETED", outstandingAtDeadline: 0 });
+    expect(m.cleanup).toBe("SETTLED");
+    expect(expectReported(h, r)).toBeGreaterThan(0);
+  });
+
+  it("OC21: a ninth distinct signature is refused by the shared budget: no eleventh request, truthful failure", async () => {
+    const x = await rehearse({}, async (h, c) => {
+      await h.to(RECEIVED_AT);
+      for (const n of [1, 2, 3, 4]) c.message(notif(n));
+      await flush();
+      await h.to(RECEIVED_AT + 12_000);
+      for (const n of [5, 6, 7, 8]) c.message(notif(n));
+      await flush();
+      await h.to(RECEIVED_AT + 24_000);
+      c.message(notif(9));
+      await flush();
+      await h.to(AFTER_ALL);
+    });
+    const { h, r } = x;
+    expect(r.exitCode).toBe(X.RUN_FAILED);
+    expect(r.report!.execution).toMatchObject({
+      status: "FAILED",
+      firstFailure: "OBSERVATION:SESSION_STOPPED",
+      sessionStopReason: "HTTP_ATTEMPT_CEILING_REACHED",
+      ownerTerminalCause: "SESSION_STOPPED",
+      connectionRunClean: false,
+      cleanupFailures: [],
+    });
+    expect(r.report!.requests).toEqual({
+      httpAttempts: 10,
+      acquisitionRequests: 2,
+      observationRequests: 8,
+      webSocketConnections: 1,
+    });
+    expect(h.calls).toHaveLength(P.session.maxHttpAttempts);
+    expect(h.method("getTransaction")).toBe(8);
+    const m = measure(x.obs)!;
+    expect(m.retrievals.map((e) => e.at)).toEqual([
+      21_500, 24_000, 26_500, 29_000, 33_500, 36_000, 38_500, 41_000,
+    ]);
+    expect(m.records.at(-1)).toEqual({
+      disposition: "UNRESOLVED",
+      factKind: "REQUEST_REFUSED",
+      factCode: "HTTP_ATTEMPT_CEILING_REACHED",
+      duplicates: 0,
+      detailsDropped: 0,
+    });
+    expect(m.records.slice(0, 8).every((rec) => rec.disposition === "INGESTED")).toBe(true);
+    expect(m.peakOutstanding).toBe(4);
+    expect(m.cleanup).toBe("SETTLED");
+    expect(r.report!.evidence.observation).toMatchObject({
+      seal: "SEALED",
+      integrity: { ok: true },
+      acquisitionBinding: "REPRODUCED",
+    });
+    expectReported(h, r);
+  });
+
+  it("OC22: a fifth envelope while four are outstanding ends the run before any excess request", async () => {
+    // Five distinct notifications in one burst, the provider stalled.
+    const a = await rehearse({ transaction: () => stalled() }, async (h, c) => {
+      await h.to(RECEIVED_AT);
+      for (const n of [1, 2, 3, 4, 5]) c.message(notif(n));
+      await flush();
+      await h.to(AFTER_ALL);
+    });
+    expect(a.r.exitCode).toBe(X.RUN_FAILED);
+    expect(a.r.report!.execution).toMatchObject({
+      firstFailure: "OBSERVATION:PROCESSING_OVERFLOW:OUTSTANDING_LIMIT",
+      ownerTerminalCause: "PROCESSING_OVERFLOW",
+      cleanupFailures: [],
+    });
+    // The burst ended the run before the first retrieval left: no request at all.
+    expect(a.r.report!.requests).toMatchObject({ httpAttempts: 2, observationRequests: 0 });
+    expect(a.h.method("getTransaction")).toBe(0);
+    const ma = measure(a.obs)!;
+    expect(ma.peakOutstanding).toBe(4);
+    expect(ma.uncertainties).toEqual(["UNPROCESSED_ENVELOPES"]);
+    expect(ma.handoff).toMatchObject({ envelopesAccepted: 5, unprocessed: { capacity: 1 } });
+    expect(ma.records).toEqual(
+      Array(4).fill({
+        disposition: "UNRESOLVED",
+        factKind: "REQUEST_REFUSED",
+        factCode: "CALLER_REFUSAL",
+        duplicates: 0,
+        detailsDropped: 0,
+      }),
+    );
+    expect(ma.drain).toEqual({ status: "ABORTED", outstandingAtDeadline: 4 });
+    expect(ma.cleanup).toBe("SETTLED");
+    expect(a.r.report!.evidence.observation).toMatchObject({
+      integrity: { ok: true },
+      acquisitionBinding: "REPRODUCED",
+    });
+    expectReported(a.h, a.r);
+
+    // Review finding: the limit counts envelopes in hand-off, not requests. Five duplicates of an
+    // already resolved signature delivered in one tick end the run the same way.
+    const d = await rehearse({}, async (h, c) => {
+      await h.to(RECEIVED_AT);
+      c.message(notif(1));
+      await flush();
+      await h.to(RECEIVED_AT + 5_000);
+      for (let i = 0; i < 5; i++) c.message(notif(1));
+      await flush();
+      await h.to(AFTER_ALL);
+    });
+    expect(d.r.exitCode).toBe(X.RUN_FAILED);
+    expect(d.r.report!.execution.firstFailure).toBe(
+      "OBSERVATION:PROCESSING_OVERFLOW:OUTSTANDING_LIMIT",
+    );
+    expect(d.r.report!.requests.httpAttempts).toBe(3);
+    const md = measure(d.obs)!;
+    expect(md.handoff).toMatchObject({
+      unprocessed: { capacity: 1 },
+      settled: { recorded: 1, duplicate: 4 },
+    });
+    expectReported(d.h, d.r);
+
+    // The same duplicates one at a time: no overflow; the fifth duplicate's detail is not kept,
+    // and retention says so (exit 2).
+    const s = await rehearse({}, async (h, c) => {
+      await h.to(RECEIVED_AT);
+      c.message(notif(1));
+      await flush();
+      await h.to(RECEIVED_AT + 5_000);
+      for (let i = 0; i < 5; i++) {
+        c.message(notif(1));
+        await flush();
+      }
+      await conclude(h, c);
+    });
+    expect(s.r.exitCode).toBe(X.EVIDENCE_LIMITED);
+    expect(s.r.report!.execution.status).toBe("SUCCEEDED");
+    expect(s.r.report!.evidence.observation.retention).toEqual({
+      status: "INCOMPLETE",
+      reasons: ["LEDGER_DUPLICATE_DETAILS_TRUNCATED"],
+    });
+    expect(measure(s.obs)!.records).toEqual([
+      {
+        disposition: "INGESTED",
+        factKind: "RESOLVED_SWAPS",
+        factCode: null,
+        duplicates: 5,
+        detailsDropped: 1,
+      },
+    ]);
+    expectReported(s.h, s.r);
+  });
+
+  it("OC23: stalled retrievals time out or are cut at the drain deadline; the evidence is never complete", async () => {
+    // One stalled retrieval mid-observation: timed out by the session, run succeeds, evidence limited.
+    const a = await rehearse(
+      { transaction: (n) => (n === 1 ? stalled() : undefined) },
+      async (h, c) => {
+        await h.to(RECEIVED_AT);
+        c.message(notif(1));
+        await flush();
+        await h.to(RECEIVED_AT + 12_000);
+        c.message(notif(2));
+        await flush();
+        await conclude(h, c);
+      },
+    );
+    expect(a.r.exitCode).toBe(X.EVIDENCE_LIMITED);
+    expect(a.r.report!.execution).toMatchObject({ status: "SUCCEEDED", connectionRunClean: true });
+    expect(a.r.report!.evidence.observation.retention).toEqual({
+      status: "INCOMPLETE",
+      reasons: ["EXCHANGE_BODY_NOT_READ"],
+    });
+    expect(a.r.report!.evidence.observation.rederivation!.implementedComponents).toBe(
+      "MISSING_EVIDENCE",
+    );
+    const ma = measure(a.obs)!;
+    expect(ma.retrievals.map((e) => [e.at, e.done, e.error])).toEqual([
+      [21_500, 21_500 + P.session.requestTimeoutMs, "REQUEST_TIMED_OUT"],
+      [33_500, 33_500, null],
+    ]);
+    expect(ma.records.map((rec) => [rec.disposition, rec.factCode])).toEqual([
+      ["UNRESOLVED", "REQUEST_TIMED_OUT"],
+      ["INGESTED", null],
+    ]);
+    expectReported(a.h, a.r);
+
+    // Four stalled just before the nominal end: serial 10 s timeouts outlast the drain.
+    const b = await rehearse({ transaction: () => stalled() }, async (h, c) => {
+      await h.to(NOMINAL_END - 1_000);
+      for (const n of [1, 2, 3, 4]) c.message(notif(n));
+      await flush();
+      await conclude(h, c);
+    });
+    expect(b.r.exitCode).toBe(X.RUN_FAILED);
+    expect(b.r.report!.execution).toMatchObject({
+      firstFailure: "OBSERVATION:CONNECTION_RUN_NOT_CLEAN",
+      ownerTerminalCause: "OBSERVATION_COMPLETED",
+      connectionRunClean: false,
+      cleanupFailures: [],
+    });
+    expect(b.r.report!.requests).toMatchObject({ httpAttempts: 5, observationRequests: 3 });
+    expect(Math.max(...b.h.callTimes)).toBeLessThan(DRAIN_DEADLINE);
+    const mb = measure(b.obs)!;
+    expect(mb.uncertainties).toEqual(["DRAIN_EXPIRED"]);
+    expect(mb.drain).toEqual({ status: "EXPIRED", outstandingAtDeadline: 2 });
+    expect(mb.retrievals.map((e) => [e.at, e.done, e.error])).toEqual([
+      [59_000, 69_000, "REQUEST_TIMED_OUT"],
+      [69_000, 79_000, "REQUEST_TIMED_OUT"],
+      // In flight when the owner settled at the drain deadline: recorded as not completed.
+      [79_000, null, null],
+    ]);
+    expect(mb.records.map((rec) => rec.disposition)).toEqual([
+      "UNRESOLVED",
+      "UNRESOLVED",
+      "PENDING",
+      "PENDING",
+    ]);
+    expect(b.r.report!.evidence.observation.retention).toEqual({
+      status: "INCOMPLETE",
+      reasons: [
+        "EXCHANGE_BODY_NOT_READ",
+        "EXCHANGE_MISSING",
+        "PENDING_WORK:accountSettlementsPending",
+      ],
+    });
+    expect(mb.cleanup).toBe("SETTLED");
+    expectReported(b.h, b.r);
+  });
+
+  it("OC24: response sizes at the limit are accepted and one byte over is refused and reported", async () => {
+    const max = P.adapter.maxResponseBytes;
+    expect(P.session.lanes.SOLANA_RPC.maxResponseBytes).toBe(max);
+    const a = await rehearse(
+      { transaction: (n, req) => new Response(padded(txBody(req), n === 1 ? max : max + 1)) },
+      async (h, c) => {
+        await h.to(RECEIVED_AT);
+        c.message(notif(1));
+        await flush();
+        await h.to(RECEIVED_AT + 5_000);
+        c.message(notif(2));
+        await flush();
+        await conclude(h, c);
+      },
+    );
+    expect(a.r.exitCode).toBe(X.EVIDENCE_LIMITED);
+    expect(a.r.report!.execution.status).toBe("SUCCEEDED");
+    const ma = measure(a.obs)!;
+    expect(ma.retrievals.map((e) => [e.error, e.bodyComplete])).toEqual([
+      [null, true],
+      ["RESPONSE_TOO_LARGE", false],
+    ]);
+    expect(ma.records.map((rec) => [rec.disposition, rec.factCode])).toEqual([
+      ["INGESTED", null],
+      ["UNRESOLVED", "RESPONSE_TOO_LARGE"],
+    ]);
+    expect(ma.retention.exchanges).toMatchObject({
+      retained: 2,
+      payloadsOmitted: 0,
+      retainedPayloadBytes: 2 * max,
+    });
+    expect(a.r.report!.evidence.observation.retention).toEqual({
+      status: "INCOMPLETE",
+      reasons: ["EXCHANGE_BODY_PARTIAL"],
+    });
+    expectReported(a.h, a.r);
+
+    // Acquisition responses at exactly their own limit: acquired, observed, exit 0.
+    const am = P.acquisition.maxResponseBytes;
+    const ok = await liveRun(
+      { acquisition: (_n, req) => new Response(padded(JSON.stringify(accountsBody(req)), am)) },
+      "run-a",
+    );
+    expect(ok.r.exitCode).toBe(X.OK);
+    expect(ok.r.report!.evidence.acquisition.computed).toBe("ACQUIRED_REPRODUCED");
+    expectReported(ok.h, ok.r);
+    // One byte over: the acquisition fails, is sealed as failed, and nothing is observed.
+    const over = harness({
+      acquisition: (n, req) =>
+        n === 1 ? new Response(padded(JSON.stringify(accountsBody(req)), am + 1)) : undefined,
+    });
+    const p = start(over, LIVE_ARGS());
+    await over.to(OBS_START + 10_000);
+    const r = await p;
+    expect(r.exitCode).toBe(X.RUN_FAILED);
+    expect(r.report!.execution.firstFailure).toBe("ACQUISITION:RESPONSE_TOO_LARGE");
+    expect(r.report!.evidence.acquisition).toMatchObject({
+      seal: "SEALED",
+      integrity: "VERIFIED",
+      computed: "ACQUISITION_FAILED",
+    });
+    expect(r.report!.requests).toEqual({
+      httpAttempts: 1,
+      acquisitionRequests: 1,
+      observationRequests: 0,
+      webSocketConnections: 0,
+    });
+    expect(over.instances).toHaveLength(0);
+    expectReported(over, r);
+  });
+
+  it("OC25: frame size, frame count and epoch bytes past their limits end the run with exit 3", async () => {
+    // One byte over the frame limit, refused by the wrapper after the client delivered it.
+    const big = await rehearse({}, async (h, c) => {
+      await h.to(RECEIVED_AT);
+      c.message(notifOfSize(1, FRAME + 1));
+      await flush();
+      await h.to(AFTER_ALL);
+    });
+    expect(big.r.exitCode).toBe(X.RUN_FAILED);
+    expect(big.r.report!.execution.firstFailure).toBe("OBSERVATION:TRANSPORT_ERROR:ERROR_EVENT");
+    expect(measure(big.obs)!.wrapper).toEqual({
+      received: 2,
+      delivered: 1,
+      deliveredBytes: 38,
+      refusedPayloadLimit: 1,
+    });
+    // Review limitation: retention covers what reached the recorder. A frame the transport
+    // refused is shown by the wrapper diagnostics and the failed run, not by retention.
+    expect(big.r.report!.evidence.observation.retention).toEqual({
+      status: "COMPLETE",
+      reasons: [],
+    });
+    expectReported(big.h, big.r);
+    // The same limit enforced by the ws client itself (close 1009).
+    const ws = await rehearse({}, async (h, c) => {
+      await h.to(RECEIVED_AT);
+      c.emit(
+        "error",
+        Object.assign(new RangeError("Max payload size exceeded"), {
+          code: "WS_ERR_UNSUPPORTED_MESSAGE_LENGTH",
+        }),
+      );
+      c.closeWith(1009);
+      await flush();
+      await h.to(AFTER_ALL);
+    });
+    expect(ws.r.exitCode).toBe(X.RUN_FAILED);
+    expect(ws.r.report!.execution.firstFailure).toBe(
+      "OBSERVATION:ACQUISITION_LIMIT:TRANSPORT_PAYLOAD_LIMIT",
+    );
+    expectReported(ws.h, ws.r);
+
+    // Exactly 128 frames (with the acknowledgement and the unsubscribe response) are accepted.
+    const frames = (extra: number, end: boolean) =>
+      rehearse({}, async (h, c) => {
+        await h.to(RECEIVED_AT);
+        c.message(notif(1));
+        await flush();
+        for (let i = 0; i < extra; i++) {
+          c.message(notif(1));
+          await flush();
+        }
+        if (end) await conclude(h, c);
+        else await h.to(AFTER_ALL);
+      });
+    const at = await frames(P.collector.maxEpochFrames - 3, true);
+    expect(at.r.exitCode).toBe(X.EVIDENCE_LIMITED);
+    expect(at.r.report!.execution.status).toBe("SUCCEEDED");
+    const mAt = measure(at.obs)!;
+    expect(mAt.epoch).toMatchObject({ frames: P.collector.maxEpochFrames, latched: false });
+    // The recorder's ledger-call records stay within their limit at the frame limit.
+    expect(mAt.retention.ledgerCalls).toMatchObject({ observed: 252, dropped: 0 });
+    expect(252).toBeLessThanOrEqual(P.recorder.maxLedgerCallRecords);
+    expect(mAt.retention.lifecycle).toMatchObject({ dropped: 0 });
+    expectReported(at.h, at.r);
+    // The 129th frame is refused.
+    const past = await frames(P.collector.maxEpochFrames - 1, false);
+    expect(past.r.exitCode).toBe(X.RUN_FAILED);
+    expect(past.r.report!.execution.firstFailure).toBe(
+      "OBSERVATION:ACQUISITION_LIMIT:EPOCH_LIMIT_EXCEEDED",
+    );
+    expect(measure(past.obs)!.epoch).toMatchObject({
+      frames: P.collector.maxEpochFrames + 1,
+      latched: true,
+    });
+    expect(past.r.report!.evidence.observation.rederivation!.implementedComponents).toBe(
+      "MISSING_EVIDENCE",
+    );
+    expectReported(past.h, past.r);
+
+    // One byte past the epoch byte limit: refused, and its payload omitted from the recording.
+    const bytes = await rehearse({}, async (h, c) => {
+      await h.to(RECEIVED_AT);
+      for (let i = 0; i < 15; i++) {
+        c.message(notifOfSize(1, FRAME));
+        await flush();
+      }
+      c.message(notifOfSize(1, FRAME - ackFrame().length + 1));
+      await flush();
+      await h.to(AFTER_ALL);
+    });
+    expect(bytes.r.exitCode).toBe(X.RUN_FAILED);
+    expect(bytes.r.report!.execution.firstFailure).toBe(
+      "OBSERVATION:ACQUISITION_LIMIT:EPOCH_LIMIT_EXCEEDED",
+    );
+    const mb = measure(bytes.obs)!;
+    expect(mb.epoch).toMatchObject({ bytes: P.collector.maxEpochBytes + 1, latched: true });
+    expect(mb.retention.incoming).toMatchObject({ payloadsOmitted: 1 });
+    expect(bytes.r.report!.evidence.observation.retention!.reasons).toContain(
+      "PAYLOAD_OMITTED:transport-records.json",
+    );
+    expectReported(bytes.h, bytes.r);
+  });
+
+  it("OC26: control frames: four server pings are answered, the fifth, an oversized one or a seventeenth frame ends the run", async () => {
+    const pings = (n: number, size = P.owner.maxControlPayloadBytes) =>
+      rehearse({}, async (h, c) => {
+        for (let i = 0; i < n; i++) {
+          await h.to(OBS_START + 1_000 + i * 1_000);
+          c.emit("ping", Buffer.alloc(size, 7));
+          await flush();
+        }
+        await conclude(h, c);
+      });
+    const four = await pings(P.owner.maxPongReplies);
+    expect(four.r.exitCode).toBe(X.OK);
+    const m4 = measure(four.obs)!;
+    expect(m4.pongReplies).toBe(P.owner.maxPongReplies);
+    expect(m4.incoming).toMatchObject({ pingsReceived: 4, pongsReceived: 2, controlFrames: 6 });
+    expectReported(four.h, four.r);
+    const five = await pings(P.owner.maxPongReplies + 1);
+    expect(five.r.exitCode).toBe(X.RUN_FAILED);
+    expect(five.r.report!.execution.firstFailure).toBe(
+      "OBSERVATION:CONTROL_FRAME_LIMIT:PONG_REPLY_LIMIT",
+    );
+    expectReported(five.h, five.r);
+    const oversized = await pings(1, P.owner.maxControlPayloadBytes + 1);
+    expect(oversized.r.exitCode).toBe(X.RUN_FAILED);
+    expect(oversized.r.report!.execution.firstFailure).toBe(
+      "OBSERVATION:TRANSPORT_ERROR:ERROR_EVENT",
+    );
+    expectReported(oversized.h, oversized.r);
+    const pongs = await rehearse({}, async (h, c) => {
+      await h.to(RECEIVED_AT);
+      for (let i = 0; i < P.owner.maxControlFrames; i++) c.emit("pong", Buffer.from([1]));
+      await flush();
+      await conclude(h, c);
+    });
+    expect(pongs.r.exitCode).toBe(X.RUN_FAILED);
+    expect(pongs.r.report!.execution.firstFailure).toBe(
+      "OBSERVATION:CONTROL_FRAME_LIMIT:INCOMING_CONTROL_FRAMES",
+    );
+    expect(measure(pongs.obs)!.incoming).toMatchObject({
+      controlFrames: P.owner.maxControlFrames + 1,
+    });
+    expectReported(pongs.h, pongs.r);
+  });
+
+  it("OC27: acquisition sealing consumes the shared lifetime: observation starts only with the owner's ceiling left", async () => {
+    // Local sealing time is simulated by moving the clock when the stage boundary's timer is set.
+    const run = async (observationStart: number, runId: string) => {
+      let moved = false;
+      const h = harness({
+        onSetTimeout: (ms, x) => {
+          const sealed = existsSync(
+            path.join(acquisitionDirOf(x.root, runId), "evidence-manifest.json"),
+          );
+          if (!moved && ms === 0 && sealed) {
+            moved = true;
+            x.state.now = observationStart;
+          }
+        },
+      });
+      const pending = start(h, LIVE_ARGS(runId));
+      const shift = observationStart - OBS_START;
+      await h.to(OBS_START + shift + 10);
+      if (h.instances.length > 0) {
+        const c = await connect(h, shift);
+        await h.to(RECEIVED_AT + shift);
+        c.message(notif(1));
+        await flush();
+        await conclude(h, c, shift);
+      }
+      const r = await pending;
+      await h.to(AFTER_ALL + shift + 60_000);
+      expect(moved).toBe(true);
+      return { h, r };
+    };
+    const ownerCeiling = P.owner.observationMs + P.owner.unsubscribeAckTimeoutMs + P.owner.drainMs;
+    expect(ownerCeiling).toBe(85_000);
+    const lastStart = T0 + P.session.lifetimeMs - ownerCeiling;
+    // Exactly the owner's ceiling left (17.5 s of sealing after the snapshot): observed, exit 0.
+    const ok = await run(lastStart, "run-l1");
+    expect(ok.r.exitCode).toBe(X.OK);
+    expect(ok.h.callTimes.map(rel)).toEqual([-PACING, 0, 39_000]);
+    expectReported(ok.h, ok.r);
+    // One millisecond less: refused at the stage boundary, no connection, the acquisition kept.
+    const short = await run(lastStart + 1, "run-l2");
+    expect(short.r.exitCode).toBe(X.RUN_FAILED);
+    expect(short.r.report!.execution.firstFailure).toBe(
+      "STAGE_BOUNDARY:SESSION_LIFETIME_INSUFFICIENT",
+    );
+    expect(short.r.report!.evidence.acquisition).toMatchObject({
+      seal: "SEALED",
+      computed: "ACQUIRED_REPRODUCED",
+    });
+    expect(short.r.report!.evidence.observation.seal).toBe("NOT_SEALED");
+    expect(short.r.report!.requests).toEqual({
+      httpAttempts: 2,
+      acquisitionRequests: 2,
+      observationRequests: 0,
+      webSocketConnections: 0,
+    });
+    expect(short.h.instances).toHaveLength(0);
+    expectReported(short.h, short.r);
+  });
+
+  it("OC28: a connection that never closes is a cleanup failure, reported apart from the entry point's", async () => {
+    const { h, r } = await liveRun({
+      onClient: (x) => {
+        x.client.close = () => undefined;
+        x.client.terminate = () => undefined;
+      },
+    });
+    expect(r.exitCode).toBe(X.RUN_FAILED);
+    expect(r.report!.execution).toMatchObject({
+      status: "FAILED",
+      firstFailure: null,
+      cleanupFailures: ["OWNER_CLEANUP:FAILED_STILL_OPEN"],
+      connectionRunClean: false,
+    });
+    expect(r.report!.entryPoint).toEqual({ signalCleanupFailures: [] });
+    const m = measure(observationDirOf(h.root))!;
+    expect(m.cleanup).toBe("FAILED_STILL_OPEN");
+    expect(m.uncertainties).toEqual(["CLEANUP_FAILED"]);
+    expect(h.logs).toContain("[LIVE] Execution: FAILED; first failure: none");
+    expect(h.logs).toContain("[LIVE] Cleanup failures: OWNER_CLEANUP:FAILED_STILL_OPEN");
+    expect(h.logs).toContain("[LIVE] Entry-point cleanup failures: none");
+    expect(r.report!.evidence.observation).toMatchObject({
+      seal: "SEALED",
+      integrity: { ok: true },
+    });
+    expectReported(h, r);
+  });
+
+  it("OC29: credentials echoed by the provider never reach output or any persisted payload, decoded base64 included", async () => {
+    const x = await rehearse(
+      {
+        transaction: (_n, req) => {
+          const body = JSON.parse(txBody(req)) as { result: { meta: { logMessages: string[] } } };
+          body.result.meta.logMessages.push(`Program log: ${RPC_URL}`, `Program log: ${SECRET}`);
+          return new Response(JSON.stringify(body));
+        },
+      },
+      async (h, c) => {
+        await h.to(RECEIVED_AT);
+        c.message(notif(1, `echo ${STREAM_URL}`));
+        await flush();
+        await h.to(RECEIVED_AT + 5_000);
+        // Not UTF-8: sealed as base64, the credential bytes inside redacted.
+        c.message(Buffer.concat([Buffer.from([0xff, 0xfe]), Buffer.from(SECRET)]));
+        await flush();
+        await h.to(AFTER_ALL);
+      },
+    );
+    const { h, r } = x;
+    expect(r.exitCode).toBe(X.RUN_FAILED);
+    expect(r.report!.execution.firstFailure).toBe("OBSERVATION:COLLECTION_DIRTY:INVALID_UTF8");
+    const m = measure(x.obs)!;
+    // The response carrying a credential is withheld from analysis, not analysed.
+    expect(m.records.map((rec) => [rec.disposition, rec.factKind, rec.factCode])).toEqual([
+      ["UNRESOLVED", "EVIDENCE_NOT_REPLAYABLE", "CREDENTIAL_MATERIAL"],
+    ]);
+    expect(m.payloads).toMatchObject({ redacted: 3, withheld: 0 });
+    expect(r.report!.evidence.observation.rederivation!.implementedComponents).toBe(
+      "LIMITED_BY_REDACTION",
+    );
+    const decoded = expectReported(h, r);
+    // The pool accounts and the binary frame, at least.
+    expect(decoded).toBeGreaterThanOrEqual(4);
   });
 });
