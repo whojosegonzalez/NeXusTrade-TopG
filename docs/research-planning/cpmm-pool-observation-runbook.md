@@ -1,6 +1,6 @@
 # CPMM Pool Observation — Operator Runbook
 
-**Status:** the live limits are not approved. The profile `PROPOSED_SHORT_OBSERVATION_PROFILE_V1` has status `PROPOSED_FOR_REVIEW_LIVE_LIMITS_NOT_APPROVED`, and live execution is `NOT_APPROVED` until independent review and the operator-limit review (roadmap Step 4) approve it. Nothing in this runbook approves a live run. Only `--help`, the dry run and the read-only verification may be used. The offline Step 4 rehearsal of this profile is recorded in `cpmm-pool-observation-step4-rehearsal.md`; Step 4 stays under review, and the rehearsal is not approval.
+**Status:** Roadmap Step 4 (offline rehearsal) was accepted for a single bounded capture, and Roadmap Step 5 (`cpmm-observation-01`) was executed under separate operator approval and accepted by independent review. Both sealed bundles and all 18 manifest-listed files match and verify offline (exit 0). Live execution remains **NOT_APPROVED** for any further run: earlier approvals are consumed and do not cover further captures. Roadmap Step 6 (extended-observation proposal) is under review. Nothing in this runbook approves a live run. Only `--help`, the dry run and read-only verification may be used.
 
 Entry point: `backend/src/scripts/cpmm-pool-observation.ts` (assessment §8.38.17 item 17 T, roadmap Step 3). It runs the accepted composition core (`cpmm-pool-observation-run.ts`) once for one explicit Raydium CPMM pool and candidate mint. It adds no acquisition, observation, sealing or verification logic of its own. It is observation only: no purchase, order, position, strategy, admission, daemon or paper trading.
 
@@ -27,6 +27,14 @@ It prints the profile label and status, the live status, the plan digest (SHA-25
 ```bash
 node backend/node_modules/tsx/dist/cli.mjs backend/src/scripts/cpmm-pool-observation.ts --verify data/research/cpmm-observations/<RUN_ID> --acquisition-dir data/research/cpmm-acquisitions/<RUN_ID>
 ```
+
+Example (verifying the accepted Step 5 capture `cpmm-observation-01`):
+
+```bash
+node backend/node_modules/tsx/dist/cli.mjs backend/src/scripts/cpmm-pool-observation.ts --verify data/research/cpmm-observations/cpmm-observation-01 --acquisition-dir data/research/cpmm-acquisitions/cpmm-observation-01
+```
+
+For an empty-transaction capture like `cpmm-observation-01`, this verification exits `0` (complete evidence).
 
 **Live mode**: `--live` exists so that the acquiring path can be tested offline with injected dependencies. This runbook gives no live command. A live command is to be written only after the profile, or a revised one, is approved in Step 4. `--live` only selects the acquiring mode; it is not, and does not record, operator approval.
 
@@ -91,16 +99,16 @@ Values in the offline tests are test inputs, not approved live limits.
 
 A live run prints separate lines for the execution status and first failure, the clock failure and cancellation, cleanup failures, the entry point's own cleanup failures (`SIGNAL_REMOVE_FAILED:<signal>`), the session stop reason and the owner's terminal cause, the request counts (HTTP attempts, acquisition requests, transaction retrievals, WebSocket connections), each bundle's path and seal, acquisition integrity and computed outcome, observation integrity, retention, re-derivation, the acquisition binding and the five qualification flags (all `false`). The last line is the same report as JSON. The run then ends: no follow-up, retry or reacquisition.
 
-| Code | Meaning                                                                                                   |
-| ---- | --------------------------------------------------------------------------------------------------------- |
-| 0    | Help, dry run, or a successful run with complete, reproduced evidence (for `--verify`: complete evidence) |
-| 1    | Invalid arguments, configuration, output location or setup refusal (nothing written), or unexpected error |
-| 2    | Evidence intact but limited (incomplete retention, or re-derivation not reproduced)                       |
-| 3    | The run failed; its evidence is intact                                                                    |
-| 4    | Evidence not verified (integrity, acquisition binding or a re-derivation mismatch)                        |
-| 5    | A bundle could not be sealed; nothing is reacquired                                                       |
-| 6    | Cancelled (Ctrl+C or termination); the evidence is intact                                                 |
-| 7    | The run would have exited 0 or 2, but a signal listener could not be removed                              |
+| Code | Meaning                                                                                                                                          |
+| ---- | ------------------------------------------------------------------------------------------------------------------------------------------------ |
+| 0    | Help, dry run, or a successful run with complete, reproduced evidence (for `--verify`: complete evidence, including zero-transaction captures)   |
+| 1    | Invalid arguments, configuration, output location or setup refusal (nothing written), or unexpected error                                        |
+| 2    | Evidence intact but limited (incomplete retention, or transaction responses present but re-derivation not reproduced due to missing credentials) |
+| 3    | The run failed; its evidence is intact                                                                                                           |
+| 4    | Evidence not verified (integrity, acquisition binding or a re-derivation mismatch)                                                               |
+| 5    | A bundle could not be sealed; nothing is reacquired                                                                                              |
+| 6    | Cancelled (Ctrl+C or termination); the evidence is intact                                                                                        |
+| 7    | The run would have exited 0 or 2, but a signal listener could not be removed                                                                     |
 
 A sealing failure takes precedence over evidence that does not verify, which takes precedence over cancellation, then a failed run, then limited evidence. A listener that could not be removed replaces only 0 and 2 (with 7); every other code is kept and the failure is still reported.
 
@@ -108,7 +116,12 @@ A sealing failure takes precedence over evidence that does not verify, which tak
 
 ## 7. Verification and its limitation
 
-`--verify` reads both bundles and writes nothing. It loads no configuration or credential, so the observation's transaction responses are not re-analysed: transaction analysis is reported as unavailable and the implemented components are not reproduced. An intact bundle therefore verifies with exit code 2 (limited), not 0. Integrity, retention and the acquisition binding are still checked. A missing, altered or different acquisition bundle does not bind (exit 4).
+`--verify` reads both bundles and writes nothing. It loads no configuration or credential.
+
+- **Empty-transaction capture**: when an observation captures zero transaction responses (e.g. `cpmm-observation-01`, where zero pool notifications arrived and no transaction retrievals were dispatched), no transaction re-analysis is required. All implemented components (collector, ledger, transport, owner report, pool context) are reproduced, retention is complete, and offline verification exits `0` (`complete evidence`).
+- **Capture with transaction responses**: when an observation contains transaction responses, re-analysing them without the run's provider credentials is unavailable (`ANALYSIS_CREDENTIALS_NOT_SUPPLIED`). Because transaction outcomes are not re-decoded offline, an otherwise intact bundle verifies as limited (exit `2`).
+
+Integrity, retention and the acquisition binding are checked in both cases. A missing, altered or different acquisition bundle does not bind (exit 4).
 
 Retention covers only what reached the recorder. A frame that the WebSocket wrapper or the `ws` client refuses (an oversized frame or control payload) is never recorded, so retention can read complete while the run failed. Such a refusal shows in `transport-diagnostics.json` (`refusedPayloadLimit`, `control.refused`) and in the owner's terminal cause, and the run exits 3 (rehearsal finding F2).
 
@@ -116,3 +129,17 @@ Retention covers only what reached the recorder. A frame that the WebSocket wrap
 
 1. **Preservation**: do not edit, move or rerun into a sealed directory. A further run needs a new run id and its own approval.
 2. **Wallet**: confirm the frozen virtual wallet (`.tmp/virtual-wallet.json`) is unchanged. The entry point never reads or writes it.
+
+## 9. Accepted Step 5 Capture: `cpmm-observation-01`
+
+Roadmap Step 5 was executed under explicit operator approval for run ID `cpmm-observation-01` at commit `ac9d6f2d3836ba2605059c0e7df713e07fa1435c` and accepted by independent offline review.
+
+- **Target**: Raydium CPMM WSOL/USDC pool `47hq28mcL7q5GhBg7epyGF2dnuJd4MKFt8QhT7CzYUp4`, candidate mint `EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v` (USDC).
+- **Bundles & manifests**:
+  - Acquisition bundle: `data/research/cpmm-acquisitions/cpmm-observation-01`, manifest SHA-256 `49273a4fa5b1dfb55c9d8184e3e2e0a711e28d778ea99a5581db68f2d2df8d83` (7 files). Outcome `ACQUIRED`, integrity `VERIFIED`, re-derivation `ACQUIRED_REPRODUCED`.
+  - Observation bundle: `data/research/cpmm-observations/cpmm-observation-01`, manifest SHA-256 `f8026f11a99b6a548f91437d2763f01c43836cb8664f5bec21a209e80ec3b845` (11 files). Observation binding `REPRODUCED`.
+  - Total: 18 manifest-listed files, byte-identical.
+- **Protocol execution**: 60-second observation (`startedAtMs: 1795510166545`, nominal end `1795510226545`, settled `1795510226815`), acknowledged subscribe and unsubscribe, 2 pings matched by 2 pongs, clean transport closure.
+- **Requests & budget**: exactly 2 HTTP account requests (discovery and paced snapshot), 0 transaction retrievals, 1 WebSocket connection. No retries, no secondary requests.
+- **Activity**: 0 pool notifications arrived during the 60-second observation window. All 5 qualification flags remain `false`.
+- **Wallet & verification**: virtual wallet unchanged (`7f2c2353ac2f62cac1bb98703742ab19c74ac5521635af6f49bbe777ad020ed9`). Offline credential-free verification (`--verify`) exits `0`.

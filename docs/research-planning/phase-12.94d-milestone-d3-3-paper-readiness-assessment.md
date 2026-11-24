@@ -11482,7 +11482,7 @@ Output directories that already exist are refused at setup (`OUTPUT_EXISTS:<bund
 - **Profile** `PROPOSED_SHORT_OBSERVATION_PROFILE_V1` (status `PROPOSED_FOR_REVIEW_LIVE_LIMITS_NOT_APPROVED`): the complete effective limits the core receives, deep-frozen and printed in full by the dry run. The session lifetime is 105,000 ms: acquisition 15,000 + observation 60,000 + unsubscribe 5,000 + max(drain 20,000, cleanup 5,000) + a 5,000 ms margin. There are 10 HTTP attempts (2 acquisition, at most 8 retrievals), only on `SOLANA_RPC`, paced at 2,500 ms. There is one connection and one subscription. Local sealing and verification use no network. The acquisition bundle is sealed and verified before observation, within the shared session lifetime. The observation bundle is sealed and verified after the session has shut down, outside it. The sanitizer and verifier size limits bound the data, not the time: there is no hard wall-clock bound on local sealing and verification. **No live limit is approved.**
 - **Cancellation and handlers**: SIGINT and SIGTERM listeners exist only while the core runs and abort the core's signal. On every exit, removal is attempted for every attempted registration, including one that attached and then threw. A failed removal does not stop the others. It is reported as `SIGNAL_REMOVE_FAILED:<signal>` (`entryPoint.signalCleanupFailures`, outside the core's frozen result). A listener left attached does nothing after the run, and a signal after the result changes nothing.
 - **Reporting**: separate lines for the execution status and first failure, clock failure and cancellation, cleanup failures, session stop and owner terminal cause, request counts, both bundle paths and seals, acquisition integrity and computed outcome, observation integrity, retention, re-derivation, acquisition binding and the five false flags, then the same report as JSON. Only refusals the entry point creates itself print text. A failing loader, `ws` client or signal registration gets a fixed refusal with its text withheld. Any other error prints `[UNEXPECTED_ERROR]`. An error's prefix is never trusted.
-- **Exit codes**, read only from the core's frozen result: 0 success with complete, reproduced evidence; 1 invalid input, configuration or setup refusal; 2 evidence limited; 3 run failed; 4 evidence not verified; 5 a bundle not sealed (never reacquired); 6 cancelled; 7 a signal listener could not be removed when the run would otherwise exit 0 or 2 (every other code is kept). A seal failure takes precedence over unverified evidence, which takes precedence over cancellation, then failure, then limited evidence. `--verify` judges the evidence only. Without credentials it cannot re-analyse transaction responses, so an intact bundle verifies as limited (exit 2), and the limitation is printed.
+- **Exit codes**, read only from the core's frozen result: 0 success with complete, reproduced evidence; 1 invalid input, configuration or setup refusal; 2 evidence limited; 3 run failed; 4 evidence not verified; 5 a bundle not sealed (never reacquired); 6 cancelled; 7 a signal listener could not be removed when the run would otherwise exit 0 or 2 (every other code is kept). A seal failure takes precedence over unverified evidence, which takes precedence over cancellation, then failure, then limited evidence. `--verify` judges the evidence only. For an empty-transaction capture (such as `cpmm-observation-01`), no transaction re-analysis is required, implemented components reproduce, and verification exits 0 (complete evidence). When transaction responses are present, credential-free verification cannot re-analyse them and reports them as unavailable, so an otherwise intact bundle verifies as limited (exit 2).
 - **Shutdown**: following §8.38.19, the entry point sets `process.exitCode` and lets the event loop drain. An unref'd 5,000 ms backstop forces exit with the same code and `[CPMM_POOL_OBSERVATION_SHUTDOWN_FORCED]` only if a handle lingers. It is separate from the run and does not bound sealing or verification, which finish before the result.
 - **Entry detection**: the CLI runs only when the process's entry argument resolves to this file's real path. Importing the module, including from a file of the same name elsewhere, runs nothing.
 - **Pin**: the two new files are exact additions in `ALLOWED_ADDITIONS_SINCE_REVIEWED_RUNNER`. H-12 also refuses look-alike additions (test-support, fixtures, `-cli`, `.js` and relocated variants).
@@ -11510,7 +11510,47 @@ Output directories that already exist are refused at setup (`OUTPUT_EXISTS:<bund
 
 **Step 4 verification**: 608 tests passed in 16 offline suites (exit 0, 27.8 s wall). Backend `tsc --noEmit`, ESLint and Prettier exited 0. Every run had an external 60 s limit. Seven targeted mutations, one at a time and each restored byte for byte with SHA-256 checked, were all caught: the owner outstanding check (OC22), the bounded response read (OC24), the collector frame (OC25) and byte (OC20) limits, the stage-boundary check (OC27), the `EXCHANGE_BODY_NOT_READ` retention reason (OC23) and the profile's outstanding limit raised to 5 (OC20, OC22). The wallet hash and the five false flags are unchanged.
 
-**Remaining for Step 4**: independent review of the rehearsal and the operator-limit review. Step 4 stays under review until both are accepted. Missing public inputs for any future capture: the exact Raydium CPMM pool and candidate mint, a new run id, explicitly configured https and wss endpoints, and the operator's approval of the limits, window and exact live command. Step 5 (any live capture) needs explicit operator approval; until then live execution is not approved and no live command is provided.
+**Remaining for Step 4**: independent review accepted the rehearsal for ONE bounded diagnostic capture (`cpmm-observation-01`), completing Roadmap Step 4. Step 5 (the single authorized capture) was executed under separate operator approval and accepted by independent review (see item U below).
+
+###### U. Roadmap Step 5: Bounded CPMM Observation Capture `cpmm-observation-01` (Accepted) and Step 6 Proposal (Extended Observation; Offline Only)
+
+**Status**: Roadmap Step 4 (offline rehearsal) was accepted by independent review for ONE bounded diagnostic capture. Step 5 (`cpmm-observation-01`) was authorized by separate operator approval, executed with the reviewed operator runbook script at commit `ac9d6f2d3836ba2605059c0e7df713e07fa1435c`, and accepted by independent review. Both sealed bundles and all 18 manifest-listed files match and verify offline (exit `0`). Step 6 (extended-observation proposal) is drafted offline (record: `docs/research-planning/cpmm-pool-observation-step6-proposal.md`). Live execution remains **NOT_APPROVED** for Step 6 or any further capture.
+
+**Step 5 Execution and Independent Verification (`cpmm-observation-01`)**:
+
+- **Target**: Raydium CPMM pool `47hq28mcL7q5GhBg7epyGF2dnuJd4MKFt8QhT7CzYUp4` (WSOL/USDC), candidate mint `EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v` (USDC). Fixed public inputs; no discovery or target selection was performed.
+- **Commit**: `ac9d6f2d3836ba2605059c0e7df713e07fa1435c`.
+- **Sealed bundles & manifest integrity**:
+  - Acquisition bundle: `data/research/cpmm-acquisitions/cpmm-observation-01/evidence-manifest.json`, SHA-256 `49273a4fa5b1dfb55c9d8184e3e2e0a711e28d778ea99a5581db68f2d2df8d83` (7 files). Outcome `ACQUIRED`, integrity `VERIFIED`, re-derivation `ACQUIRED_REPRODUCED`. Context slot `473283318`.
+  - Observation bundle: `data/research/cpmm-observations/cpmm-observation-01/cpmm-observation-manifest.json`, SHA-256 `f8026f11a99b6a548f91437d2763f01c43836cb8664f5bec21a209e80ec3b845` (11 files). Observation binding `REPRODUCED`.
+  - All 18 manifest-listed files across both bundles match byte for byte.
+- **Protocol & transport execution**:
+  - Observation window: nominal 60,000 ms (`startedAtMs: 1795510166545`, `nominalEndMs: 1795510226545`), settled cleanly at `1795510226815` ms.
+  - Sockets & messages: exactly 1 WebSocket connection, acknowledged `accountSubscribe`, acknowledged `accountUnsubscribe`, normal clean close (`cause: OBSERVATION_COMPLETED`, `code: UNSUBSCRIBE_RESPONSE`, `connectionRunClean: true`).
+  - Control frames: 2 pings dispatched, both matched by received pongs, 0 unmatched pongs, 0 control frame overflows.
+- **Requests & budget**:
+  - Exactly 2 HTTP account requests on `SOLANA_RPC` (discovery and paced snapshot).
+  - 0 transaction retrievals dispatched; 0 requests on other lanes. Total HTTP attempts: 2 (well within the 10-attempt ceiling).
+  - No retries, reconnects, fallbacks, or follow-up requests.
+- **Activity & qualification**:
+  - 0 pool notifications arrived during the 60-second observation window (the target pool had zero on-chain swap events during this interval).
+  - All five qualification flags remain strictly `false`: `notificationCompletenessEstablished: false`, `quietWindowEstablished: false`, `qualificationEligible: false`, `replayableCaptureEstablished: false`, `admissionEligible: false`.
+  - No trading, orders, positions, strategies, or admissions.
+- **Virtual wallet invariant**:
+  - Virtual wallet balance (7.9259 SOL) and hash (`7F2C2353AC2F62CAC1BB98703742AB19C74AC5521635AF6F49BBE777AD020ED9`) confirmed unchanged before and after the run.
+- **Offline verification**:
+  - Read-only credential-free verification (`--verify data/research/cpmm-observations/cpmm-observation-01 --acquisition-dir data/research/cpmm-acquisitions/cpmm-observation-01`) exits `0`.
+  - Retention is `COMPLETE`. Implemented components (collector, ledger, transport diagnostics, owner report, pool context) are `REPRODUCED`. Because zero transactions occurred, transaction re-analysis is not needed and the evidence state is fully `VERIFIED`. (Corrects earlier blanket runbook text stating credential-free verification always exits 2).
+
+**Step 6 Extended-Observation Proposal Summary**:
+A detailed proposal for a single bounded extended observation is recorded in `docs/research-planning/cpmm-pool-observation-step6-proposal.md`.
+
+- **Target rationale**: Analyzes why `cpmm-observation-01` saw zero notifications (60s was a quiet interval on WSOL/USDC), balances extending observation duration against the accepted owner's 4-outstanding-hand-off limit (finding F1), and proposes observing a pool with expected swap rate < 8 swaps/min and burst <= 4 swaps.
+- **Duration & lifetime**: 300 s (5 min) observation window (`observationMs = 300,000`), bounded session lifetime of 350,000 ms (`15,000` acq + `300,000` obs + `5,000` unsub + `25,000` drain + `5,000` margin).
+- **Ceilings & pacing**: 30 total HTTP attempts (2 acquisition, up to 28 retrievals), 2,500 ms `SOLANA_RPC` pacing, 1 WebSocket connection, 1 subscription, up to 15 pings and 16 pong replies.
+- **Handoffs & retention**: Enforces the 4-outstanding limit, expanded retention limits (256 epoch frames, 2 MB epoch bytes, 32 exchange records, 8 MB exchange bodies), and a 25 s drain window.
+- **Outcome matrix**: Rigorously defines evidentiary value of an empty capture (proves extended 5m transport health, zero pool activity), an active capture (proves live on-chain streaming, deduplication, exchange storage, and decoding), a failed capture (proves fail-closed boundaries under live conditions without leaking requests), and a budget-exhausted capture (proves strict halting at attempt ceiling).
+- **Governance**: Step 6 is documentation and proposal only. Live execution is NOT approved.
 
 ---
 
@@ -11521,6 +11561,9 @@ Output directories that already exist are refused at setup (`OUTPUT_EXISTS:<bund
 - Sealed probe 01 manifest unchanged: `data/research/capability-checks/solana-subscription-01/evidence-manifest.json` (`25ED3117B87D2847BB70AE52B3A6B7096FC94B337156E8EC0C5BB4896C3B7506`).
 - Sealed probe 02 manifest unchanged: `data/research/capability-checks/solana-subscription-02/evidence-manifest.json` (`56DFBF8DCE62DAD4C1FF0F40C1F6CCE18B9B5811B72A05D9F90FF4A58E6FA1A1`).
 - Sealed watch 02 manifest added and verified: `data/research/prechecks/fresh-amm-v4-watch-02/evidence-manifest.json` (`9DA4BE7556CDCBD4DB653F0483C8C28A425B5D1AFF49F8CAC06E178DDB827C99`).
+- Sealed `cpmm-observation-01` acquisition manifest: `data/research/cpmm-acquisitions/cpmm-observation-01/evidence-manifest.json` (`49273a4fa5b1dfb55c9d8184e3e2e0a711e28d778ea99a5581db68f2d2df8d83`, 7 files, outcome `ACQUIRED`, re-derivation `ACQUIRED_REPRODUCED`).
+- Sealed `cpmm-observation-01` observation manifest: `data/research/cpmm-observations/cpmm-observation-01/cpmm-observation-manifest.json` (`f8026f11a99b6a548f91437d2763f01c43836cb8664f5bec21a209e80ec3b845`, 11 files, binding `REPRODUCED`, retention `COMPLETE`).
+- Offline credential-free `--verify` on `cpmm-observation-01` verified and exits 0.
 - Pin check: `checkPin` in `backend/src/scripts/paper-pilot-handoff.ts` with tightened parser accepts reviewed endpoint modifications (`PIN_OK`, exit 0).
 - Test suite results: 140/140 passed across Group 1 (70/70, including S-18 18/18) and Group 2 (70/70). Backend typecheck and ESLint clean.
 
