@@ -8,11 +8,14 @@ import { spawnSync } from "node:child_process";
 import {
   cpSync,
   existsSync,
+  linkSync,
   mkdirSync,
   mkdtempSync,
   readFileSync,
   readdirSync,
   rmSync,
+  symlinkSync,
+  unlinkSync,
   writeFileSync,
 } from "node:fs";
 import os from "node:os";
@@ -122,6 +125,10 @@ class VirtualScheduler {
     if (idx !== -1) this.queue.splice(idx, 1);
   }
 
+  hasPending(): boolean {
+    return this.queue.length > 0;
+  }
+
   async runTo(targetMs: number): Promise<void> {
     while (true) {
       let nextIdx = -1;
@@ -203,14 +210,29 @@ function makeHarness(opts: { fetch?: FetchScript; env?: Record<string, string | 
     ...extra,
   });
 
+  async function drive<T>(promise: Promise<T>, advanceMs = 15_000): Promise<T> {
+    let settled = false;
+    const tracked = promise.finally(() => {
+      settled = true;
+    });
+    const targetMs = START_MS + advanceMs;
+    while (!settled) {
+      await new Promise<void>((r) => setImmediate(r));
+      if (sched.hasPending()) {
+        await sched.runTo(targetMs);
+      } else if (settled) {
+        break;
+      }
+    }
+    return tracked;
+  }
+
   async function runLive(extra: Partial<ActivityCheckCliDeps> = {}, advanceMs = 15_000) {
     const promise = runCpmmPoolActivityCheckCli(
       ["--pool", POOL, "--out-dir", OUT_REL, "--live"],
       deps(extra),
     );
-    await new Promise<void>((r) => setImmediate(r));
-    await sched.runTo(START_MS + advanceMs);
-    return promise;
+    return drive(promise, advanceMs);
   }
 
   return {
@@ -222,6 +244,7 @@ function makeHarness(opts: { fetch?: FetchScript; env?: Record<string, string | 
       return loadCalls;
     },
     deps,
+    drive,
     runLive,
   };
 }
@@ -821,5 +844,225 @@ describe("cpmm-pool-activity-check offline suite", () => {
     expect(badProc.status).toBe(X.INVALID);
     expect(badProc.stderr).toContain("[CLI_INVALID_ARG]");
     expect(badProc.stderr).not.toContain("bad-secret-value");
+  });
+
+  it("AC14 (defect 1): positional credential URL and unknown secret options never echo in printable error or CLI output", async () => {
+    const h = makeHarness();
+    const cases: string[][] = [[RPC_URL], [`--unknown-${RPC_KEY}`, "x"], [`--url=${RPC_URL}`]];
+    for (const argv of cases) {
+      let thrown: unknown;
+      try {
+        await runCpmmPoolActivityCheckCli(argv, h.deps());
+      } catch (err) {
+        thrown = err;
+      }
+      expect(thrown).toBeDefined();
+      const printable = printableActivityCheckError(thrown);
+      expect(printable).toBe("[CLI_INVALID_ARG] unknown, malformed or positional argument");
+      expect(printable).not.toContain(RPC_KEY);
+      expect(printable).not.toContain(RPC_URL);
+      expect(printable).not.toContain("synthetic.invalid");
+    }
+
+    const tsx = path.resolve(import.meta.dirname, "../../node_modules/tsx/dist/cli.mjs");
+    const script = path.resolve(import.meta.dirname, "cpmm-pool-activity-check.ts");
+    const posProc = spawnSync(process.execPath, [tsx, script, RPC_URL], {
+      encoding: "utf8",
+      timeout: 15_000,
+    });
+    expect(posProc.status).toBe(X.INVALID);
+    expect(posProc.stderr).not.toContain(RPC_KEY);
+    expect(posProc.stderr).not.toContain(RPC_URL);
+    expect(posProc.stderr).toContain("[CLI_INVALID_ARG] unknown, malformed or positional argument");
+  });
+
+  it("AC15 (defect 2): absolute acquisition deadline refuses dispatch at/after t0+10000 and bounds in-flight work by remaining time", async () => {
+    // First reading returns t0; subsequent readings return t0 + 10_000 (right at declared deadline).
+    const h = makeHarness();
+    let clockReads = 0;
+    const jumpClock = () => (clockReads++ === 0 ? START_MS : START_MS + 10_000);
+    const rExpired = await h.drive(
+      runCpmmPoolActivityCheckCli(
+        ["--pool", POOL, "--out-dir", OUT_REL, "--live"],
+        h.deps({ clock: jumpClock }),
+      ),
+    );
+    expect(h.calls).toHaveLength(0);
+    expect(rExpired.acquisition!.outcome).toBe("DEADLINE_EXPIRED");
+    expect((rExpired.record!.request as Record<string, unknown>).dispatchedAtMs).toBeNull();
+    expect(rExpired.verification!.integrity.ok).toBe(true);
+    expect(rExpired.verification!.computed!.reanalysisStatus).toBe("REPRODUCED");
+    expect(rExpired.verification!.computed!.outcome).toBe("DEADLINE_EXPIRED");
+    expect(rExpired.exitCode).toBe(X.NO_PAGE);
+
+    // Partial startup elapsed time (6,000 ms spent before open) bounds in-flight fetch to remaining 4,000 ms.
+    const h2 = makeHarness({ fetch: { delayMs: 6_000 } });
+    const out2 = "data/research/cpmm-activity-checks/check-partial-deadline";
+    let readCount = 0;
+    const partialClock = () => {
+      readCount++;
+      if (readCount === 1) return START_MS;
+      return Math.max(START_MS + 6_000, h2.sched.now);
+    };
+    const r2 = await h2.drive(
+      runCpmmPoolActivityCheckCli(
+        ["--pool", POOL, "--out-dir", out2, "--live"],
+        h2.deps({ clock: partialClock }),
+      ),
+    );
+    expect(h2.calls).toHaveLength(1);
+    expect(r2.acquisition!.outcome).toBe("DEADLINE_EXPIRED");
+    expect(r2.acquisition!.endedAtMs).toBeLessThanOrEqual(START_MS + 10_000);
+    expect(r2.verification!.integrity.ok).toBe(true);
+    expect(r2.exitCode).toBe(X.NO_PAGE);
+
+    // Clock jumps to t0 + 10_000 right at dispatch refusal check (read 1 = t0, read 2 = t0 + 1, read 3+ = t0 + 10_000).
+    const h3 = makeHarness();
+    let reads3 = 0;
+    const dispatchJumpClock = () => {
+      reads3++;
+      if (reads3 === 1) return START_MS;
+      if (reads3 === 2) return START_MS + 1;
+      return START_MS + 10_000;
+    };
+    const r3 = await h3.drive(
+      runCpmmPoolActivityCheckCli(
+        [
+          "--pool",
+          POOL,
+          "--out-dir",
+          "data/research/cpmm-activity-checks/check-dispatch-jump",
+          "--live",
+        ],
+        h3.deps({ clock: dispatchJumpClock }),
+      ),
+    );
+    expect(h3.calls).toHaveLength(0);
+    expect(r3.acquisition!.outcome).toBe("DEADLINE_EXPIRED");
+    expect(r3.verification!.integrity.ok).toBe(true);
+    expect(r3.exitCode).toBe(X.NO_PAGE);
+  });
+
+  it("AC16 (defect 3): blockTime MAX_SAFE_INTEGER and 7500-nested err objects seal bounded MALFORMED_RESPONSE instead of throwing", async () => {
+    // 3a: blockTime = Number.MAX_SAFE_INTEGER overflows JS Date ISO conversion (< 64 KiB body)
+    const maxBtBody = rpcBody([rec(1, 500, Number.MAX_SAFE_INTEGER)]);
+    expect(Buffer.byteLength(maxBtBody, "utf8")).toBeLessThan(65_536);
+    const hBt = makeHarness({ fetch: { body: maxBtBody } });
+    const rBt = await hBt.runLive();
+    expect(rBt.exitCode).toBe(X.NO_PAGE);
+    expect(rBt.seal!.ok).toBe(true);
+    expect(rBt.verification!.integrity.ok).toBe(true);
+    expect(rBt.verification!.recorded!.outcome).toBe("MALFORMED_RESPONSE");
+    expect(rBt.verification!.computed!.reanalysisStatus).toBe("REPRODUCED");
+    expect(rBt.verification!.computed!.outcome).toBe("MALFORMED_RESPONSE");
+
+    // 3b: ~7500 nested {"x":...} error structure (< 64 KiB body)
+    const nestedErr = `${'{"x":'.repeat(7500)}0${"}".repeat(7500)}`;
+    const deepBody =
+      `{"jsonrpc":"2.0","id":1,"result":[{"signature":${JSON.stringify(sig(1))},` +
+      `"slot":500,"err":${nestedErr},"memo":null,"blockTime":${BASE_SEC},"confirmationStatus":"confirmed"}]}`;
+    expect(Buffer.byteLength(deepBody, "utf8")).toBeLessThan(65_536);
+    const hDeep = makeHarness({ fetch: { body: deepBody } });
+    const rDeep = await hDeep.runLive();
+    expect(rDeep.exitCode).toBe(X.NO_PAGE);
+    expect(rDeep.seal!.ok).toBe(true);
+    expect(rDeep.verification!.integrity.ok).toBe(true);
+    expect(rDeep.verification!.recorded!.outcome).toBe("MALFORMED_RESPONSE");
+    expect(rDeep.verification!.computed!.reanalysisStatus).toBe("REPRODUCED");
+    expect(rDeep.verification!.computed!.outcome).toBe("MALFORMED_RESPONSE");
+
+    // 3c: ordinary error objects and exact 65536-byte boundary remain accepted cleanly
+    const ordinaryErrBody = rpcBody([
+      rec(1, 500, BASE_SEC, { err: { InstructionError: [0, { Custom: 6001 }] } }),
+    ]);
+    const hOrd = makeHarness({ fetch: { body: ordinaryErrBody } });
+    const rOrd = await hOrd.runLive();
+    expect(rOrd.exitCode).toBe(X.OK);
+    expect(rOrd.verification!.computed!.page!.counts.failed).toBe(1);
+
+    const overhead = rpcBody([rec(1, 500, BASE_SEC, { memo: "" })]).length;
+    const exact64kBody = rpcBody([rec(1, 500, BASE_SEC, { memo: "a".repeat(65_536 - overhead) })]);
+    expect(Buffer.byteLength(exact64kBody, "utf8")).toBe(65_536);
+    const h64k = makeHarness({ fetch: { body: exact64kBody } });
+    const r64k = await h64k.runLive();
+    expect(r64k.exitCode).toBe(X.OK);
+    expect(r64k.verification!.integrity.ok).toBe(true);
+  });
+
+  it("AC17 (defect 4): verifier rejects symlinked manifest/artifacts and oversized files BEFORE reading contents", async () => {
+    const h = makeHarness();
+    const r = await h.runLive();
+    expect(r.exitCode).toBe(X.OK);
+    const absOut = path.join(h.projectRoot, ...OUT_REL.split("/"));
+
+    const copyBundle = () => {
+      const copyDir = mkdtempSync(path.join(os.tmpdir(), "cpmm-activity-sym-"));
+      roots.push(copyDir);
+      cpSync(absOut, copyDir, { recursive: true });
+      return copyDir;
+    };
+
+    const outsideDir = mkdtempSync(path.join(os.tmpdir(), "cpmm-activity-outside-"));
+    roots.push(outsideDir);
+    const outsideManifest = path.join(outsideDir, "outside-manifest.json");
+    writeFileSync(outsideManifest, readFileSync(path.join(absOut, ACTIVITY_CHECK_FILES.manifest)));
+    const outsideActivity = path.join(outsideDir, "outside-activity.json");
+    writeFileSync(outsideActivity, '{"tampered":true}\n');
+
+    const reads: string[] = [];
+    const spyRead = (filePath: string) => {
+      reads.push(filePath);
+      return readFileSync(filePath);
+    };
+
+    // 4a: Symlinked manifest is rejected before reading (zero bytes read, manifestSha256 null)
+    const linkedManifestDir = copyBundle();
+    unlinkSync(path.join(linkedManifestDir, ACTIVITY_CHECK_FILES.manifest));
+    symlinkSync(outsideManifest, path.join(linkedManifestDir, ACTIVITY_CHECK_FILES.manifest));
+    reads.length = 0;
+    const vLinkedManifest = verifyActivityCheckEvidence(linkedManifestDir, { readFile: spyRead });
+    expect(vLinkedManifest.integrity.ok).toBe(false);
+    expect(vLinkedManifest.manifestSha256).toBeNull();
+    expect(reads).toEqual([]);
+
+    // 4b: Symlinked activity.json stops before ANY file read (zero reads, never reports MODIFIED:activity.json)
+    const linkedActivityDir = copyBundle();
+    unlinkSync(path.join(linkedActivityDir, ACTIVITY_CHECK_FILES.activity));
+    symlinkSync(outsideActivity, path.join(linkedActivityDir, ACTIVITY_CHECK_FILES.activity));
+    reads.length = 0;
+    const vLinkedActivity = verifyActivityCheckEvidence(linkedActivityDir, { readFile: spyRead });
+    expect(vLinkedActivity.integrity.ok).toBe(false);
+    expect(vLinkedActivity.integrity.problems).not.toContain(
+      `MODIFIED:${ACTIVITY_CHECK_FILES.activity}`,
+    );
+    expect(reads).toEqual([]);
+
+    // 4c: Hard-linked activity.json also rejected before any file read
+    const hardLinkedDir = copyBundle();
+    linkSync(
+      path.join(hardLinkedDir, ACTIVITY_CHECK_FILES.activity),
+      path.join(outsideDir, "hardlinked-activity.json"),
+    );
+    reads.length = 0;
+    const vHard = verifyActivityCheckEvidence(hardLinkedDir, { readFile: spyRead });
+    expect(vHard.integrity.ok).toBe(false);
+    expect(vHard.integrity.problems).not.toContain(`MODIFIED:${ACTIVITY_CHECK_FILES.activity}`);
+    expect(reads).toEqual([]);
+
+    // 4d: Oversized manifest (>64 KiB) or oversized artifact (>512 KiB) stops before any file read
+    const hugeManifestDir = copyBundle();
+    writeFileSync(path.join(hugeManifestDir, ACTIVITY_CHECK_FILES.manifest), "x".repeat(70_000));
+    reads.length = 0;
+    const vHuge = verifyActivityCheckEvidence(hugeManifestDir, { readFile: spyRead });
+    expect(vHuge.integrity.ok).toBe(false);
+    expect(vHuge.manifestSha256).toBeNull();
+    expect(reads).toEqual([]);
+
+    const hugeActivityDir = copyBundle();
+    writeFileSync(path.join(hugeActivityDir, ACTIVITY_CHECK_FILES.activity), "x".repeat(600_000));
+    reads.length = 0;
+    const vHugeActivity = verifyActivityCheckEvidence(hugeActivityDir, { readFile: spyRead });
+    expect(vHugeActivity.integrity.ok).toBe(false);
+    expect(reads).toEqual([]);
   });
 });

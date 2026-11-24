@@ -79,6 +79,22 @@ export const ACTIVITY_CHECK_LIMITS = Object.freeze({
   maxResponseBytes: 65_536,
 });
 
+/** Maximum Unix timestamp in seconds representable by JS Date without overflow (`Date.toISOString()`). */
+export const MAX_ACTIVITY_BLOCK_TIME_SEC = 8_640_000_000_000;
+
+/** Bounds on provider-derived error structures inside `getSignaturesForAddress` records. */
+export const ACTIVITY_ERROR_STRUCTURE_LIMITS = Object.freeze({
+  maxDepth: 32,
+  maxNodes: 1_024,
+});
+
+/** Finite bounds enforced by offline verification before reading any file bytes. */
+export const ACTIVITY_CHECK_VERIFIER_LIMITS = Object.freeze({
+  maxManifestBytes: 65_536,
+  maxFileBytes: 524_288,
+  maxEntries: 16,
+});
+
 export type ActivityRecordSchemaVersion = 1;
 export const ACTIVITY_CHECK_VERSION: ActivityRecordSchemaVersion = 1;
 export const ACTIVITY_CHECK_SUPPORTED_VERSIONS: readonly ActivityRecordSchemaVersion[] =
@@ -170,6 +186,35 @@ const isRecord = (v: unknown): v is Record<string, unknown> =>
   v !== null && typeof v === "object" && !Array.isArray(v);
 const isSafeCount = (v: unknown): v is number =>
   typeof v === "number" && Number.isSafeInteger(v) && v >= 0;
+
+/** Iterative depth- and node-count check so arbitrary nesting never overflows the call stack. */
+function isBoundedJsonStructure(value: unknown, maxDepth: number, maxNodes: number): boolean {
+  const stack: { readonly v: unknown; readonly depth: number }[] = [{ v: value, depth: 0 }];
+  let nodes = 0;
+  while (stack.length > 0) {
+    const item = stack.pop()!;
+    nodes++;
+    if (nodes > maxNodes || item.depth > maxDepth) return false;
+    const val = item.v;
+    if (val === null || typeof val !== "object") continue;
+    if (Array.isArray(val)) {
+      for (let i = 0; i < val.length; i++) {
+        stack.push({ v: val[i], depth: item.depth + 1 });
+      }
+    } else {
+      for (const k of Object.keys(val as Record<string, unknown>)) {
+        stack.push({ v: (val as Record<string, unknown>)[k], depth: item.depth + 1 });
+      }
+    }
+  }
+  return true;
+}
+
+function safeUnixSecToIso(sec: number | null): string | null {
+  if (sec === null || !isSafeCount(sec) || sec > MAX_ACTIVITY_BLOCK_TIME_SEC) return null;
+  const d = new Date(sec * 1000);
+  return Number.isNaN(d.getTime()) ? null : d.toISOString();
+}
 
 function redactText(text: string, secrets: readonly string[]): string {
   if (secrets.length === 0 || text === "") return text;
@@ -305,7 +350,10 @@ export function analyzePoolActivityResponse(
     }
     if (!isValidSolanaSignature(raw.signature)) return malformed(`SIGNATURE_INVALID:${i}`);
     if (!isSafeCount(raw.slot)) return malformed(`SLOT_INVALID:${i}`);
-    if (raw.blockTime !== null && !isSafeCount(raw.blockTime)) {
+    if (
+      raw.blockTime !== null &&
+      (!isSafeCount(raw.blockTime) || raw.blockTime > MAX_ACTIVITY_BLOCK_TIME_SEC)
+    ) {
       return malformed(`BLOCK_TIME_INVALID:${i}`);
     }
     if (raw.confirmationStatus !== "confirmed" && raw.confirmationStatus !== "finalized") {
@@ -313,6 +361,16 @@ export function analyzePoolActivityResponse(
     }
     if (!(raw.err === null || typeof raw.err === "string" || isRecord(raw.err))) {
       return malformed(`ERR_INVALID:${i}`);
+    }
+    if (
+      raw.err !== null &&
+      !isBoundedJsonStructure(
+        raw.err,
+        ACTIVITY_ERROR_STRUCTURE_LIMITS.maxDepth,
+        ACTIVITY_ERROR_STRUCTURE_LIMITS.maxNodes,
+      )
+    ) {
+      return malformed(`ERR_TOO_DEEP_OR_LARGE:${i}`);
     }
     if (!(raw.memo === null || typeof raw.memo === "string")) {
       return malformed(`MEMO_INVALID:${i}`);
@@ -410,14 +468,8 @@ function summarizeActivityPage(records: readonly ActivityPageRecord[]): Activity
         newestKnownBlockTimeSec !== null && oldestKnownBlockTimeSec !== null
           ? newestKnownBlockTimeSec - oldestKnownBlockTimeSec
           : null,
-      newestKnownBlockTimeIso:
-        newestKnownBlockTimeSec !== null
-          ? new Date(newestKnownBlockTimeSec * 1000).toISOString()
-          : null,
-      oldestKnownBlockTimeIso:
-        oldestKnownBlockTimeSec !== null
-          ? new Date(oldestKnownBlockTimeSec * 1000).toISOString()
-          : null,
+      newestKnownBlockTimeIso: safeUnixSecToIso(newestKnownBlockTimeSec),
+      oldestKnownBlockTimeIso: safeUnixSecToIso(oldestKnownBlockTimeSec),
       blockTimeOrderAnomaly,
     },
     observedSlotRange: {
@@ -506,7 +558,7 @@ export async function runPoolActivityRequest(o: {
       ...base,
       outcome: "OPERATOR_CANCELLED",
       detail: "Operator cancellation before dispatch",
-      endedAtMs: clock(),
+      endedAtMs: Math.max(startedAtMs, clock()),
       requestId: null,
       exchange: null,
       sessionStopReason: null,
@@ -516,10 +568,27 @@ export async function runPoolActivityRequest(o: {
     };
   }
 
+  const preOpenMs = clock();
+  const remainingMs = deadlineAtMs - preOpenMs;
+  if (remainingMs <= 0) {
+    return {
+      ...base,
+      outcome: "DEADLINE_EXPIRED",
+      detail: "LIFETIME_EXPIRED",
+      endedAtMs: Math.max(startedAtMs, preOpenMs),
+      requestId: null,
+      exchange: null,
+      sessionStopReason: "LIFETIME_EXPIRED",
+      analysis: null,
+      cancelled: false,
+      cancellationPhase: null,
+    };
+  }
+
   const limits: PaperRequestSessionLimits = {
-    lifetimeMs: L.acquisitionDeadlineMs,
+    lifetimeMs: remainingMs,
     maxHttpAttempts: L.httpRequests,
-    requestTimeoutMs: L.requestTimeoutMs,
+    requestTimeoutMs: Math.min(L.requestTimeoutMs, remainingMs),
     lanes: {
       SOLANA_RPC: { maxAttempts: 1, pacingMs: 2_500, maxResponseBytes: L.maxResponseBytes },
       DEXSCREENER: { maxAttempts: 0, pacingMs: 1_000, maxResponseBytes: 1 },
@@ -564,6 +633,7 @@ export async function runPoolActivityRequest(o: {
         params: buildActivityCheckRpcParams(o.poolAddress),
       }),
       jsonRpcId: requestId,
+      refusal: () => (clock() >= deadlineAtMs ? "LIFETIME_EXPIRED" : null),
       waitSignals: o.abortSignal ? [o.abortSignal] : undefined,
     });
   } finally {
@@ -575,12 +645,17 @@ export async function runPoolActivityRequest(o: {
   const stopReason = session.getStatus().stopReason;
   const recordedStop = stopReason === "ACTIVITY_CHECK_FINISHED" ? null : stopReason;
   if (e === null) {
+    const expiredBeforeDispatch = recordedStop === "LIFETIME_EXPIRED" || clock() >= deadlineAtMs;
     return {
       ...base,
-      outcome: cancelled ? "OPERATOR_CANCELLED" : "NOT_DISPATCHED",
-      detail: recordedStop,
-      endedAtMs: clock(),
-      requestId,
+      outcome: cancelled
+        ? "OPERATOR_CANCELLED"
+        : expiredBeforeDispatch
+          ? "DEADLINE_EXPIRED"
+          : "NOT_DISPATCHED",
+      detail: recordedStop ?? (expiredBeforeDispatch ? "LIFETIME_EXPIRED" : null),
+      endedAtMs: Math.max(startedAtMs, clock()),
+      requestId: recordedStop === "LIFETIME_EXPIRED" ? null : requestId,
       exchange: null,
       sessionStopReason: recordedStop,
       analysis: null,
@@ -597,8 +672,10 @@ export async function runPoolActivityRequest(o: {
       ? analyzePoolActivityResponse(e.body, requestId)
       : null;
   const cancelledDuring = cancelled && e.entry.error !== null;
+  const dispatchedAtOrAfterDeadline = e.entry.dispatchedAtMs >= deadlineAtMs;
   const completedAfterDeadline =
     e.entry.error === null && (e.entry.completedAtMs ?? Infinity) > deadlineAtMs;
+  const deadlineHit = dispatchedAtOrAfterDeadline || completedAfterDeadline;
   const outcome = outcomeOf(
     e.entry.error,
     e.entry.httpStatus,
@@ -606,20 +683,22 @@ export async function runPoolActivityRequest(o: {
     recordedStop,
     cancelledDuring,
     analysis,
-    completedAfterDeadline,
+    deadlineHit,
   );
 
   return {
     ...base,
     outcome,
-    detail: completedAfterDeadline
-      ? "COMPLETED_AFTER_DEADLINE"
+    detail: deadlineHit
+      ? dispatchedAtOrAfterDeadline
+        ? "DISPATCHED_AT_OR_AFTER_DEADLINE"
+        : "COMPLETED_AFTER_DEADLINE"
       : analysis?.kind === "MALFORMED"
         ? analysis.reason
         : analysis?.kind === "RPC_ERROR"
           ? `JSON-RPC error ${analysis.code}`
           : e.entry.error,
-    endedAtMs: clock(),
+    endedAtMs: Math.max(startedAtMs, clock()),
     requestId,
     exchange: e,
     sessionStopReason: recordedStop,
@@ -961,7 +1040,56 @@ const OUTCOMES: readonly string[] = [
   "NOT_DISPATCHED",
 ];
 
-export function verifyActivityCheckEvidence(dir: string): ActivityCheckVerification {
+export interface VerifyActivityCheckDeps {
+  readonly readFile?: ((filePath: string) => Buffer) | undefined;
+}
+
+function readBoundedRegularFile(
+  dir: string,
+  name: string,
+  maxBytes: number,
+  problems: string[],
+  readFile: (filePath: string) => Buffer,
+): Buffer | null {
+  const fullPath = path.join(dir, name);
+  let st: ReturnType<typeof lstatSync>;
+  try {
+    st = lstatSync(fullPath);
+  } catch {
+    problems.push(`MISSING:${name}`);
+    return null;
+  }
+  if (st.isSymbolicLink() || st.nlink > 1) {
+    problems.push(`LINK_REJECTED:${name}`);
+    return null;
+  }
+  if (!st.isFile()) {
+    problems.push(`NOT_REGULAR_FILE:${name}`);
+    return null;
+  }
+  if (!isSafeCount(st.size) || st.size > maxBytes) {
+    problems.push(`FILE_TOO_LARGE:${name}`);
+    return null;
+  }
+  let bytes: Buffer;
+  try {
+    bytes = readFile(fullPath);
+  } catch {
+    problems.push(`FILE_UNREADABLE:${name}`);
+    return null;
+  }
+  if (bytes.length !== st.size) {
+    problems.push(`FILE_CHANGED_DURING_READ:${name}`);
+    return null;
+  }
+  return bytes;
+}
+
+export function verifyActivityCheckEvidence(
+  dir: string,
+  deps: VerifyActivityCheckDeps = {},
+): ActivityCheckVerification {
+  const readFile = deps.readFile ?? ((p: string) => readFileSync(p));
   const problems: string[] = [];
   let manifestSha256: string | null = null;
   let recordedSummary: ActivityCheckVerification["recorded"] = null;
@@ -995,17 +1123,66 @@ export function verifyActivityCheckEvidence(dir: string): ActivityCheckVerificat
     }
     if (problems.length > 0) return fail();
 
+    const expected: readonly string[] = [ACTIVITY_CHECK_FILES.plan, ACTIVITY_CHECK_FILES.activity];
+
+    // Inspect directory entries strictly via lstat BEFORE reading any file bytes.
+    let dirEntries: string[];
+    try {
+      dirEntries = readdirSync(dir);
+    } catch {
+      problems.push("OUTPUT_DIRECTORY_INVALID");
+      return fail();
+    }
+    if (dirEntries.length > ACTIVITY_CHECK_VERIFIER_LIMITS.maxEntries) {
+      problems.push("TOO_MANY_ENTRIES");
+      return fail();
+    }
+    for (const name of dirEntries) {
+      let st: ReturnType<typeof lstatSync>;
+      try {
+        st = lstatSync(path.join(dir, name));
+      } catch {
+        problems.push(`UNREADABLE_ENTRY:${name}`);
+        continue;
+      }
+      if (st.isSymbolicLink() || st.nlink > 1) problems.push(`LINK_REJECTED:${name}`);
+      else if (!st.isFile()) problems.push(`UNEXPECTED_ENTRY:${name}`);
+      else if (name !== ACTIVITY_CHECK_FILES.manifest && !expected.includes(name)) {
+        problems.push(`UNLISTED:${name}`);
+      } else {
+        const cap =
+          name === ACTIVITY_CHECK_FILES.manifest
+            ? ACTIVITY_CHECK_VERIFIER_LIMITS.maxManifestBytes
+            : ACTIVITY_CHECK_VERIFIER_LIMITS.maxFileBytes;
+        if (st.size > cap) problems.push(`FILE_TOO_LARGE:${name}`);
+      }
+    }
+    if (problems.length > 0) return fail();
+
+    const manifestBytes = readBoundedRegularFile(
+      dir,
+      ACTIVITY_CHECK_FILES.manifest,
+      ACTIVITY_CHECK_VERIFIER_LIMITS.maxManifestBytes,
+      problems,
+      readFile,
+    );
+    if (manifestBytes === null) {
+      if (problems.includes(`MISSING:${ACTIVITY_CHECK_FILES.manifest}`)) {
+        problems.push("MANIFEST_MISSING_OR_INVALID");
+      }
+      return fail();
+    }
+    manifestSha256 = sha256(manifestBytes);
     let manifest: unknown;
     try {
-      const bytes = readFileSync(path.join(dir, ACTIVITY_CHECK_FILES.manifest));
-      manifestSha256 = sha256(bytes);
-      manifest = JSON.parse(bytes.toString("utf8"));
+      const manifestText = decodeStrictUtf8(manifestBytes);
+      if (manifestText === null) throw new Error("NOT_UTF8");
+      manifest = JSON.parse(manifestText);
     } catch {
       problems.push("MANIFEST_MISSING_OR_INVALID");
       return fail();
     }
 
-    const expected: readonly string[] = [ACTIVITY_CHECK_FILES.plan, ACTIVITY_CHECK_FILES.activity];
     if (
       !isRecord(manifest) ||
       manifest.kind !== ACTIVITY_CHECK_MANIFEST_KIND ||
@@ -1020,34 +1197,29 @@ export function verifyActivityCheckEvidence(dir: string): ActivityCheckVerificat
           f.path !== expected[i] ||
           typeof f.sha256 !== "string" ||
           !HEX64.test(f.sha256) ||
-          !isSafeCount(f.bytes),
+          !isSafeCount(f.bytes) ||
+          f.bytes > ACTIVITY_CHECK_VERIFIER_LIMITS.maxFileBytes,
       )
     ) {
       problems.push("MANIFEST_INVALID");
       return fail();
     }
 
-    for (const name of readdirSync(dir)) {
-      const st = lstatSync(path.join(dir, name));
-      if (st.isSymbolicLink() || !st.isFile()) problems.push(`UNEXPECTED_ENTRY:${name}`);
-      else if (name !== ACTIVITY_CHECK_FILES.manifest && !expected.includes(name)) {
-        problems.push(`UNLISTED:${name}`);
-      }
-    }
-
     const files = new Map<string, Buffer>();
     for (const f of manifest.files as Record<string, unknown>[]) {
-      let bytes: Buffer;
-      try {
-        bytes = readFileSync(path.join(dir, f.path as string));
-      } catch {
-        problems.push(`MISSING:${String(f.path)}`);
-        continue;
-      }
+      const name = String(f.path);
+      const bytes = readBoundedRegularFile(
+        dir,
+        name,
+        ACTIVITY_CHECK_VERIFIER_LIMITS.maxFileBytes,
+        problems,
+        readFile,
+      );
+      if (bytes === null) continue;
       if (sha256(bytes) !== f.sha256 || bytes.length !== f.bytes) {
-        problems.push(`MODIFIED:${String(f.path)}`);
+        problems.push(`MODIFIED:${name}`);
       } else {
-        files.set(f.path as string, bytes);
+        files.set(name, bytes);
       }
     }
     if (problems.length > 0) return fail();
@@ -1153,10 +1325,21 @@ export function verifyActivityCheckEvidence(dir: string): ActivityCheckVerificat
     let withheld = false;
 
     if (resp === null) {
-      if (recOutcome !== "OPERATOR_CANCELLED" && recOutcome !== "NOT_DISPATCHED") {
+      if (
+        recOutcome !== "OPERATOR_CANCELLED" &&
+        recOutcome !== "NOT_DISPATCHED" &&
+        recOutcome !== "DEADLINE_EXPIRED"
+      ) {
         problems.push("OUTCOME_NOT_REPRODUCED");
       }
       if (recOutcome === "OPERATOR_CANCELLED" && cancelled !== true) {
+        problems.push("OUTCOME_NOT_REPRODUCED");
+      }
+      if (
+        recOutcome === "DEADLINE_EXPIRED" &&
+        (rec.sessionStopReason !== "LIFETIME_EXPIRED" ||
+          (r.endedAtMs as number) < (r.deadlineAtMs as number))
+      ) {
         problems.push("OUTCOME_NOT_REPRODUCED");
       }
       if (req.dispatchedAtMs !== null || req.completedAtMs !== null) {
@@ -1521,8 +1704,8 @@ function parseActivityCli(rawArgs: readonly string[]): ParsedCli {
       allowPositionals: false,
       tokens: true,
     }));
-  } catch (err) {
-    throw cliError(err instanceof Error ? err.message : String(err));
+  } catch {
+    throw cliError("unknown, malformed or positional argument");
   }
 
   const seen = new Set<string>();
