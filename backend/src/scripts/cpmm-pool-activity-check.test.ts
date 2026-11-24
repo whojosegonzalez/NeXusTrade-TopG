@@ -943,6 +943,202 @@ describe("cpmm-pool-activity-check offline suite", () => {
     expect(r3.exitCode).toBe(X.NO_PAGE);
   });
 
+  it("AC18 (deadline race): elapsed time between remainingMs/open and open/dispatch still aborts/refuses at t0+10000", async () => {
+    // 1. Repro: first two clock reads return t0 (remainingMs=10000), then virtual time jumps to t0+6000 before session.open()
+    const out1 = "data/research/cpmm-activity-checks/check-pre-open-jump";
+    const h1 = makeHarness();
+    const scheduledAts1: number[] = [];
+    let fetchAbortedAtMs1: number | null = null;
+    const stallingFetch1 = (async (_input: unknown, init?: RequestInit): Promise<Response> => {
+      h1.calls.push({ url: String(_input), init });
+      return new Promise<Response>((_resolve, reject) => {
+        if (init?.signal?.aborted) {
+          fetchAbortedAtMs1 = h1.sched.now;
+          reject(new Error(`aborted:${RPC_URL}`));
+          return;
+        }
+        init?.signal?.addEventListener(
+          "abort",
+          () => {
+            fetchAbortedAtMs1 = h1.sched.now;
+            reject(new Error(`aborted:${RPC_URL}`));
+          },
+          { once: true },
+        );
+      });
+    }) as unknown as typeof fetch;
+    const trackedTimers1: PaperRequestSessionTimers = {
+      setTimeout: (fn, ms) => {
+        scheduledAts1.push(h1.sched.now + Math.max(0, ms));
+        return h1.sched.add(fn, ms);
+      },
+      clearTimeout: (handle) => h1.sched.clear(handle),
+    };
+    let reads1 = 0;
+    const preOpenJumpClock = () => {
+      reads1++;
+      if (reads1 <= 2) return START_MS;
+      if (h1.sched.now < START_MS + 6_000) h1.sched.now = START_MS + 6_000;
+      return h1.sched.now;
+    };
+    const r1 = await h1.drive(
+      runCpmmPoolActivityCheckCli(
+        ["--pool", POOL, "--out-dir", out1, "--live"],
+        h1.deps({ clock: preOpenJumpClock, timers: trackedTimers1, fetchFn: stallingFetch1 }),
+      ),
+      20_000,
+    );
+    expect(h1.calls).toHaveLength(1);
+    expect(scheduledAts1.every((at) => at <= START_MS + 10_000)).toBe(true);
+    expect(fetchAbortedAtMs1).toBe(START_MS + 10_000);
+    expect(r1.acquisition!.outcome).toBe("DEADLINE_EXPIRED");
+    expect(r1.acquisition!.endedAtMs).toBe(START_MS + 10_000);
+    expect(r1.verification!.integrity.ok).toBe(true);
+    expect(r1.exitCode).toBe(X.NO_PAGE);
+
+    // 2. Control: time advances to t0+6000 before remainingMs calculation -> also aborts at t0+10000
+    const outCtrl = "data/research/cpmm-activity-checks/check-pre-calc-control";
+    const hCtrl = makeHarness();
+    let fetchAbortedAtMsCtrl: number | null = null;
+    const stallingFetchCtrl = (async (_input: unknown, init?: RequestInit): Promise<Response> => {
+      hCtrl.calls.push({ url: String(_input), init });
+      return new Promise<Response>((_resolve, reject) => {
+        init?.signal?.addEventListener(
+          "abort",
+          () => {
+            fetchAbortedAtMsCtrl = hCtrl.sched.now;
+            reject(new Error(`aborted:${RPC_URL}`));
+          },
+          { once: true },
+        );
+      });
+    }) as unknown as typeof fetch;
+    let ctrlReads = 0;
+    const ctrlClock = () => {
+      ctrlReads++;
+      if (ctrlReads === 1) return START_MS;
+      if (hCtrl.sched.now < START_MS + 6_000) hCtrl.sched.now = START_MS + 6_000;
+      return hCtrl.sched.now;
+    };
+    const rCtrl = await hCtrl.drive(
+      runCpmmPoolActivityCheckCli(
+        ["--pool", POOL, "--out-dir", outCtrl, "--live"],
+        hCtrl.deps({ clock: ctrlClock, fetchFn: stallingFetchCtrl }),
+      ),
+      20_000,
+    );
+    expect(hCtrl.calls).toHaveLength(1);
+    expect(fetchAbortedAtMsCtrl).toBe(START_MS + 10_000);
+    expect(rCtrl.acquisition!.endedAtMs).toBe(START_MS + 10_000);
+    expect(rCtrl.acquisition!.outcome).toBe("DEADLINE_EXPIRED");
+    expect(rCtrl.exitCode).toBe(X.NO_PAGE);
+
+    // 3. Past-deadline jump between remainingMs calculation and session.open() -> zero dispatches
+    const outPastOpen = "data/research/cpmm-activity-checks/check-pre-open-expired";
+    const hPastOpen = makeHarness();
+    let readsPastOpen = 0;
+    const pastOpenClock = () => {
+      readsPastOpen++;
+      if (readsPastOpen <= 2) return START_MS;
+      if (hPastOpen.sched.now < START_MS + 10_500) hPastOpen.sched.now = START_MS + 10_500;
+      return hPastOpen.sched.now;
+    };
+    const rPastOpen = await hPastOpen.drive(
+      runCpmmPoolActivityCheckCli(
+        ["--pool", POOL, "--out-dir", outPastOpen, "--live"],
+        hPastOpen.deps({ clock: pastOpenClock }),
+      ),
+      20_000,
+    );
+    expect(hPastOpen.calls).toHaveLength(0);
+    expect(rPastOpen.acquisition!.outcome).toBe("DEADLINE_EXPIRED");
+    expect(rPastOpen.verification!.integrity.ok).toBe(true);
+    expect(rPastOpen.exitCode).toBe(X.NO_PAGE);
+
+    // 4a. Elapsed time between session.open() (t0) and session.dispatch() (t0+6000) still caps timeout at t0+10000
+    const outDispatchJump = "data/research/cpmm-activity-checks/check-open-to-dispatch-jump";
+    const hDisp = makeHarness();
+    const scheduledAtsDisp: number[] = [];
+    let fetchAbortedAtMsDisp: number | null = null;
+    let openTimerArmed = false;
+    const stallingFetchDisp = (async (_input: unknown, init?: RequestInit): Promise<Response> => {
+      hDisp.calls.push({ url: String(_input), init });
+      return new Promise<Response>((_resolve, reject) => {
+        init?.signal?.addEventListener(
+          "abort",
+          () => {
+            fetchAbortedAtMsDisp = hDisp.sched.now;
+            reject(new Error(`aborted:${RPC_URL}`));
+          },
+          { once: true },
+        );
+      });
+    }) as unknown as typeof fetch;
+    const trackedTimersDisp: PaperRequestSessionTimers = {
+      setTimeout: (fn, ms) => {
+        scheduledAtsDisp.push(hDisp.sched.now + Math.max(0, ms));
+        const handle = hDisp.sched.add(fn, ms);
+        openTimerArmed = true;
+        return handle;
+      },
+      clearTimeout: (handle) => hDisp.sched.clear(handle),
+    };
+    const openToDispatchJumpClock = () => {
+      if (openTimerArmed && hDisp.sched.now < START_MS + 6_000) {
+        hDisp.sched.now = START_MS + 6_000;
+      }
+      return hDisp.sched.now;
+    };
+    const rDisp = await hDisp.drive(
+      runCpmmPoolActivityCheckCli(
+        ["--pool", POOL, "--out-dir", outDispatchJump, "--live"],
+        hDisp.deps({
+          clock: openToDispatchJumpClock,
+          timers: trackedTimersDisp,
+          fetchFn: stallingFetchDisp,
+        }),
+      ),
+      20_000,
+    );
+    expect(hDisp.calls).toHaveLength(1);
+    expect(scheduledAtsDisp.every((at) => at <= START_MS + 10_000)).toBe(true);
+    expect(fetchAbortedAtMsDisp).toBe(START_MS + 10_000);
+    expect(rDisp.acquisition!.outcome).toBe("DEADLINE_EXPIRED");
+    expect(rDisp.acquisition!.endedAtMs).toBe(START_MS + 10_000);
+    expect(rDisp.verification!.integrity.ok).toBe(true);
+    expect(rDisp.exitCode).toBe(X.NO_PAGE);
+
+    // 4b. Elapsed time past deadline between session.open() and session.dispatch() refuses dispatch (0 calls)
+    const outDispExpired = "data/research/cpmm-activity-checks/check-open-to-dispatch-expired";
+    const hDispExp = makeHarness();
+    let openTimerArmedExp = false;
+    const trackedTimersDispExp: PaperRequestSessionTimers = {
+      setTimeout: (fn, ms) => {
+        const handle = hDispExp.sched.add(fn, ms);
+        openTimerArmedExp = true;
+        return handle;
+      },
+      clearTimeout: (handle) => hDispExp.sched.clear(handle),
+    };
+    const openToDispatchExpiredClock = () => {
+      if (openTimerArmedExp && hDispExp.sched.now < START_MS + 10_500) {
+        hDispExp.sched.now = START_MS + 10_500;
+      }
+      return hDispExp.sched.now;
+    };
+    const rDispExp = await hDispExp.drive(
+      runCpmmPoolActivityCheckCli(
+        ["--pool", POOL, "--out-dir", outDispExpired, "--live"],
+        hDispExp.deps({ clock: openToDispatchExpiredClock, timers: trackedTimersDispExp }),
+      ),
+      20_000,
+    );
+    expect(hDispExp.calls).toHaveLength(0);
+    expect(rDispExp.acquisition!.outcome).toBe("DEADLINE_EXPIRED");
+    expect(rDispExp.verification!.integrity.ok).toBe(true);
+    expect(rDispExp.exitCode).toBe(X.NO_PAGE);
+  });
+
   it("AC16 (defect 3): blockTime MAX_SAFE_INTEGER and 7500-nested err objects seal bounded MALFORMED_RESPONSE instead of throwing", async () => {
     // 3a: blockTime = Number.MAX_SAFE_INTEGER overflows JS Date ISO conversion (< 64 KiB body)
     const maxBtBody = rpcBody([rec(1, 500, Number.MAX_SAFE_INTEGER)]);

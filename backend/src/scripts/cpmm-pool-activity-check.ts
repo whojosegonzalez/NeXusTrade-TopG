@@ -597,13 +597,26 @@ export async function runPoolActivityRequest(o: {
     },
   };
 
+  const rawTimers: PaperRequestSessionTimers = o.timers ?? {
+    setTimeout: (fn, ms) => globalThis.setTimeout(fn, ms),
+    clearTimeout: (handle) =>
+      globalThis.clearTimeout(handle as ReturnType<typeof globalThis.setTimeout>),
+  };
+  const boundedTimers: PaperRequestSessionTimers = {
+    setTimeout: (fn, ms) => {
+      const remaining = Math.max(0, deadlineAtMs - clock());
+      return rawTimers.setTimeout(fn, Math.min(Math.max(0, ms), remaining));
+    },
+    clearTimeout: (handle) => rawTimers.clearTimeout(handle),
+  };
+
   let exchange: PaperRequestExchangeEvidence | null = null;
   const session = new PaperRequestSession({
     executionContext: "PAPER_SIMULATION",
     fetchFn: o.fetchFn,
     limits,
     clock: o.clock,
-    timers: o.timers,
+    timers: boundedTimers,
     onExchangeComplete: (e) => {
       exchange = e;
     },
@@ -633,6 +646,7 @@ export async function runPoolActivityRequest(o: {
         params: buildActivityCheckRpcParams(o.poolAddress),
       }),
       jsonRpcId: requestId,
+      timeoutMs: Math.max(1, Math.min(L.requestTimeoutMs, deadlineAtMs - clock())),
       refusal: () => (clock() >= deadlineAtMs ? "LIFETIME_EXPIRED" : null),
       waitSignals: o.abortSignal ? [o.abortSignal] : undefined,
     });
