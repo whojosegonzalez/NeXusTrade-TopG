@@ -42,7 +42,7 @@ node backend/node_modules/tsx/dist/cli.mjs backend/src/scripts/cpmm-pool-observa
 - Loaded only in `--live`, after every argument and output check, through the existing daemon configuration loader (`loadDaemonEnvironment`), and resolved by the reviewed endpoint resolver (`resolveSolanaEndpoints`).
 - `SOLANA_RPC_URL` must be https and `SOLANA_WS_URL` must be configured explicitly as wss. The stream URL is never derived from the RPC URL. Neither may contain a fragment.
 - Refusals are fixed messages (`[MISSING_CONFIGURATION]`, `[INVALID_CONFIGURATION]`) raised before `fetch` or the `ws` client is loaded, before any signal handler is installed and before anything is written.
-- Credential values, raw configuration and free exception text are never printed. An unexpected error prints only its bracketed code, or `[UNEXPECTED_ERROR]`. The core redacts both endpoint URLs from the evidence.
+- Credential values, raw configuration and free exception text are never printed. Only refusals the entry point creates itself are printed as text; an error's own prefix is never trusted. A failing dependency gets a fixed refusal with its error text withheld: `[CONFIGURATION_LOAD_FAILED]` (the configuration loader), `[WS_CLIENT_LOAD_FAILED]` (the `ws` client) or `[SIGNAL_INSTALL_FAILED]` (a signal listener). Any other error prints only `[UNEXPECTED_ERROR]`. The core redacts both endpoint URLs from the evidence.
 
 ## 4. Proposed profile `PROPOSED_SHORT_OBSERVATION_PROFILE_V1` (not approved)
 
@@ -78,11 +78,16 @@ Values in the offline tests are test inputs, not approved live limits.
 | **Session ceiling**    | **10**                                                                   |
 | WebSocket              | 1 connection, 1 subscription; no reconnect, retry, fallback or follow-up |
 
-**Local overhead** (separate from the session lifetime; no request or connection): after the session stops, both bundles are sealed and verified locally. This time is not timed by the session lifetime. It is bounded by the evidence limits: the sanitizer's 8,388,608 bytes per file and the verifier's 1,048,576-byte manifest, 8,388,608 bytes per file, 268,435,456 bytes in total and 4,096 entries.
+**Local sealing and verification** (file writes and offline re-derivation; no request or connection):
+
+- The **acquisition** bundle is sealed and verified after the snapshot and before observation, while the shared session lifetime runs. That time uses the lifetime: observation starts only if the remaining lifetime still covers the owner's ceiling, so a slow seal ends the run at the stage boundary (`SESSION_LIFETIME_INSUFFICIENT`, or `SESSION_STOPPED` once the lifetime has run out) instead of extending anything.
+- The **observation** bundle is sealed and verified after the session has shut down. That time is outside the session lifetime.
+- The evidence limits (the sanitizer's 8,388,608 bytes per file; the verifier's 1,048,576-byte manifest, 8,388,608 bytes per file, 268,435,456 bytes in total and 4,096 entries) bound the data written and read, not the time taken. There is no hard wall-clock bound on local sealing and verification.
+- The **shutdown fallback** is separate: once the result is known, the exit code is set and the process drains. Only a process still alive 5,000 ms later is forced to exit, with the same code and `[CPMM_POOL_OBSERVATION_SHUTDOWN_FORCED]`. It does not bound sealing or verification, which finish before the result.
 
 ## 6. Outcome reporting and exit codes
 
-A live run prints separate lines for the execution status and first failure, the clock failure and cancellation, cleanup failures, the session stop reason and the owner's terminal cause, the request counts (HTTP attempts, acquisition requests, transaction retrievals, WebSocket connections), each bundle's path and seal, acquisition integrity and computed outcome, observation integrity, retention, re-derivation, the acquisition binding and the five qualification flags (all `false`). The last line is the same report as JSON. The run then ends: no follow-up, retry or reacquisition.
+A live run prints separate lines for the execution status and first failure, the clock failure and cancellation, cleanup failures, the entry point's own cleanup failures (`SIGNAL_REMOVE_FAILED:<signal>`), the session stop reason and the owner's terminal cause, the request counts (HTTP attempts, acquisition requests, transaction retrievals, WebSocket connections), each bundle's path and seal, acquisition integrity and computed outcome, observation integrity, retention, re-derivation, the acquisition binding and the five qualification flags (all `false`). The last line is the same report as JSON. The run then ends: no follow-up, retry or reacquisition.
 
 | Code | Meaning                                                                                                   |
 | ---- | --------------------------------------------------------------------------------------------------------- |
@@ -93,10 +98,11 @@ A live run prints separate lines for the execution status and first failure, the
 | 4    | Evidence not verified (integrity, acquisition binding or a re-derivation mismatch)                        |
 | 5    | A bundle could not be sealed; nothing is reacquired                                                       |
 | 6    | Cancelled (Ctrl+C or termination); the evidence is intact                                                 |
+| 7    | The run would have exited 0 or 2, but a signal listener could not be removed                              |
 
-A sealing failure takes precedence over evidence that does not verify, which takes precedence over cancellation, then a failed run, then limited evidence.
+A sealing failure takes precedence over evidence that does not verify, which takes precedence over cancellation, then a failed run, then limited evidence. A listener that could not be removed replaces only 0 and 2 (with 7); every other code is kept and the failure is still reported.
 
-**Cancellation**: while the core runs, SIGINT and SIGTERM abort its signal; the core then settles, seals and verifies what it has. The handlers exist only while the core runs and are removed on every exit.
+**Cancellation**: while the core runs, SIGINT and SIGTERM abort its signal (printing `[LIVE] <signal> received` once); the core then settles, seals and verifies what it has. The listeners exist only while the core runs. On every exit, removal is attempted for every listener whose registration was attempted, including one that attached and then threw, and a failed removal does not stop the others. A failed removal is reported as `SIGNAL_REMOVE_FAILED:<signal>` in the entry-point cleanup line and in the JSON report (`entryPoint.signalCleanupFailures`); the core's result and evidence are reported unchanged. A listener left attached does nothing after the run. If installing a listener fails, the core never runs and the refusal is `[SIGNAL_INSTALL_FAILED]` (exit 1), naming any failed removal.
 
 ## 7. Verification and its limitation
 

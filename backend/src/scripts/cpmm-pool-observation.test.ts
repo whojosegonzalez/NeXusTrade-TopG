@@ -19,6 +19,8 @@ import {
   readdirSync,
   rmSync,
   statSync,
+  symlinkSync,
+  unlinkSync,
   writeFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
@@ -65,6 +67,7 @@ import {
   CPMM_OBSERVATION_COMPONENT_SOURCES,
   CPMM_OBSERVATION_COMPONENT_VERSIONS,
   CPMM_OBSERVATION_CONFIG_ERRORS,
+  CPMM_OBSERVATION_DEPENDENCY_ERRORS,
   CPMM_OBSERVATION_EXIT_CODES,
   CPMM_OBSERVATION_LIVE_FLAG_MEANING,
   CPMM_OBSERVATION_LIVE_STATUS,
@@ -77,8 +80,10 @@ import {
   CPMM_OBSERVATION_SIGNALS,
   CPMM_OBSERVATION_USAGE,
   buildCpmmObservationPlan,
+  cpmmObservationCliExitCode,
   cpmmObservationLiveExitCode,
   cpmmObservationVerifyExitCode,
+  isCpmmObservationMainModule,
   isSolanaAddress,
   printableError,
   runCpmmPoolObservationCli,
@@ -105,14 +110,14 @@ const P = CPMM_OBSERVATION_PROFILE_LIMITS;
 const CLI_PATH = fileURLToPath(new URL("./cpmm-pool-observation.ts", import.meta.url));
 const BACKEND_DIR = path.resolve(path.dirname(CLI_PATH), "..", "..");
 
-/** A child Node process with tsx and no configuration-like environment variables. */
-function spawnNode(args: string[]) {
+/** A child Node process with no configuration-like environment variables. */
+function spawnChild(args: string[], cwd = BACKEND_DIR) {
   return new Promise<{ code: number | null; stdout: string; stderr: string }>((resolve) => {
     const env = Object.fromEntries(
       Object.entries(process.env).filter(([k]) => !/SOLANA|KEY|SECRET|TOKEN|URL/i.test(k)),
     );
-    const child = spawn(process.execPath, ["--import", "tsx", ...args], {
-      cwd: BACKEND_DIR,
+    const child = spawn(process.execPath, args, {
+      cwd,
       env,
       stdio: ["ignore", "pipe", "pipe"],
     });
@@ -123,13 +128,17 @@ function spawnNode(args: string[]) {
     child.on("close", (code) => resolve({ code, stdout, stderr }));
   });
 }
+const spawnNode = (args: string[]) => spawnChild(["--import", "tsx", ...args]);
 
 const flush = async (rounds = 8) => {
   for (let i = 0; i < rounds; i++) await new Promise((r) => setImmediate(r));
 };
 
 const TMP = mkdtempSync(path.join(tmpdir(), "cpmm-cli-test-"));
+/** Directory links into the source tree: always unlinked before the recursive removal. */
+const links: string[] = [];
 afterAll(() => {
+  for (const link of links) if (existsSync(link)) unlinkSync(link);
   rmSync(TMP, { recursive: true, force: true });
 });
 let dirCounter = 0;
@@ -472,7 +481,11 @@ interface HarnessOptions {
   onClient?: (h: Harness) => void;
   /** Called for each listener the CLI installs; may throw to refuse it. */
   onInstall?: (event: CpmmObservationSignal) => void;
-  /** Called for each listener the CLI removes; may throw. */
+  /** Called after a listener is attached; may throw (the listener stays attached). */
+  onInstalled?: (event: CpmmObservationSignal) => void;
+  /** Called before a listener is removed; may throw (the listener stays attached). */
+  onBeforeRemove?: (event: CpmmObservationSignal) => void;
+  /** Called after a listener is removed; may throw. */
   onRemove?: (event: CpmmObservationSignal) => void;
 }
 
@@ -607,9 +620,11 @@ function harness(o: HarnessOptions = {}) {
         counters.installs++;
         installed.set(event, [...(installed.get(event) ?? []), listener]);
         captured.push(listener);
+        o.onInstalled?.(event);
       },
       removeListener: (event, listener) => {
         counters.removals++;
+        o.onBeforeRemove?.(event);
         installed.set(
           event,
           (installed.get(event) ?? []).filter((l) => l !== listener),
@@ -849,9 +864,9 @@ describe("CPMM pool observation CLI (item 17 T, roadmap step 3)", () => {
     for (const lane of ["RUGCHECK", "SOLANA_TRACKER", "DEXSCREENER"] as const) {
       expect(P.session.lanes[lane].maxAttempts).toBe(0);
     }
-    // Local sealing and verification are shown separately from the session's timed budget.
-    expect(plan.localOverhead).toMatchObject({ timedBySessionLifetime: false, network: "NONE" });
-    expect(Object.values(plan.localOverhead.bounds).every((n) => Number.isSafeInteger(n))).toBe(
+    // Local sealing and verification: where each happens, and data bounds (not time bounds).
+    expect(plan.localOverhead).toMatchObject({ network: "NONE", hardWallClockBound: false });
+    expect(Object.values(plan.localOverhead.dataBounds).every((n) => Number.isSafeInteger(n))).toBe(
       true,
     );
     expect(plan.flags).toEqual(CPMM_EVIDENCE_FALSE_FLAGS);
@@ -902,6 +917,7 @@ describe("CPMM pool observation CLI (item 17 T, roadmap step 3)", () => {
       "node:crypto",
       "node:fs",
       "node:path",
+      "node:url",
       "node:util",
       "../candidate-scanner/CpmmPoolWebSocketTransport.js",
       "../candidate-scanner/PaperRequestSession.js",
@@ -1043,8 +1059,8 @@ describe("CPMM pool observation CLI (item 17 T, roadmap step 3)", () => {
     ]) {
       expect(isSolanaAddress(bad), bad).toBe(false);
     }
-    // The parser's own (argument-echoing) text never reaches the output.
-    expect(printableError(new Error(`[CLI_INVALID_ARG] x`))).toBe("[CLI_INVALID_ARG] x");
+    // Text shaped like a refusal but not created by the entry point is never printed.
+    expect(printableError(new Error(`[CLI_INVALID_ARG] x`))).toBe("[UNEXPECTED_ERROR]");
   });
 
   it("OC4: missing or invalid configuration refuses --live before any transport or write", async () => {
@@ -1077,7 +1093,7 @@ describe("CPMM pool observation CLI (item 17 T, roadmap step 3)", () => {
       expect(readdirSync(h.root)).toEqual([]);
       expect(h.logs).toEqual([]);
     }
-    // A loader or ws-client failure prints its code only, never its text.
+    // A loader or ws-client failure prints a fixed refusal, never its text or its code.
     const loader = harness();
     await expectRefusal(
       runCpmmPoolObservationCli(
@@ -1088,7 +1104,7 @@ describe("CPMM pool observation CLI (item 17 T, roadmap step 3)", () => {
           },
         }),
       ),
-      "[UNEXPECTED_ERROR]",
+      CPMM_OBSERVATION_DEPENDENCY_ERRORS.configurationLoad,
     );
     const ws = harness();
     await expectRefusal(
@@ -1098,7 +1114,7 @@ describe("CPMM pool observation CLI (item 17 T, roadmap step 3)", () => {
           loadWebSocketConstructor: () => Promise.reject(new Error(`[WS_MISSING] ${SECRET}`)),
         }),
       ),
-      "[WS_MISSING]",
+      CPMM_OBSERVATION_DEPENDENCY_ERRORS.webSocketClientLoad,
     );
     for (const h of [loader, ws]) {
       expect(h.calls).toHaveLength(0);
@@ -1166,6 +1182,7 @@ describe("CPMM pool observation CLI (item 17 T, roadmap step 3)", () => {
       poolContextProvenance: "ACQUIRED_BOUND",
     });
     expect(report.flags).toEqual(CPMM_EVIDENCE_FALSE_FLAGS);
+    expect(report.entryPoint).toEqual({ signalCleanupFailures: [] });
     expect(r.planDigestSha256).toMatch(/^[0-9a-f]{64}$/);
     // Distinct lines for each part of the outcome, then the machine-readable report.
     const at = (prefix: string) => h.logs.filter((l) => l.startsWith(prefix));
@@ -1175,6 +1192,10 @@ describe("CPMM pool observation CLI (item 17 T, roadmap step 3)", () => {
     expect(h.logs).toContain(`[LIVE] ${CPMM_OBSERVATION_LIVE_FLAG_MEANING}`);
     expect(at("[LIVE] Execution:")).toEqual(["[LIVE] Execution: SUCCEEDED; first failure: none"]);
     expect(at("[LIVE] Cleanup failures:")).toEqual(["[LIVE] Cleanup failures: none"]);
+    expect(at("[LIVE] Entry-point cleanup failures:")).toEqual([
+      "[LIVE] Entry-point cleanup failures: none",
+    ]);
+    expect(at("[LIVE] SIGINT received").concat(at("[LIVE] SIGTERM received"))).toEqual([]);
     expect(at("[LIVE] Requests:")).toEqual([
       "[LIVE] Requests: 3 HTTP (2 acquisition, 1 transaction retrieval); WebSocket connections: 1",
     ]);
@@ -1214,13 +1235,18 @@ describe("CPMM pool observation CLI (item 17 T, roadmap step 3)", () => {
     expect(h.instances).toHaveLength(1);
     expect([...h.installed.values()].flat()).toEqual([]);
     expect(h.counters.removals).toBe(CPMM_OBSERVATION_SIGNALS.length);
+    expect(h.logs.filter((l) => l.includes(" received: cancelling"))).toEqual([
+      "[LIVE] SIGINT received: cancelling the run; the core still seals what it has",
+    ]);
     // A signal after the result (even through a retained listener) changes nothing.
     const before = JSON.stringify(r);
+    const logsBefore = [...h.logs];
     for (const l of h.captured) l();
     h.fire("SIGINT");
     h.fire("SIGTERM");
     await h.to(AFTER_ALL + 60_000);
     expect(JSON.stringify(r)).toBe(before);
+    expect(h.logs).toEqual(logsBefore);
     expect(h.calls).toHaveLength(2);
     expect(r.report!.requests).toMatchObject({ httpAttempts: 2, webSocketConnections: 1 });
     expectCredentialFree(h, r);
@@ -1247,6 +1273,9 @@ describe("CPMM pool observation CLI (item 17 T, roadmap step 3)", () => {
     expect(a.instances).toHaveLength(0);
     expect(a.calls).toHaveLength(1);
     expect([...a.installed.values()].flat()).toEqual([]);
+    expect(a.logs.filter((l) => l.includes(" received: cancelling"))).toEqual([
+      "[LIVE] SIGTERM received: cancelling the run; the core still seals what it has",
+    ]);
     expectCredentialFree(a, r2);
   });
 
@@ -1625,6 +1654,13 @@ describe("CPMM pool observation CLI (item 17 T, roadmap step 3)", () => {
       X.EVIDENCE_NOT_VERIFIED,
     );
     expect(new Set(Object.values(X)).size).toBe(Object.keys(X).length);
+    // A listener the entry point could not remove turns only success or limited evidence into 7.
+    const failures = ["SIGNAL_REMOVE_FAILED:SIGINT"];
+    for (const code of Object.values(X)) {
+      expect(cpmmObservationCliExitCode(code, [])).toBe(code);
+      const expected = code === X.OK || code === X.EVIDENCE_LIMITED ? X.CLEANUP_FAILED : code;
+      expect(cpmmObservationCliExitCode(code, failures), String(code)).toBe(expected);
+    }
   });
 
   it("OC11: signal handlers are detached on every exit, including install and removal failures", async () => {
@@ -1634,14 +1670,18 @@ describe("CPMM pool observation CLI (item 17 T, roadmap step 3)", () => {
         if (event === "SIGTERM") throw new Error(`[SIGNAL] ${SECRET}`);
       },
     });
-    await expectRefusal(runCpmmPoolObservationCli(LIVE_ARGS(), h.deps()), "[SIGNAL]");
+    await expectRefusal(
+      runCpmmPoolObservationCli(LIVE_ARGS(), h.deps()),
+      CPMM_OBSERVATION_DEPENDENCY_ERRORS.signalInstall,
+    );
     expect([...h.installed.values()].flat()).toEqual([]);
-    expect(h.counters).toMatchObject({ installs: 1, removals: 1 });
+    // Removal is attempted for every registration attempted, including the refused one.
+    expect(h.counters).toMatchObject({ installs: 1, removals: 2 });
     expect(h.calls).toHaveLength(0);
     expect(h.queue.size).toBe(0);
     expect(readdirSync(h.root)).toEqual([]);
 
-    // A removal failure does not change the run's result, and the other listener is still removed.
+    // A removal failure is reported without changing the core's result; the other is removed.
     const f = harness({
       acquisition: (_n, req) =>
         Response.json({ jsonrpc: "2.0", id: req.id, error: { code: -32005, message: "x" } }),
@@ -1653,17 +1693,19 @@ describe("CPMM pool observation CLI (item 17 T, roadmap step 3)", () => {
     await f.to(OBS_START + 10_000);
     const r = await pending;
     expect(r.exitCode).toBe(X.RUN_FAILED);
+    expect(r.report!.execution.firstFailure).toBe("ACQUISITION:RPC_ERROR");
+    expect(r.report!.entryPoint.signalCleanupFailures).toEqual(["SIGNAL_REMOVE_FAILED:SIGINT"]);
     expect(f.counters.removals).toBe(2);
     expect(f.installed.get("SIGTERM")).toEqual([]);
     expectCredentialFree(f, r);
   });
 
-  it("OC12: printable errors carry fixed text or a code, never free exception text", () => {
-    expect(printableError(new Error(`[OUTPUT_EXISTS] x`))).toBe("[OUTPUT_EXISTS] x");
+  it("OC12: printable errors carry the entry point's fixed text or a fixed code, never free text", () => {
+    expect(printableError(new Error(`[OUTPUT_EXISTS] x`))).toBe("[UNEXPECTED_ERROR]");
     expect(printableError(new Error(CPMM_OBSERVATION_CONFIG_ERRORS.rpcHttps))).toBe(
-      CPMM_OBSERVATION_CONFIG_ERRORS.rpcHttps,
+      "[UNEXPECTED_ERROR]",
     );
-    expect(printableError(new Error(`[SOME_CODE] ${SECRET}`))).toBe("[SOME_CODE]");
+    expect(printableError(new Error(`[SOME_CODE] ${SECRET}`))).toBe("[UNEXPECTED_ERROR]");
     expect(printableError(new Error(`${RPC_URL} failed`))).toBe("[UNEXPECTED_ERROR]");
     expect(printableError(`[CLI_INVALID_ARG] ${SECRET}`)).toBe("[UNEXPECTED_ERROR]");
     expect(printableError(undefined)).toBe("[UNEXPECTED_ERROR]");
@@ -1715,4 +1757,297 @@ describe("CPMM pool observation CLI (item 17 T, roadmap step 3)", () => {
     expect(lingering.stderr.trim()).toBe(`${CPMM_OBSERVATION_SHUTDOWN_FORCED_NOTICE} after 200 ms`);
     expect(CPMM_OBSERVATION_SHUTDOWN_GRACE_MS).toBe(5_000);
   }, 45_000);
+
+  it("OC15: a dependency's error is never printed as trusted text, whatever its prefix", async () => {
+    const D = CPMM_OBSERVATION_DEPENDENCY_ERRORS;
+    const codes = [
+      "CLI_INVALID_ARG",
+      "OUTPUT_EXISTS",
+      "MISSING_CONFIGURATION",
+      "INVALID_CONFIGURATION",
+    ];
+    for (const code of codes) {
+      const message = `[${code}] ${RPC_URL}`;
+      const cases: [string, Partial<CpmmObservationCliDeps>, HarnessOptions, keyof typeof D][] = [
+        [
+          "loader throws",
+          {
+            loadEnvironment: () => {
+              throw new Error(message);
+            },
+          },
+          {},
+          "configurationLoad",
+        ],
+        [
+          "loader rejects",
+          { loadEnvironment: () => Promise.reject(new Error(message)) },
+          {},
+          "configurationLoad",
+        ],
+        [
+          "ws loader rejects",
+          { loadWebSocketConstructor: () => Promise.reject(new Error(message)) },
+          {},
+          "webSocketClientLoad",
+        ],
+        [
+          "signal registration throws",
+          {},
+          {
+            onInstall: () => {
+              throw new Error(message);
+            },
+          },
+          "signalInstall",
+        ],
+      ];
+      for (const [label, over, options, expected] of cases) {
+        const h = harness(options);
+        let caught: unknown = null;
+        try {
+          await runCpmmPoolObservationCli(LIVE_ARGS(), h.deps(over));
+        } catch (err) {
+          caught = err;
+        }
+        const printed = printableError(caught);
+        for (const banned of [SECRET, HOST, "https://", "api-key"]) {
+          expect(printed.includes(banned), `${code} ${label}: ${banned}`).toBe(false);
+        }
+        expect(printed, `${code} ${label}`).toBe(D[expected]);
+        expect(h.calls).toHaveLength(0);
+        expect(h.queue.size).toBe(0);
+        expect([...h.installed.values()].flat()).toEqual([]);
+        expect(readdirSync(h.root)).toEqual([]);
+      }
+    }
+    // Text that merely looks like a refusal is not trusted, nor is anything derived from one.
+    expect(printableError(new Error(CPMM_OBSERVATION_CONFIG_ERRORS.rpcHttps))).toBe(
+      "[UNEXPECTED_ERROR]",
+    );
+    expect(printableError(new Error(`[OUTPUT_EXISTS] ${SECRET}`))).toBe("[UNEXPECTED_ERROR]");
+    const h = harness();
+    let refusal: unknown = null;
+    try {
+      await runCpmmPoolObservationCli(LIVE_ARGS(), h.deps({ env: {} }));
+    } catch (err) {
+      refusal = err;
+    }
+    expect(printableError(refusal)).toBe(SOLANA_ENDPOINT_ERRORS.rpc);
+    expect(printableError(Object.create(refusal as object))).toBe("[UNEXPECTED_ERROR]");
+    expect(() => {
+      (refusal as { message: string }).message = SECRET;
+    }).toThrow(TypeError);
+    expect(printableError(refusal)).toBe(SOLANA_ENDPOINT_ERRORS.rpc);
+  });
+
+  it("OC16: only executing the entry file runs it; importing it from a same-named file does not", async () => {
+    const href = pathToFileURL(CLI_PATH).href;
+    const wrappers = ["cpmm-pool-observation.js", "cpmm-pool-observation.ts"].map((name) => {
+      const dir = path.join(TMP, `wrapper-${++dirCounter}`);
+      mkdirSync(dir);
+      const file = path.join(dir, name);
+      writeFileSync(
+        file,
+        `import(${JSON.stringify(href)}).then(() => console.log("WRAPPER_IMPORTED"), () => { console.log("WRAPPER_IMPORT_FAILED"); process.exitCode = 9; });\n`,
+      );
+      return file;
+    });
+    // A directory link to the scripts directory: the entry argument differs from the real path.
+    const link = path.join(TMP, `link-${++dirCounter}`);
+    links.push(link);
+    symlinkSync(path.dirname(CLI_PATH), link, "junction");
+    const direct = [
+      path.relative(BACKEND_DIR, CLI_PATH),
+      CLI_PATH.replace(/\\/g, "/"),
+      path.join(link, path.basename(CLI_PATH)),
+    ];
+    if (process.platform === "win32") {
+      direct.push(path.join(path.dirname(CLI_PATH).toUpperCase(), path.basename(CLI_PATH)));
+    }
+    const repoRoot = path.dirname(BACKEND_DIR);
+    const tsxCli = path.join(BACKEND_DIR, "node_modules", "tsx", "dist", "cli.mjs");
+    const [imported, runbook, ...directs] = await Promise.all([
+      Promise.all(wrappers.map((w) => spawnNode([w, "--help"]))),
+      // The runbook's own command form, from the repository root.
+      spawnChild([tsxCli, "backend/src/scripts/cpmm-pool-observation.ts", "--help"], repoRoot),
+      ...direct.map((p) => spawnNode([p, "--help"])),
+    ]);
+    for (const out of imported) {
+      expect(out.stdout.trim()).toBe("WRAPPER_IMPORTED");
+      expect(out.stderr).toBe("");
+      expect(out.code).toBe(0);
+    }
+    for (const out of [runbook, ...directs]) {
+      expect(out.code).toBe(X.OK);
+      expect(out.stdout.startsWith(CPMM_OBSERVATION_USAGE)).toBe(true);
+      expect(out.stderr).toBe("");
+    }
+    expect(isCpmmObservationMainModule(CLI_PATH, href)).toBe(true);
+    for (const w of wrappers) expect(isCpmmObservationMainModule(w, href)).toBe(false);
+    expect(isCpmmObservationMainModule(undefined, href)).toBe(false);
+    expect(isCpmmObservationMainModule("", href)).toBe(false);
+    expect(
+      isCpmmObservationMainModule(path.join(TMP, "absent", "cpmm-pool-observation.ts"), href),
+    ).toBe(false);
+    expect(isCpmmObservationMainModule(path.join(link, path.basename(CLI_PATH)), href)).toBe(true);
+    unlinkSync(link);
+    expect(existsSync(CLI_PATH)).toBe(true);
+  }, 45_000);
+
+  it("OC17: a failed listener removal is reported, later removals still run, and the exit is not success", async () => {
+    const h = harness({
+      onBeforeRemove: (event) => {
+        if (event === "SIGINT") throw new Error(`[OUTPUT_EXISTS] ${SECRET}`);
+      },
+    });
+    const pending = start(h, LIVE_ARGS());
+    await observe(h);
+    const r = await pending;
+    await h.to(AFTER_ALL + 60_000);
+    expect(r.exitCode).not.toBe(X.OK);
+    expect(r.exitCode).toBe(X.CLEANUP_FAILED);
+    const report = r.report!;
+    expect(report.entryPoint).toEqual({ signalCleanupFailures: ["SIGNAL_REMOVE_FAILED:SIGINT"] });
+    // The core's frozen result and evidence are reported unchanged.
+    const clean = (await shared).r.report!;
+    expect(report.execution).toEqual(clean.execution);
+    expect(report.requests).toEqual(clean.requests);
+    expect(report.flags).toEqual(CPMM_EVIDENCE_FALSE_FLAGS);
+    expect(report.evidence.acquisition).toMatchObject({
+      seal: "SEALED",
+      integrity: "VERIFIED",
+      computed: "ACQUIRED_REPRODUCED",
+    });
+    expect(report.evidence.observation).toMatchObject({
+      seal: "SEALED",
+      integrity: { ok: true, problems: [] },
+      retention: { status: "COMPLETE", reasons: [] },
+      acquisitionBinding: "REPRODUCED",
+    });
+    // The SIGTERM removal still ran; the SIGINT listener the source kept is reported.
+    expect(h.counters.removals).toBe(CPMM_OBSERVATION_SIGNALS.length);
+    expect(h.installed.get("SIGTERM")).toEqual([]);
+    expect(h.installed.get("SIGINT")).toHaveLength(1);
+    expect(h.logs).toContain("[LIVE] Entry-point cleanup failures: SIGNAL_REMOVE_FAILED:SIGINT");
+    expect(h.logs).toContain(
+      `[LIVE] Exit code ${X.CLEANUP_FAILED}. Ends here: no follow-up, retry or reacquisition.`,
+    );
+    expect(JSON.parse(h.logs.at(-1)!)).toEqual(JSON.parse(JSON.stringify(report)));
+    // The listener left attached, and every other retained one, is inert after the run.
+    const logs = [...h.logs];
+    const before = JSON.stringify(r);
+    h.fire("SIGINT");
+    for (const l of h.captured) l();
+    await h.to(AFTER_ALL + 120_000);
+    expect(h.logs).toEqual(logs);
+    expect(JSON.stringify(r)).toBe(before);
+    expect(h.calls).toHaveLength(3);
+    expect(h.queue.size).toBe(0);
+    expectCredentialFree(h, r);
+
+    // Both removals fail: both are reported in order; a failed run keeps its own exit code.
+    const f = harness({
+      acquisition: (_n, req) =>
+        Response.json({ jsonrpc: "2.0", id: req.id, error: { code: -32005, message: "x" } }),
+      onBeforeRemove: () => {
+        throw new Error(SECRET);
+      },
+    });
+    const p2 = start(f, LIVE_ARGS());
+    await f.to(OBS_START + 10_000);
+    const r2 = await p2;
+    expect(r2.exitCode).toBe(X.RUN_FAILED);
+    expect(r2.report!.entryPoint.signalCleanupFailures).toEqual([
+      "SIGNAL_REMOVE_FAILED:SIGINT",
+      "SIGNAL_REMOVE_FAILED:SIGTERM",
+    ]);
+    expect(f.counters.removals).toBe(2);
+    expectCredentialFree(f, r2);
+  });
+
+  it("OC18: a listener attached by a registration that then throws is removed as well", async () => {
+    const D = CPMM_OBSERVATION_DEPENDENCY_ERRORS;
+    const attachThenThrow = (event: CpmmObservationSignal) => {
+      if (event === "SIGTERM") throw new Error(`[INVALID_CONFIGURATION] ${SECRET}`);
+    };
+    const h = harness({ onInstalled: attachThenThrow });
+    let caught: unknown = null;
+    try {
+      await runCpmmPoolObservationCli(LIVE_ARGS(), h.deps());
+    } catch (err) {
+      caught = err;
+    }
+    expect([...h.installed.values()].flat()).toEqual([]);
+    expect(printableError(caught).includes(SECRET)).toBe(false);
+    expect(printableError(caught)).toBe(D.signalInstall);
+    expect(h.counters).toMatchObject({ installs: 2, removals: 2 });
+    expect(h.calls).toHaveLength(0);
+    expect(h.queue.size).toBe(0);
+    expect(readdirSync(h.root)).toEqual([]);
+
+    // A removal failing as well is named in the (fixed) refusal; what stays attached is inert.
+    const g = harness({
+      onInstalled: attachThenThrow,
+      onBeforeRemove: (event) => {
+        if (event === "SIGINT") throw new Error(SECRET);
+      },
+    });
+    let caught2: unknown = null;
+    try {
+      await runCpmmPoolObservationCli(LIVE_ARGS(), g.deps());
+    } catch (err) {
+      caught2 = err;
+    }
+    expect(printableError(caught2)).toBe(
+      `${D.signalInstall}; listener cleanup failed: SIGNAL_REMOVE_FAILED:SIGINT`,
+    );
+    expect(g.installed.get("SIGINT")).toHaveLength(1);
+    expect(g.installed.get("SIGTERM")).toEqual([]);
+    const logs = [...g.logs];
+    g.fire("SIGINT");
+    for (const l of g.captured) l();
+    await flush();
+    expect(g.logs).toEqual(logs);
+    expect(g.calls).toHaveLength(0);
+    expect(g.queue.size).toBe(0);
+  });
+
+  it("OC19: the plan places each bundle's sealing correctly and claims no hard wall-clock bound", async () => {
+    const plan = buildCpmmObservationPlan({
+      mode: "DRY_RUN",
+      runId: "r-1",
+      target: TARGET,
+      acquisitionDir: acquisitionRel("r-1"),
+      observationDir: observationRel("r-1"),
+    });
+    expect(plan.localOverhead).toMatchObject({
+      network: "NONE",
+      acquisitionEvidence: "SEALED_AND_VERIFIED_BEFORE_OBSERVATION_WITHIN_SESSION_LIFETIME",
+      observationEvidence: "SEALED_AND_VERIFIED_AFTER_SESSION_SHUTDOWN",
+      hardWallClockBound: false,
+      shutdownFallback: { graceMs: CPMM_OBSERVATION_SHUTDOWN_GRACE_MS },
+    });
+    expect(plan.localOverhead).not.toHaveProperty("timedBySessionLifetime");
+    expect(plan.localOverhead.description).not.toMatch(/bounded by the evidence size limits/);
+    // The real run agrees: the acquisition is sealed and verified before the connection exists,
+    // and the observation bundle appears only after it.
+    const seen: { acquisition: string[]; observation: boolean }[] = [];
+    const { h, r } = await liveRun(
+      {
+        onClient: (x) =>
+          seen.push({
+            acquisition: readdirSync(acquisitionDirOf(x.root, "run-t")),
+            observation: existsSync(observationDirOf(x.root, "run-t")),
+          }),
+      },
+      "run-t",
+    );
+    expect(r.exitCode).toBe(X.OK);
+    expect(seen).toHaveLength(1);
+    expect(seen[0]!.acquisition).toContain("evidence-manifest.json");
+    expect(seen[0]!.observation).toBe(false);
+    expect(existsSync(observationDirOf(h.root, "run-t"))).toBe(true);
+    expect(r.report!.execution.sessionStopReason).not.toBeNull();
+  });
 });

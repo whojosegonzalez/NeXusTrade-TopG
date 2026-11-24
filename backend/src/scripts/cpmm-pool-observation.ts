@@ -15,18 +15,21 @@
  *   loads configuration or credentials, so transaction re-analysis is reported as unavailable.
  *
  * There is no discovery, target selection, retry, reconnect, fallback or follow-up. Credential
- * values, raw configuration and free exception text are never printed.
+ * values, raw configuration and free exception text are never printed: only refusals this entry
+ * point creates itself carry text; any other error prints a fixed code.
  *
  * Exit codes: 0 help, dry run, or a successful run (or verification) with complete, reproduced
  * evidence; 1 invalid arguments, configuration, output location or setup refusal (nothing
  * opened or written), or an unexpected error; 2 evidence intact but limited (incomplete retention
  * or re-derivation not reproduced); 3 the run failed with its evidence intact; 4 evidence not
  * verified (integrity, acquisition binding or a re-derivation mismatch); 5 a bundle could not be
- * sealed (nothing reacquired); 6 cancelled, with its evidence intact.
+ * sealed (nothing reacquired); 6 cancelled, with its evidence intact; 7 the run would have
+ * exited 0 or 2, but a signal listener could not be removed.
  */
 import { createHash } from "node:crypto";
-import { existsSync } from "node:fs";
+import { existsSync, realpathSync } from "node:fs";
 import path from "node:path";
+import { fileURLToPath } from "node:url";
 import { parseArgs } from "node:util";
 import type { CpmmWsClientConstructor } from "../candidate-scanner/CpmmPoolWebSocketTransport.js";
 import type { PaperRequestSessionTimers } from "../candidate-scanner/PaperRequestSession.js";
@@ -204,7 +207,18 @@ export const CPMM_OBSERVATION_EXIT_CODES = Object.freeze({
   EVIDENCE_NOT_VERIFIED: 4,
   SEAL_FAILED: 5,
   CANCELLED: 6,
+  CLEANUP_FAILED: 7,
 });
+
+/**
+ * Upper bound on graceful shutdown once the result is known. The exit code is set and the event
+ * loop drains: an idle HTTP connection or a closing socket may still be releasing its handle, and
+ * exiting at once can tear it down (assessment §8.38.19, `UV_HANDLE_CLOSING`). Only a process still
+ * alive past this bound is forced to exit, with the same code and a fixed notice. The timer is
+ * unref'd, so it never delays a process that drains on its own.
+ */
+export const CPMM_OBSERVATION_SHUTDOWN_GRACE_MS = 5_000;
+export const CPMM_OBSERVATION_SHUTDOWN_FORCED_NOTICE = "[CPMM_POOL_OBSERVATION_SHUTDOWN_FORCED]";
 
 export const CPMM_OBSERVATION_USAGE = [
   "Usage: cpmm-pool-observation --help",
@@ -220,7 +234,8 @@ export const CPMM_OBSERVATION_USAGE = [
   "  --verify <dir>       Verify a sealed observation bundle offline (no configuration loaded).",
   "  --acquisition-dir <dir>  Its acquisition bundle (required with --verify).",
   "Exit codes: 0 succeeded or informational, 1 invalid input or error, 2 evidence limited,",
-  "            3 run failed, 4 evidence not verified, 5 sealing failed, 6 cancelled.",
+  "            3 run failed, 4 evidence not verified, 5 sealing failed, 6 cancelled,",
+  "            7 a signal listener could not be removed (otherwise 0 or 2).",
 ].join("\n");
 
 export type CpmmObservationSignal = "SIGINT" | "SIGTERM";
@@ -298,6 +313,8 @@ export interface CpmmObservationCliReport {
   };
   readonly evidence: CpmmObservationEvidenceReport;
   readonly flags: typeof CPMM_EVIDENCE_FALSE_FLAGS;
+  /** The entry point's own cleanup, outside the core's frozen result. */
+  readonly entryPoint: { readonly signalCleanupFailures: readonly string[] };
 }
 
 export interface CpmmObservationCliResult {
@@ -406,11 +423,18 @@ export function buildCpmmObservationPlan(input: {
       },
     },
     localOverhead: {
-      timedBySessionLifetime: false,
       network: "NONE",
+      acquisitionEvidence: "SEALED_AND_VERIFIED_BEFORE_OBSERVATION_WITHIN_SESSION_LIFETIME",
+      observationEvidence: "SEALED_AND_VERIFIED_AFTER_SESSION_SHUTDOWN",
+      hardWallClockBound: false,
       description:
-        "After the session stops, both bundles are sealed and verified locally: file writes and offline re-derivation only, no request or connection. This time is not part of the session lifetime; it is bounded by the evidence size limits below.",
-      bounds: {
+        "Sealing and verification are local file writes and offline re-derivation only, with no request or connection. The acquisition bundle is sealed and verified after the snapshot and before observation, while the shared session lifetime runs: that time uses the lifetime, and observation starts only if the remaining lifetime still covers the owner's ceiling. The observation bundle is sealed and verified after the session has shut down, outside the session lifetime. The data bounds below limit how much is written and read, not how long it takes: no hard wall-clock bound applies to local sealing and verification.",
+      shutdownFallback: {
+        graceMs: CPMM_OBSERVATION_SHUTDOWN_GRACE_MS,
+        description:
+          "Separate from the run: once the result is known the exit code is set and the process drains; only a process still alive this long afterwards is forced to exit with the same code. It does not bound sealing or verification, which finish before the result.",
+      },
+      dataBounds: {
         sanitizerMaxPayloadBytesPerFile: EVIDENCE_SANITIZER_LIMITS.maxPayloadBytes,
         verifierMaxManifestBytes: CPMM_EVIDENCE_VERIFIER_LIMITS.maxManifestBytes,
         verifierMaxFileBytes: CPMM_EVIDENCE_VERIFIER_LIMITS.maxFileBytes,
@@ -453,7 +477,18 @@ export function isSolanaAddress(s: string): boolean {
   return zeros + bytes === 32;
 }
 
-const cliError = (message: string) => new Error(`[CLI_INVALID_ARG] ${message}`);
+/**
+ * Refusals this entry point creates, with fixed text. Only these are printed as text: a
+ * dependency's error is never trusted for its message, whatever prefix it carries.
+ */
+const trustedRefusals = new WeakSet<Error>();
+function refusal(message: string): Error {
+  const err = new Error(message);
+  trustedRefusals.add(err);
+  return Object.freeze(err);
+}
+
+const cliError = (message: string) => refusal(`[CLI_INVALID_ARG] ${message}`);
 
 type Parsed =
   | { readonly mode: "HELP" }
@@ -643,9 +678,25 @@ export function cpmmObservationVerifyExitCode(evidence: CpmmObservationEvidenceR
 const sealText = (s: { readonly ok: boolean; readonly code?: string } | null) =>
   s === null ? "NOT_SEALED" : s.ok ? "SEALED" : `FAILED:${s.code ?? "UNKNOWN"}`;
 
+/**
+ * The exit code of the process: the run's own code, except that a listener the entry point could
+ * not remove turns a successful or limited run into a cleanup failure.
+ */
+export function cpmmObservationCliExitCode(
+  runExitCode: number,
+  signalCleanupFailures: readonly string[],
+): number {
+  const X = CPMM_OBSERVATION_EXIT_CODES;
+  if (signalCleanupFailures.length === 0) return runExitCode;
+  return runExitCode === X.OK || runExitCode === X.EVIDENCE_LIMITED
+    ? X.CLEANUP_FAILED
+    : runExitCode;
+}
+
 export function cpmmObservationReport(
   projectRoot: string,
   r: CpmmObservationRunResult,
+  signalCleanupFailures: readonly string[] = [],
 ): CpmmObservationCliReport {
   const acqSeal = r.acquisitionEvidence.seal;
   const obsSeal = r.observationEvidence.seal;
@@ -680,6 +731,7 @@ export function cpmmObservationReport(
       observation: r.observationEvidence.verification,
     }),
     flags: CPMM_EVIDENCE_FALSE_FLAGS,
+    entryPoint: { signalCleanupFailures: [...signalCleanupFailures] },
   };
 }
 
@@ -718,19 +770,19 @@ export const CPMM_OBSERVATION_CONFIG_ERRORS = Object.freeze({
   fragment: "[INVALID_CONFIGURATION] SOLANA_RPC_URL and SOLANA_WS_URL must not contain a fragment",
 });
 
-const errorCode = (err: unknown) => {
-  const m = /^\[([A-Z0-9_]+)\]/.exec(err instanceof Error ? err.message : "");
-  return m ? m[1]! : "UNEXPECTED_ERROR";
-};
-/** Errors raised by this entry point carry fixed text only; anything else prints its code. */
-const OWN_ERROR_CODES = new Set([
-  "CLI_INVALID_ARG",
-  "OUTPUT_EXISTS",
-  "MISSING_CONFIGURATION",
-  "INVALID_CONFIGURATION",
-]);
+/** Fixed refusals for a failing dependency: its own error text is withheld. */
+export const CPMM_OBSERVATION_DEPENDENCY_ERRORS = Object.freeze({
+  configurationLoad:
+    "[CONFIGURATION_LOAD_FAILED] the configuration loader failed; its error text is withheld",
+  endpointRefused: "[INVALID_CONFIGURATION] the endpoint resolver refused the configuration",
+  webSocketClientLoad:
+    "[WS_CLIENT_LOAD_FAILED] the WebSocket client could not be loaded; its error text is withheld",
+  signalInstall:
+    "[SIGNAL_INSTALL_FAILED] a signal listener could not be installed; the run did not start",
+});
+
 export const printableError = (err: unknown): string =>
-  OWN_ERROR_CODES.has(errorCode(err)) && err instanceof Error ? err.message : `[${errorCode(err)}]`;
+  err instanceof Error && trustedRefusals.has(err) ? err.message : "[UNEXPECTED_ERROR]";
 
 const sha256 = (s: string) => createHash("sha256").update(s).digest("hex");
 
@@ -809,7 +861,7 @@ export async function runCpmmPoolObservationCli(
   const observationDir = path.join(projectRoot, ...CPMM_EVIDENCE_ROOT_SEGMENTS, parsed.runId);
   for (const dir of [acquisitionDir, observationDir]) {
     if (existsSync(dir)) {
-      throw new Error(
+      throw refusal(
         `[OUTPUT_EXISTS] ${rel(projectRoot, dir)} already exists; refusing to overwrite`,
       );
     }
@@ -840,24 +892,36 @@ export async function runCpmmPoolObservationCli(
   // ------------------------------------------------------------------------------------------
   // --live: configuration is loaded only here, after every argument and output check.
   // ------------------------------------------------------------------------------------------
-  await (deps.loadEnvironment ?? loadConfiguredEnvironment)();
+  const D = CPMM_OBSERVATION_DEPENDENCY_ERRORS;
+  try {
+    await (deps.loadEnvironment ?? loadConfiguredEnvironment)();
+  } catch {
+    throw refusal(D.configurationLoad);
+  }
   const env = deps.env ?? process.env;
-  const { resolveSolanaEndpoints } = await import("./paper-single-candidate-diagnostic.js");
+  const { resolveSolanaEndpoints, SOLANA_ENDPOINT_ERRORS } =
+    await import("./paper-single-candidate-diagnostic.js");
   const endpoints = resolveSolanaEndpoints(env);
-  if (!endpoints.ok) throw new Error(endpoints.error);
+  if (!endpoints.ok) {
+    const known: readonly string[] = Object.values(SOLANA_ENDPOINT_ERRORS);
+    throw refusal(known.includes(endpoints.error) ? endpoints.error : D.endpointRefused);
+  }
   if (endpoints.wsSource !== "SOLANA_WS_URL")
-    throw new Error(CPMM_OBSERVATION_CONFIG_ERRORS.wsExplicit);
+    throw refusal(CPMM_OBSERVATION_CONFIG_ERRORS.wsExplicit);
   // With an https RPC endpoint the resolver already refuses any explicit stream URL but wss.
   if (new URL(endpoints.rpcUrl).protocol !== "https:")
-    throw new Error(CPMM_OBSERVATION_CONFIG_ERRORS.rpcHttps);
+    throw refusal(CPMM_OBSERVATION_CONFIG_ERRORS.rpcHttps);
   if (endpoints.rpcUrl.includes("#") || endpoints.wsUrl.includes("#"))
-    throw new Error(CPMM_OBSERVATION_CONFIG_ERRORS.fragment);
+    throw refusal(CPMM_OBSERVATION_CONFIG_ERRORS.fragment);
 
   // Real transport dependencies are loaded only after every check above.
   const fetchFn = deps.fetchFn ?? globalThis.fetch;
-  const webSocketClientConstructor = await (
-    deps.loadWebSocketConstructor ?? loadInstalledWebSocket
-  )();
+  let webSocketClientConstructor: CpmmWsClientConstructor;
+  try {
+    webSocketClientConstructor = await (deps.loadWebSocketConstructor ?? loadInstalledWebSocket)();
+  } catch {
+    throw refusal(D.webSocketClientLoad);
+  }
 
   log(`[LIVE] Profile: ${CPMM_OBSERVATION_PROFILE_LABEL} (${CPMM_OBSERVATION_PROFILE_STATUS})`);
   log(`[LIVE] ${CPMM_OBSERVATION_LIVE_FLAG_MEANING}`);
@@ -865,43 +929,73 @@ export async function runCpmmPoolObservationCli(
 
   const signals = deps.signals ?? process;
   const controller = new AbortController();
-  const onSignal = () => controller.abort();
-  const installed: CpmmObservationSignal[] = [];
-  let result: CpmmObservationRunResult;
+  // A listener the source fails to remove may stay attached; it must do nothing after the run.
+  let listening = true;
+  const listeners = new Map(
+    CPMM_OBSERVATION_SIGNALS.map((s) => [
+      s,
+      () => {
+        if (!listening || controller.signal.aborted) return;
+        log(`[LIVE] ${s} received: cancelling the run; the core still seals what it has`);
+        controller.abort();
+      },
+    ]),
+  );
+  // Recorded before each registration: one that attaches and then throws is still removed.
+  const attempted: CpmmObservationSignal[] = [];
+  const signalCleanupFailures: string[] = [];
+  let installFailed = false;
+  let result: CpmmObservationRunResult | null = null;
   try {
-    for (const s of CPMM_OBSERVATION_SIGNALS) {
-      signals.on(s, onSignal);
-      installed.push(s);
+    try {
+      for (const s of CPMM_OBSERVATION_SIGNALS) {
+        attempted.push(s);
+        signals.on(s, listeners.get(s)!);
+      }
+    } catch {
+      installFailed = true;
     }
-    result = await runCpmmPoolObservation({
-      projectRoot,
-      runId: parsed.runId,
-      target: { ...parsed.target },
-      endpoints: { rpcUrl: endpoints.rpcUrl, streamUrl: endpoints.wsUrl },
-      secrets: [],
-      fetchFn,
-      webSocketClientConstructor,
-      clock: deps.clock ?? (() => Date.now()),
-      timers: deps.timers ?? defaultTimers,
-      signal: controller.signal,
-      componentVersions: { ...CPMM_OBSERVATION_COMPONENT_VERSIONS },
-      epoch: CPMM_OBSERVATION_RUN_CONSTANTS.epoch,
-      subscribeRequestId: CPMM_OBSERVATION_RUN_CONSTANTS.subscribeRequestId,
-      unsubscribeRequestId: CPMM_OBSERVATION_RUN_CONSTANTS.unsubscribeRequestId,
-      limits: L,
-    });
+    if (!installFailed)
+      result = await runCpmmPoolObservation({
+        projectRoot,
+        runId: parsed.runId,
+        target: { ...parsed.target },
+        endpoints: { rpcUrl: endpoints.rpcUrl, streamUrl: endpoints.wsUrl },
+        secrets: [],
+        fetchFn,
+        webSocketClientConstructor,
+        clock: deps.clock ?? (() => Date.now()),
+        timers: deps.timers ?? defaultTimers,
+        signal: controller.signal,
+        componentVersions: { ...CPMM_OBSERVATION_COMPONENT_VERSIONS },
+        epoch: CPMM_OBSERVATION_RUN_CONSTANTS.epoch,
+        subscribeRequestId: CPMM_OBSERVATION_RUN_CONSTANTS.subscribeRequestId,
+        unsubscribeRequestId: CPMM_OBSERVATION_RUN_CONSTANTS.unsubscribeRequestId,
+        limits: L,
+      });
   } finally {
-    for (const s of installed) {
+    listening = false;
+    for (const s of attempted) {
       try {
-        signals.removeListener(s, onSignal);
+        signals.removeListener(s, listeners.get(s)!);
       } catch {
-        // Nothing else to detach; the run's result is unaffected.
+        signalCleanupFailures.push(`SIGNAL_REMOVE_FAILED:${s}`);
       }
     }
   }
+  if (installFailed || result === null) {
+    throw refusal(
+      signalCleanupFailures.length === 0
+        ? D.signalInstall
+        : `${D.signalInstall}; listener cleanup failed: ${signalCleanupFailures.join(", ")}`,
+    );
+  }
 
-  const report = cpmmObservationReport(projectRoot, result);
-  const exitCode = cpmmObservationLiveExitCode(result, report.evidence);
+  const report = cpmmObservationReport(projectRoot, result, signalCleanupFailures);
+  const exitCode = cpmmObservationCliExitCode(
+    cpmmObservationLiveExitCode(result, report.evidence),
+    signalCleanupFailures,
+  );
   const e = report.execution;
   log(`[LIVE] Execution: ${e.status}; first failure: ${e.firstFailure ?? "none"}`);
   log(
@@ -910,6 +1004,8 @@ export async function runCpmmPoolObservationCli(
   log(
     `[LIVE] Cleanup failures: ${e.cleanupFailures.length ? e.cleanupFailures.join(", ") : "none"}`,
   );
+  const cleanup = report.entryPoint.signalCleanupFailures;
+  log(`[LIVE] Entry-point cleanup failures: ${cleanup.length ? cleanup.join(", ") : "none"}`);
   log(
     `[LIVE] Session stop: ${e.sessionStopReason ?? "none"}; owner terminal cause: ${e.ownerTerminalCause ?? "not started"}`,
   );
@@ -924,16 +1020,7 @@ export async function runCpmmPoolObservationCli(
   return { mode: "LIVE", exitCode, planDigestSha256, report };
 }
 
-/**
- * Upper bound on graceful shutdown once the result is known. The exit code is set and the event
- * loop drains: an idle HTTP connection or a closing socket may still be releasing its handle, and
- * exiting at once can tear it down (assessment §8.38.19, `UV_HANDLE_CLOSING`). Only a process still
- * alive past this bound is forced to exit, with the same code and a fixed notice. The timer is
- * unref'd, so it never delays a process that drains on its own.
- */
-export const CPMM_OBSERVATION_SHUTDOWN_GRACE_MS = 5_000;
-export const CPMM_OBSERVATION_SHUTDOWN_FORCED_NOTICE = "[CPMM_POOL_OBSERVATION_SHUTDOWN_FORCED]";
-
+/** Settles the process with the shutdown backstop (`CPMM_OBSERVATION_SHUTDOWN_GRACE_MS`). */
 export function settleCpmmObservationProcess(
   exitCode: number,
   graceMs: number = CPMM_OBSERVATION_SHUTDOWN_GRACE_MS,
@@ -946,8 +1033,32 @@ export function settleCpmmObservationProcess(
   backstop.unref();
 }
 
-const invoked = process.argv[1] === undefined ? "" : path.basename(process.argv[1]);
-if (invoked === "cpmm-pool-observation.ts" || invoked === "cpmm-pool-observation.js") {
+/**
+ * A file's identity: its real path, or null if it cannot be resolved. The native resolver also
+ * returns the on-disk case and separators on Windows, so differently spelled paths agree.
+ */
+function fileIdentity(file: string): string | null {
+  try {
+    return realpathSync.native(path.resolve(file));
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Whether the process was started with this file as its entry point. A file elsewhere with the
+ * same name that imports this module is not this file, so importing never runs the CLI.
+ */
+export function isCpmmObservationMainModule(
+  entryArg: string | undefined,
+  moduleUrl: string,
+): boolean {
+  if (entryArg === undefined || entryArg === "") return false;
+  const entry = fileIdentity(entryArg);
+  return entry !== null && entry === fileIdentity(fileURLToPath(moduleUrl));
+}
+
+if (isCpmmObservationMainModule(process.argv[1], import.meta.url)) {
   runCpmmPoolObservationCli(process.argv.slice(2))
     .then((r) => settleCpmmObservationProcess(r.exitCode))
     .catch((err: unknown) => {
