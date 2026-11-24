@@ -120,11 +120,11 @@ In `CpmmPoolConnectionOwner.ts` (lines 979–1006, 1318–1336), all lifecycle c
 
 ### 3.2 Framing of the 25-Second Drain Window
 
-The 25,000 ms drain window is a **deliberate cutoff**, not an assumption that 10 retrievals are queued:
+The 25,000 ms drain window is a **deliberate cutoff**, not an assumption about settling time:
 
 - The owner maintains at most 4 outstanding handoffs at any moment; there is no queue of 10 requests.
 - Each `getTransaction` request requires minimum 2,500 ms dispatch spacing, plus network RTT and up to 10,000 ms request timeout.
-- A trailing set of up to 4 outstanding handoffs in flight when unsubscription completes may take $4 \times 2{,}500\text{ ms} + \sum \text{RTT} \approx 10\text{ s} - 25\text{ s}$ to settle.
+- Rather than estimating settling time or waiting indefinitely for in-flight requests, 25 seconds is enforced as a strict, deliberate cutoff bounding post-observation wait.
 - If in-flight work or trailing handoffs do not settle before `drainDeadlineMs` ($t_0 + 330{,}000\text{ ms}$), the owner halts fail-closed with `DRAIN_EXPIRED` (exit 3) and records pending work truthfully in `session-ledger.json`.
 
 ---
@@ -155,16 +155,16 @@ All HTTP requests share a single strict session budget on `SOLANA_RPC`. There ar
 - **Subscriptions**: exactly 1 `logsSubscribe` on the pool address; 1 `logsUnsubscribe`.
 - **Ping interval**: 20,000 ms.
 - **Pong timeout**: 5,000 ms.
-- **Exact ping count derivation**:
-  - Pings are dispatched only when `pongBy = now + pongTimeoutMs < nominalEndMs`.
+- **Punctual synthetic ping schedule and timer delays**:
+  - Client keepalive pings are dispatched only when `pongBy = now + pongTimeoutMs < nominalEndMs`.
   - With $t_0 = 0$, `nominalEndMs = 300,000`, `pingIntervalMs = 20,000`, `pongTimeoutMs = 5,000`:
-    - Dispatches occur at $t = 20\text{s}, 40\text{s}, 60\text{s}, \dots, 280\text{s}$ (14 pings). For each, $\text{pongBy} = t + 5\text{s} \le 285\text{s} < 300\text{s}$.
+    - Dispatches occur punctually at $t = 20\text{s}, 40\text{s}, 60\text{s}, \dots, 280\text{s}$ (14 pings). For each, $\text{pongBy} = t + 5\text{s} \le 285\text{s} < 300\text{s}$.
     - At $t = 300\text{s}$, `now >= nominalEndMs` triggers unsubscription, and $\text{pongBy} = 305\text{s} \ge 300\text{s}$ suppresses any 15th ping.
-  - Therefore, in a clean 300-second run, **exactly 14 client pings** are dispatched, matched by 14 received pongs.
+  - In a synthetic test with zero timer drift, **exactly 14 client pings** are dispatched, matched by 14 received pongs. In a live runtime with real timer delays or event-loop jitter, fewer pings may be dispatched within the observation window; 14 represents the punctual synthetic schedule ceiling.
 - **Control frame limits**:
   - `pings`: limit 16 (dispatched by client; accommodates 14 clean pings with headroom of 2).
   - `pongReplies`: limit 16 (replies to server-initiated pings).
-  - `maxControlFrames`: 36 frames of at most 125 bytes.
+  - `maxControlFrames`: 36 frames of at most 125 bytes. Crucially, `CpmmPoolConnectionOwner` tracks `controlFrames` as **incoming** control frames: `this.pingsReceived + this.pongsReceived` (incoming pings from server + incoming pongs from server). Outgoing client keepalive pings are counted separately by client dispatch limits (`pings: 16`), not by `controlFrames`. A clean run with 14 received pongs and 0 server pings registers 14 incoming control frames (well within the 36-frame ceiling).
 - **Wrapper limits**: 65,536 bytes per frame, 16 fragments, 64 buffered chunks, handshake timeout 5,000 ms, close timeout 5,000 ms.
 
 ---
@@ -220,12 +220,13 @@ The Step 6 proposal explicitly accounts for all findings identified during rehea
 5. **F5: Duplicate details truncation**:
    - At most 4 duplicate details are retained per signature. A 5th duplicate marks retention `INCOMPLETE` (exit 2).
    - _Evidence status_: Exit 2 is a non-failing terminal state that faithfully reports incomplete retention without triggering retries.
-6. **F6: Control-frame limit binds only in an unclean run**:
-   - A clean run sees 14 client pings and 14 server pongs. Reaching 36 control frames requires unsolicited pongs or server ping floods, which already mark the run unclean.
+6. **F6: Control-frame and retention limits bind only in an unclean run**:
+   - The owner's `maxControlFrames = 36` counts incoming control frames (`this.pingsReceived + this.pongsReceived`). A punctual clean run with 14 incoming pongs and 0 incoming pings registers 14 incoming control frames. Reaching 36 incoming control frames requires unsolicited pongs or server ping floods, ending the run fail-closed with `CONTROL_FRAME_LIMIT:INCOMING_CONTROL_FRAMES` (exit 3); a 17th server ping triggers `CONTROL_FRAME_LIMIT:PONG_REPLY_LIMIT` (exit 3).
+   - In parallel, the observation recorder's retention limit `maxControlRecords = 64` bounds recorded control events (outgoing calls, completions, and incoming events). A punctual clean run generates 42 control records ($14 \times 3 \le 64$), keeping retention `COMPLETE`. A server ping flood (e.g. 16 server pings + 14 keepalive pings = 90 records) reaches the retention boundary, safely dropping excess control records and reporting `INCOMPLETE` retention with reason `RECORDS_DROPPED:control` (exit 2).
 7. **F7: Lifetime allowance for acquisition sealing**:
    - Acquisition plus local sealing and verification must finish within 20,000 ms of session open. Past that, the stage boundary check halts the run before any WebSocket connection is established.
-8. **F8: Sanitizer encoding limitation**:
-   - The sanitizer detects literal, escaped, URL, and raw binary forms of endpoint credentials. It does not detect re-encoded credentials (base64, hex, compression) inside arbitrary payloads.
+8. **F8: Sanitizer encoding coverage and limitations**:
+   - The sanitizer detects and redacts literal, escaped, URL-encoded, and raw binary/decoded UTF-8 forms of endpoint credentials and secrets before diagnostic or file output. It does not detect arbitrary re-encoded credentials (such as arbitrary nested base64, hex, or compressed payloads) inside unstructured payloads; this remains a recognized architectural limitation.
 
 ---
 
@@ -269,20 +270,20 @@ Across all possible outcomes:
 
 ## 8. Detailed Profile Comparison
 
-| Group                        | Step 5 Profile (`PROPOSED_SHORT_OBSERVATION_PROFILE_V1`) | Step 6 Proposed Profile (`PROPOSED_EXTENDED_OBSERVATION_PROFILE_V1`) | Rationale                                   |
-| :--------------------------- | :------------------------------------------------------- | :------------------------------------------------------------------- | :------------------------------------------ |
-| **Session Lifetime**         | 105,000 ms (1m 45s)                                      | **350,000 ms (5m 50s)**                                              | Extended observation window                 |
-| **Observation Duration**     | 60,000 ms (1m)                                           | **300,000 ms (5m)**                                                  | $5\times$ window to capture trade activity  |
-| **HTTP Attempts Ceiling**    | 10 (2 acq + at most 8 retrievals)                        | **30 (2 acq + at most 28 retrievals)**                               | Headroom for multiple swap cycles           |
-| **Pacing (`SOLANA_RPC`)**    | 2,500 ms minimum dispatch spacing                        | **2,500 ms minimum dispatch spacing**                                | Strict RPC rate limit preservation          |
-| **Outstanding Limit**        | 4 hand-offs (`maxOutstandingResolutions`)                | **4 hand-offs (`maxOutstandingResolutions`)**                        | Preserves accepted owner contract           |
-| **Pings Dispatched (Clean)** | 2 client pings (at 20s, 40s)                             | **14 client pings (at 20s, 40s, ..., 280s)**                         | Exact derivation from deadline math         |
-| **Ping / Pong Reply Limits** | 3 pings / 4 pong replies                                 | **16 pings / 16 pong replies**                                       | Bounded headroom for extended window        |
-| **Control Frames Limit**     | 16 frames                                                | **36 frames**                                                        | Accommodates 14 pings + 14 pongs + headroom |
-| **Drain Window**             | 20,000 ms                                                | **25,000 ms**                                                        | Deliberate cutoff bounding post-obs wait    |
-| **Collector Epoch Bytes**    | 1,048,576 bytes (1 MB)                                   | **2,097,152 bytes (2 MB)**                                           | Accommodates 5m of notifications            |
-| **Exchange Records**         | 16 records                                               | **32 records**                                                       | Accommodates up to 30 exchanges             |
-| **Exchange Body Storage**    | 2,621,440 bytes                                          | **8,388,608 bytes (8 MB)**                                           | Safe bound for 30 full responses            |
+| Group                        | Step 5 Profile (`PROPOSED_SHORT_OBSERVATION_PROFILE_V1`) | Step 6 Proposed Profile (`PROPOSED_EXTENDED_OBSERVATION_PROFILE_V1`) | Rationale                                                           |
+| :--------------------------- | :------------------------------------------------------- | :------------------------------------------------------------------- | :------------------------------------------------------------------ |
+| **Session Lifetime**         | 105,000 ms (1m 45s)                                      | **350,000 ms (5m 50s)**                                              | Extended observation window                                         |
+| **Observation Duration**     | 60,000 ms (1m)                                           | **300,000 ms (5m)**                                                  | $5\times$ window to capture trade activity                          |
+| **HTTP Attempts Ceiling**    | 10 (2 acq + at most 8 retrievals)                        | **30 (2 acq + at most 28 retrievals)**                               | Headroom for multiple swap cycles                                   |
+| **Pacing (`SOLANA_RPC`)**    | 2,500 ms minimum dispatch spacing                        | **2,500 ms minimum dispatch spacing**                                | Strict RPC rate limit preservation                                  |
+| **Outstanding Limit**        | 4 hand-offs (`maxOutstandingResolutions`)                | **4 hand-offs (`maxOutstandingResolutions`)**                        | Preserves accepted owner contract                                   |
+| **Pings Dispatched (Clean)** | 2 client pings (at 20s, 40s)                             | **14 client pings (at 20s, 40s, ..., 280s)**                         | Punctual synthetic ceiling; allows fewer with timer delays          |
+| **Ping / Pong Reply Limits** | 3 pings / 4 pong replies                                 | **16 pings / 16 pong replies**                                       | Bounded headroom for extended window                                |
+| **Control Frames Limit**     | 16 incoming frames                                       | **36 incoming frames**                                               | Incoming pings + pongs; accommodates 14 pongs + 16 pings + headroom |
+| **Drain Window**             | 20,000 ms                                                | **25,000 ms**                                                        | Deliberate cutoff bounding post-obs wait                            |
+| **Collector Epoch Bytes**    | 1,048,576 bytes (1 MB)                                   | **2,097,152 bytes (2 MB)**                                           | Accommodates 5m of notifications                                    |
+| **Exchange Records**         | 16 records                                               | **32 records**                                                       | Accommodates up to 30 exchanges                                     |
+| **Exchange Body Storage**    | 2,621,440 bytes                                          | **8,388,608 bytes (8 MB)**                                           | Safe bound for 30 full responses                                    |
 
 ---
 
@@ -293,7 +294,7 @@ Across all possible outcomes:
 To maintain strict modularity and zero regression:
 
 1. **Byte-Identical Preservation**:
-   - `PROPOSED_SHORT_OBSERVATION_PROFILE_V1` and its frozen SHA-256 digest (`8cd48f310f828a2a8ee09f2d126588db6449195b6c3674e2d4099fa7788da23f`) are preserved completely byte-identical.
+   - `PROPOSED_SHORT_OBSERVATION_PROFILE_V1` and its frozen SHA-256 digest (`8cd48f31a9dd8a157c91341dbee0acb0f773fbf2b29eef20ea4fb978f533cf78`) are preserved completely byte-identical.
 2. **Separately Selected Extended Profile**:
    - Introduce `PROPOSED_EXTENDED_OBSERVATION_PROFILE_V1` as a distinct frozen constant.
    - CLI selection via explicit flag: `--profile short` (default) vs `--profile extended`.
@@ -312,7 +313,7 @@ To maintain strict modularity and zero regression:
 
 | Test Case | Scenario & Focus                                                | Expected Exit | Expected Outcome & Evidence State                                                                                                                 |
 | :-------- | :-------------------------------------------------------------- | :------------ | :------------------------------------------------------------------------------------------------------------------------------------------------ |
-| **OC30**  | Extended profile schema & frozen digest validation              | 0             | Extended profile matches schema; digest matches frozen constant; short profile digest unchanged.                                                  |
+| **OC30**  | Extended profile schema & frozen digest validation              | 0             | Extended profile matches schema; digest matches frozen constant; short profile digest (`8cd48f31...`) unchanged.                                  |
 | **OC31**  | Timing budget inequality validation                             | 0             | $350{,}000\text{ ms} \ge 15{,}000 + 300{,}000 + 5{,}000 + \max(25{,}000, 5{,}000) = 345{,}000\text{ ms}$ verified; margin is $5{,}000\text{ ms}$. |
 | **OC32**  | Clean 300s run with zero notifications                          | 0             | Exactly 14 pings dispatched, 14 pongs received, clean unsubscription, exit 0, bundle verified offline.                                            |
 | **OC33**  | Active capture with moderate transaction rate ($N \in [1, 28]$) | 0             | Serialized 2,500 ms pacing enforced; signatures deduplicated; swaps decoded; vault balances updated; exit 0.                                      |
@@ -320,8 +321,8 @@ To maintain strict modularity and zero regression:
 | **OC35**  | HTTP attempt ceiling reached (28 retrievals exhausted)          | 3             | 29th signature refused; fails closed with `HTTP_ATTEMPT_CEILING_REACHED`; all 28 transactions sealed intact.                                      |
 | **OC36**  | Drain window expiration with trailing pending work (Finding F3) | 3             | In-flight work taking $> 25{,}000\text{ ms}$ triggers `DRAIN_EXPIRED`; pending work truthfully recorded in ledger.                                |
 | **OC37**  | Duplicate detail truncation (Finding F5)                        | 2             | 5th duplicate of a signature truncates duplicate details; retention marked `INCOMPLETE`; exit 2.                                                  |
-| **OC38**  | Refused oversized frame (Finding F2)                            | 3             | Frame $> 65{,}536\text{ bytes}$ refused by wrapper; reported in `transport-diagnostics.json`; exit 3.                                             |
-| **OC39**  | Credential protection under extended execution                  | 0             | Literal, escaped, URL, and base64 forms of credentials withheld from diagnostics and terminal output.                                             |
+| **OC38**  | Control-frame and retention limits (Finding F6)                 | 2 / 3         | 16 pings answered with pong replies, drops excess records at 64-record retention boundary (exit 2); 17th ping ends run with exit 3.               |
+| **OC39**  | Credential protection & cancellation under extended execution   | 6 / 3         | Cancellation exits 6; supported literal/URL/binary credentials redacted; retains arbitrary re-encoding limitation (Finding F8).                   |
 
 ---
 

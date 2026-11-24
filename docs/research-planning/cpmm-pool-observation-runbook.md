@@ -17,10 +17,10 @@ node backend/node_modules/tsx/dist/cli.mjs backend/src/scripts/cpmm-pool-observa
 **Dry run** (the default without `--live`; no configuration or credential loaded, no transport constructed, no request, nothing written):
 
 ```bash
-node backend/node_modules/tsx/dist/cli.mjs backend/src/scripts/cpmm-pool-observation.ts --pool <POOL> --mint <MINT> --run-id <RUN_ID>
+node backend/node_modules/tsx/dist/cli.mjs backend/src/scripts/cpmm-pool-observation.ts --pool <POOL> --mint <MINT> --run-id <RUN_ID> [--profile <short|extended>]
 ```
 
-It prints the profile label and status, the live status, the plan digest (SHA-256) and the full plan as JSON: target, output directories, the complete effective limits, the budget and the separate local overhead.
+It prints the profile label and status, the live status, the plan digest (SHA-256) and the full plan as JSON: target, output directories, the complete effective limits, the budget and the separate local overhead. Specifying `--profile extended` builds and displays the plan under the proposed extended limits.
 
 **Verify a sealed run** (read-only and offline; see §7):
 
@@ -40,7 +40,8 @@ For an empty-transaction capture like `cpmm-observation-01`, this verification e
 
 ## 2. Argument rules
 
-- The modes are `--help` (alone), `--pool --mint --run-id [--live]`, and `--verify <observation-dir> --acquisition-dir <acquisition-dir>`. Modes cannot be combined.
+- The modes are `--help` (alone), `--pool --mint --run-id [--profile <short|extended>] [--live]`, and `--verify <observation-dir> --acquisition-dir <acquisition-dir>`. Modes cannot be combined.
+- `--profile` optionally selects the observation profile (`short` [default] or `extended`). `--profile` cannot be combined with `--help` or `--verify`. Missing, unknown, or repeated `--profile` values are refused with `[CLI_INVALID_ARG]`. Both profiles remain strictly not approved for live use.
 - `--pool` and `--mint` must be canonical base58 encodings of exactly 32 bytes and must differ. There is no discovery, target selection or substitution.
 - `--run-id` matches `^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$` and names both bundles: `data/research/cpmm-acquisitions/<RUN_ID>` and `data/research/cpmm-observations/<RUN_ID>`. If either exists, the run is refused (`[OUTPUT_EXISTS]`) before any configuration is loaded, in the dry run too. Sealed bundles are never overwritten.
 - Unknown flags, positional arguments, repeated flags (including `--flag=value` forms) and missing values are refused with fixed text (`[CLI_INVALID_ARG]`). The refusal never echoes an argument.
@@ -52,9 +53,11 @@ For an empty-transaction capture like `cpmm-observation-01`, this verification e
 - Refusals are fixed messages (`[MISSING_CONFIGURATION]`, `[INVALID_CONFIGURATION]`) raised before `fetch` or the `ws` client is loaded, before any signal handler is installed and before anything is written.
 - Credential values, raw configuration and free exception text are never printed. Only refusals the entry point creates itself are printed as text; an error's own prefix is never trusted. A failing dependency gets a fixed refusal with its error text withheld: `[CONFIGURATION_LOAD_FAILED]` (the configuration loader), `[WS_CLIENT_LOAD_FAILED]` (the `ws` client) or `[SIGNAL_INSTALL_FAILED]` (a signal listener). Any other error prints only `[UNEXPECTED_ERROR]`. The core redacts both endpoint URLs from the evidence.
 
-## 4. Proposed profile `PROPOSED_SHORT_OBSERVATION_PROFILE_V1` (not approved)
+## 4. Proposed profiles (not approved)
 
-These are the complete effective limits the core receives in `--live`; nothing is overridden at run time. The dry run prints the same values.
+### Short profile `PROPOSED_SHORT_OBSERVATION_PROFILE_V1` (default)
+
+These are the complete effective limits the core receives in `--live` with `--profile short`; nothing is overridden at run time. The dry run prints the same values.
 
 | Group              | Proposed values                                                                                                                                                                                                                                                                                        |
 | ------------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
@@ -69,6 +72,24 @@ These are the complete effective limits the core receives in `--live`; nothing i
 | Evidence recorders | 10 pending exchange evidence; observation recorder: 160 incoming records (1,048,576 bytes), 8 outgoing (8,192 bytes), 64 control (8,192 bytes), 128 lifecycle, 16 exchanges (2,621,440 body bytes), 256 ledger calls, 16 instrumentation failures, 262,144 bytes per record, 200,000 finish-copy nodes |
 | Fan-out            | 8 retained failures                                                                                                                                                                                                                                                                                    |
 | Run constants      | epoch 1; subscribe request id 1; unsubscribe request id 2                                                                                                                                                                                                                                              |
+
+### Extended profile `PROPOSED_EXTENDED_OBSERVATION_PROFILE_V1`
+
+Selected via `--profile extended`. Both profiles remain strictly not approved for live use.
+
+| Group              | Proposed extended values                                                                                                                                                                                                                                                                                 |
+| ------------------ | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Session            | lifetime 350,000 ms; 30 HTTP attempts; request timeout 10,000 ms                                                                                                                                                                                                                                         |
+| Lanes              | `SOLANA_RPC` 30 attempts, pacing 2,500 ms, 262,144 bytes per response; `RUGCHECK`, `SOLANA_TRACKER` and `DEXSCREENER` 0 attempts                                                                                                                                                                         |
+| Acquisition        | duration 15,000 ms; timeout 5,000 ms; 16,384 bytes per response                                                                                                                                                                                                                                          |
+| Connection owner   | observation 300,000 ms; subscribe ack 10,000 ms; unsubscribe ack 5,000 ms; ping every 20,000 ms; pong 5,000 ms; 16 pings; 16 pong replies; 36 control frames of at most 125 bytes; 4 outstanding retrievals; 8 retained unprocessed; drain 25,000 ms; cleanup 5,000 ms                                   |
+| WebSocket wrapper  | 65,536 bytes per frame; 16 fragments; 64 buffered chunks; handshake 5,000 ms; close 5,000 ms                                                                                                                                                                                                             |
+| Collector          | 65,536 bytes per frame; 256 frames and 2,097,152 bytes per epoch; 257 retained frame records; 256 retained notifications; 1 epoch                                                                                                                                                                        |
+| Ledger             | 256 signature records; 4 duplicate details per record; 1 epoch                                                                                                                                                                                                                                           |
+| Transaction source | 256 tracked signatures; 262,144 bytes per response                                                                                                                                                                                                                                                       |
+| Evidence recorders | 30 pending exchange evidence; observation recorder: 320 incoming records (2,097,152 bytes), 16 outgoing (16,384 bytes), 64 control (8,192 bytes), 128 lifecycle, 32 exchanges (8,388,608 body bytes), 512 ledger calls, 16 instrumentation failures, 262,144 bytes per record, 400,000 finish-copy nodes |
+| Fan-out            | 8 retained failures                                                                                                                                                                                                                                                                                      |
+| Run constants      | epoch 1; subscribe request id 1; unsubscribe request id 2                                                                                                                                                                                                                                                |
 
 Values in the offline tests are test inputs, not approved live limits.
 

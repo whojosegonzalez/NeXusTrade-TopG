@@ -54,16 +54,21 @@ import {
 import { EVIDENCE_SANITIZER_LIMITS } from "./evidence-credential-sanitizer.js";
 
 // ---------------------------------------------------------------------------------------------
-// The proposed profile (for review; no live limit is approved)
+// The proposed profiles (for review; no live limit is approved)
 // ---------------------------------------------------------------------------------------------
 
 export const CPMM_OBSERVATION_PROFILE_LABEL = "PROPOSED_SHORT_OBSERVATION_PROFILE_V1" as const;
+export const CPMM_EXTENDED_OBSERVATION_PROFILE_LABEL =
+  "PROPOSED_EXTENDED_OBSERVATION_PROFILE_V1" as const;
 export const CPMM_OBSERVATION_PROFILE_STATUS =
   "PROPOSED_FOR_REVIEW_LIVE_LIMITS_NOT_APPROVED" as const;
 export const CPMM_OBSERVATION_LIVE_STATUS =
   "NOT_APPROVED: the proposed profile awaits independent review and the operator-limit review" as const;
 export const CPMM_OBSERVATION_LIVE_FLAG_MEANING =
   "--live only selects the acquiring mode; it is not, and does not record, operator approval" as const;
+
+export type CpmmObservationProfileName = "short" | "extended";
+export const CPMM_OBSERVATION_PROFILES = Object.freeze(["short", "extended"] as const);
 
 /** Two `getMultipleAccounts` requests: discovery, then the paced snapshot. */
 export const CPMM_ACQUISITION_REQUESTS = 2;
@@ -161,6 +166,101 @@ export const CPMM_OBSERVATION_PROFILE_LIMITS: CpmmObservationRunLimits = deepFre
   fanOut: { maxRetainedFailures: 8 },
 });
 
+// ---------------------------------------------------------------------------------------------
+// Extended profile: 300 s observation, 350 s session, 30 HTTP attempts (up to 28 retrievals)
+// ---------------------------------------------------------------------------------------------
+
+const EXTENDED_MAX_HTTP_ATTEMPTS = 30;
+const EXTENDED_EPOCH_BYTES = 2_097_152;
+const EXTENDED_OWNER = {
+  observationMs: 300_000,
+  ackTimeoutMs: 10_000,
+  unsubscribeAckTimeoutMs: 5_000,
+  pingIntervalMs: 20_000,
+  pongTimeoutMs: 5_000,
+  maxPings: 16,
+  maxPongReplies: 16,
+  maxControlFrames: 36,
+  maxControlPayloadBytes: 125,
+  maxOutstandingResolutions: 4,
+  maxRetainedUnprocessed: 8,
+  drainMs: 25_000,
+  cleanupTimeoutMs: 5_000,
+} as const;
+
+export const CPMM_EXTENDED_OBSERVATION_PROFILE_LIMITS: CpmmObservationRunLimits = deepFreeze({
+  session: {
+    lifetimeMs:
+      ACQUISITION.durationMs +
+      EXTENDED_OWNER.observationMs +
+      EXTENDED_OWNER.unsubscribeAckTimeoutMs +
+      Math.max(EXTENDED_OWNER.drainMs, EXTENDED_OWNER.cleanupTimeoutMs) +
+      CPMM_PROFILE_LIFETIME_MARGIN_MS,
+    maxHttpAttempts: EXTENDED_MAX_HTTP_ATTEMPTS,
+    requestTimeoutMs: 10_000,
+    lanes: {
+      SOLANA_RPC: {
+        maxAttempts: EXTENDED_MAX_HTTP_ATTEMPTS,
+        pacingMs: RPC_PACING_MS,
+        maxResponseBytes: RPC_MAX_RESPONSE_BYTES,
+      },
+      RUGCHECK: { ...DISABLED_LANE },
+      SOLANA_TRACKER: { ...DISABLED_LANE },
+      DEXSCREENER: { ...DISABLED_LANE },
+    },
+  },
+  acquisition: { ...ACQUISITION },
+  owner: { ...EXTENDED_OWNER },
+  wrapper: {
+    maxFrameBytes: FRAME_BYTES,
+    maxFragments: 16,
+    maxBufferedChunks: 64,
+    handshakeTimeoutMs: 5_000,
+    closeTimeoutMs: 5_000,
+  },
+  collector: {
+    maxFrameBytes: FRAME_BYTES,
+    maxEpochFrames: 256,
+    maxEpochBytes: EXTENDED_EPOCH_BYTES,
+    maxRetainedFrameRecords: 257,
+    maxRetainedNotifications: 256,
+    maxEpochs: 1,
+  },
+  ledger: { maxSignatureRecords: 256, maxDuplicateDetailsPerRecord: 4, maxEpochs: 1 },
+  adapter: { maxTrackedSignatures: 256, maxResponseBytes: RPC_MAX_RESPONSE_BYTES },
+  evidenceRecorder: { maxPendingEvidence: EXTENDED_MAX_HTTP_ATTEMPTS },
+  recorder: {
+    maxIncomingRecords: 320,
+    maxIncomingPayloadBytes: EXTENDED_EPOCH_BYTES,
+    maxOutgoingRecords: 16,
+    maxOutgoingPayloadBytes: 16_384,
+    maxControlRecords: 64,
+    maxControlPayloadBytes: 8_192,
+    maxLifecycleRecords: 128,
+    maxExchangeRecords: 32,
+    maxExchangeBodyBytes: 8_388_608,
+    maxLedgerCallRecords: 512,
+    maxInstrumentationFailures: 16,
+    maxPayloadBytesPerRecord: RPC_MAX_RESPONSE_BYTES,
+    maxFinishCopyNodes: 400_000,
+  },
+  fanOut: { maxRetainedFailures: 8 },
+});
+
+export function getCpmmObservationProfileLimits(
+  name: CpmmObservationProfileName = "short",
+): CpmmObservationRunLimits {
+  return name === "extended"
+    ? CPMM_EXTENDED_OBSERVATION_PROFILE_LIMITS
+    : CPMM_OBSERVATION_PROFILE_LIMITS;
+}
+
+export function getCpmmObservationProfileLabel(name: CpmmObservationProfileName = "short"): string {
+  return name === "extended"
+    ? CPMM_EXTENDED_OBSERVATION_PROFILE_LABEL
+    : CPMM_OBSERVATION_PROFILE_LABEL;
+}
+
 /** Fixed run constants (one connection, one epoch). */
 export const CPMM_OBSERVATION_RUN_CONSTANTS = deepFreeze({
   epoch: 1,
@@ -222,7 +322,7 @@ export const CPMM_OBSERVATION_SHUTDOWN_FORCED_NOTICE = "[CPMM_POOL_OBSERVATION_S
 
 export const CPMM_OBSERVATION_USAGE = [
   "Usage: cpmm-pool-observation --help",
-  "     | cpmm-pool-observation --pool <address> --mint <address> --run-id <id> [--live]",
+  "     | cpmm-pool-observation --pool <address> --mint <address> --run-id <id> [--live] [--profile <short|extended>]",
   "     | cpmm-pool-observation --verify <observation-dir> --acquisition-dir <acquisition-dir>",
   "  --help               Print this usage and the proposed plan (nothing loaded, opened or written).",
   "  --pool <address>     The exact Raydium CPMM pool account (no discovery or selection).",
@@ -231,6 +331,7 @@ export const CPMM_OBSERVATION_USAGE = [
   "                       Without --live: dry run (plan and complete limits only).",
   "  --live               Acquire and observe once with the proposed profile. Requires explicit",
   "                       SOLANA_RPC_URL (https) and SOLANA_WS_URL (wss). Not operator approval.",
+  "  --profile <name>     Observation profile: 'short' (default, 60s) or 'extended' (300s).",
   "  --verify <dir>       Verify a sealed observation bundle offline (no configuration loaded).",
   "  --acquisition-dir <dir>  Its acquisition bundle (required with --verify).",
   "Exit codes: 0 succeeded or informational, 1 invalid input or error, 2 evidence limited,",
@@ -329,15 +430,17 @@ export interface CpmmObservationCliResult {
 // Plan
 // ---------------------------------------------------------------------------------------------
 
-const L = CPMM_OBSERVATION_PROFILE_LIMITS;
-
 export function buildCpmmObservationPlan(input: {
   readonly mode: "DRY_RUN" | "LIVE";
   readonly runId: string;
   readonly target: { readonly poolAddress: string; readonly candidateMint: string };
   readonly acquisitionDir: string;
   readonly observationDir: string;
+  readonly profile?: CpmmObservationProfileName | undefined;
 }) {
+  const profileName = input.profile ?? "short";
+  const L = getCpmmObservationProfileLimits(profileName);
+  const profileLabel = getCpmmObservationProfileLabel(profileName);
   const drainOrCleanupMs = Math.max(L.owner.drainMs, L.owner.cleanupTimeoutMs);
   const requiredLifetimeMs =
     L.acquisition.durationMs +
@@ -352,7 +455,7 @@ export function buildCpmmObservationPlan(input: {
     liveExecution: CPMM_OBSERVATION_LIVE_STATUS,
     liveFlag: CPMM_OBSERVATION_LIVE_FLAG_MEANING,
     profile: {
-      label: CPMM_OBSERVATION_PROFILE_LABEL,
+      label: profileLabel,
       status: CPMM_OBSERVATION_PROFILE_STATUS,
       limits: L,
       runConstants: CPMM_OBSERVATION_RUN_CONSTANTS,
@@ -378,7 +481,7 @@ export function buildCpmmObservationPlan(input: {
         drainOrCleanupMs,
         requiredMs: requiredLifetimeMs,
         marginMs: L.session.lifetimeMs - requiredLifetimeMs,
-        extended: false,
+        extended: profileName === "extended",
       },
       http: {
         maxHttpAttempts: L.session.maxHttpAttempts,
@@ -497,6 +600,7 @@ type Parsed =
       readonly mode: "DRY_RUN" | "LIVE";
       readonly runId: string;
       readonly target: { readonly poolAddress: string; readonly candidateMint: string };
+      readonly profile: CpmmObservationProfileName;
     };
 
 function parseCli(rawArgs: readonly string[]): Parsed {
@@ -513,6 +617,7 @@ function parseCli(rawArgs: readonly string[]): Parsed {
         "run-id": { type: "string" },
         verify: { type: "string" },
         "acquisition-dir": { type: "string" },
+        profile: { type: "string" },
       },
       strict: true,
       allowPositionals: false,
@@ -536,6 +641,9 @@ function parseCli(rawArgs: readonly string[]): Parsed {
     if (["live", "pool", "mint", "run-id"].some((k) => seen.has(k))) {
       throw cliError("--verify cannot be combined with --live, --pool, --mint or --run-id");
     }
+    if (seen.has("profile")) {
+      throw cliError("--verify cannot be combined with --profile");
+    }
     const observationDir = values.verify;
     const acquisitionDir = values["acquisition-dir"];
     if (typeof observationDir !== "string" || observationDir === "") {
@@ -545,6 +653,14 @@ function parseCli(rawArgs: readonly string[]): Parsed {
       throw cliError("--verify needs --acquisition-dir with the acquisition directory");
     }
     return { mode: "VERIFY", observationDir, acquisitionDir };
+  }
+  let profile: CpmmObservationProfileName = "short";
+  if (values.profile !== undefined) {
+    if (values.profile === "short" || values.profile === "extended") {
+      profile = values.profile;
+    } else {
+      throw cliError("--profile must be 'short' or 'extended'");
+    }
   }
   const pool = values.pool;
   const mint = values.mint;
@@ -564,6 +680,7 @@ function parseCli(rawArgs: readonly string[]): Parsed {
     mode: values.live === true ? "LIVE" : "DRY_RUN",
     runId,
     target: { poolAddress: pool, candidateMint: mint },
+    profile,
   };
 }
 
@@ -866,6 +983,8 @@ export async function runCpmmPoolObservationCli(
       );
     }
   }
+  const selectedLimits = getCpmmObservationProfileLimits(parsed.profile);
+  const selectedLabel = getCpmmObservationProfileLabel(parsed.profile);
   const planJson = JSON.stringify(
     buildCpmmObservationPlan({
       mode: parsed.mode,
@@ -873,6 +992,7 @@ export async function runCpmmPoolObservationCli(
       target: parsed.target,
       acquisitionDir: rel(projectRoot, acquisitionDir),
       observationDir: rel(projectRoot, observationDir),
+      profile: parsed.profile,
     }),
   );
   const planDigestSha256 = sha256(planJson);
@@ -880,9 +1000,7 @@ export async function runCpmmPoolObservationCli(
     log(
       "[DRY_RUN] No configuration loaded, no transport opened, no request sent, nothing written.",
     );
-    log(
-      `[DRY_RUN] Profile: ${CPMM_OBSERVATION_PROFILE_LABEL} (${CPMM_OBSERVATION_PROFILE_STATUS})`,
-    );
+    log(`[DRY_RUN] Profile: ${selectedLabel} (${CPMM_OBSERVATION_PROFILE_STATUS})`);
     log(`[DRY_RUN] Live execution: ${CPMM_OBSERVATION_LIVE_STATUS}`);
     log(`[DRY_RUN] Plan digest (sha256): ${planDigestSha256}`);
     log(planJson);
@@ -923,7 +1041,7 @@ export async function runCpmmPoolObservationCli(
     throw refusal(D.webSocketClientLoad);
   }
 
-  log(`[LIVE] Profile: ${CPMM_OBSERVATION_PROFILE_LABEL} (${CPMM_OBSERVATION_PROFILE_STATUS})`);
+  log(`[LIVE] Profile: ${selectedLabel} (${CPMM_OBSERVATION_PROFILE_STATUS})`);
   log(`[LIVE] ${CPMM_OBSERVATION_LIVE_FLAG_MEANING}`);
   log(`[LIVE] Plan digest (sha256): ${planDigestSha256}`);
 
@@ -971,7 +1089,7 @@ export async function runCpmmPoolObservationCli(
         epoch: CPMM_OBSERVATION_RUN_CONSTANTS.epoch,
         subscribeRequestId: CPMM_OBSERVATION_RUN_CONSTANTS.subscribeRequestId,
         unsubscribeRequestId: CPMM_OBSERVATION_RUN_CONSTANTS.unsubscribeRequestId,
-        limits: L,
+        limits: selectedLimits,
       });
   } finally {
     listening = false;

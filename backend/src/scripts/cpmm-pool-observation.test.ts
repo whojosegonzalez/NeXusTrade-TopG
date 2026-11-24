@@ -10,6 +10,7 @@
  * verification of missing directories.
  */
 import { spawn } from "node:child_process";
+import { createHash } from "node:crypto";
 import {
   cpSync,
   existsSync,
@@ -74,6 +75,9 @@ import {
   CPMM_OBSERVATION_PROFILE_LABEL,
   CPMM_OBSERVATION_PROFILE_LIMITS,
   CPMM_OBSERVATION_PROFILE_STATUS,
+  CPMM_EXTENDED_OBSERVATION_PROFILE_LABEL,
+  CPMM_EXTENDED_OBSERVATION_PROFILE_LIMITS,
+  CPMM_OBSERVATION_PROFILES,
   CPMM_OBSERVATION_RUN_CONSTANTS,
   CPMM_OBSERVATION_SHUTDOWN_FORCED_NOTICE,
   CPMM_OBSERVATION_SHUTDOWN_GRACE_MS,
@@ -2984,6 +2988,497 @@ describe("CPMM observation profile rehearsal (roadmap step 4)", () => {
     );
     const decoded = expectReported(h, r);
     // The pool accounts and the binary frame, at least.
+    expect(decoded).toBeGreaterThanOrEqual(4);
+  });
+});
+
+// ---------------------------------------------------------------------------------------------
+// Extended profile rehearsal (roadmap step 6)
+// ---------------------------------------------------------------------------------------------
+
+const P_EXT = CPMM_EXTENDED_OBSERVATION_PROFILE_LIMITS;
+const NOMINAL_END_EXT = OBS_START + P_EXT.owner.observationMs;
+const DRAIN_DEADLINE_EXT =
+  NOMINAL_END_EXT + P_EXT.owner.unsubscribeAckTimeoutMs + P_EXT.owner.drainMs;
+const AFTER_ALL_EXT = DRAIN_DEADLINE_EXT + 10;
+
+const LIVE_EXTENDED_ARGS = (runId = "run-ext-1") => [
+  "--pool",
+  TARGET.poolAddress,
+  "--mint",
+  TARGET.candidateMint,
+  "--run-id",
+  runId,
+  "--profile",
+  "extended",
+  "--live",
+];
+
+async function concludeExtended(h: Harness, c: FakeClient, shift = 0): Promise<void> {
+  await h.to(NOMINAL_END_EXT + shift);
+  c.message(unsubAck());
+  await flush();
+  await h.to(AFTER_ALL_EXT + shift);
+}
+
+async function rehearseExtended(
+  o: HarnessOptions,
+  script: (h: Harness, c: FakeClient) => Promise<void>,
+  runId = "run-ext-1",
+) {
+  const h = harness(o);
+  const pending = start(h, LIVE_EXTENDED_ARGS(runId));
+  const c = await connect(h);
+  await script(h, c);
+  const r = await pending;
+  await h.to(AFTER_ALL_EXT + 60_000);
+  return { h, r, obs: observationDirOf(h.root, runId), acq: acquisitionDirOf(h.root, runId) };
+}
+
+describe("CPMM extended observation profile rehearsal (roadmap step 6)", () => {
+  it("OC30: profile selection is validated and immutable profile properties hold", async () => {
+    const { used, deps } = untouched();
+    const root = freshRoot();
+    const pool = TARGET.poolAddress;
+    const mint = TARGET.candidateMint;
+
+    await expectRefusal(
+      runCpmmPoolObservationCli(["--pool", pool, "--mint", mint, "--run-id", "r1", "--profile"], {
+        ...deps,
+        projectRoot: root,
+      }),
+      "[CLI_INVALID_ARG] unknown, malformed or positional argument",
+    );
+    await expectRefusal(
+      runCpmmPoolObservationCli(
+        ["--pool", pool, "--mint", mint, "--run-id", "r1", "--profile", ""],
+        { ...deps, projectRoot: root },
+      ),
+      "[CLI_INVALID_ARG] --profile must be 'short' or 'extended'",
+    );
+    await expectRefusal(
+      runCpmmPoolObservationCli(
+        ["--pool", pool, "--mint", mint, "--run-id", "r1", "--profile", "unknown"],
+        { ...deps, projectRoot: root },
+      ),
+      "[CLI_INVALID_ARG] --profile must be 'short' or 'extended'",
+    );
+    await expectRefusal(
+      runCpmmPoolObservationCli(
+        [
+          "--pool",
+          pool,
+          "--mint",
+          mint,
+          "--run-id",
+          "r1",
+          "--profile",
+          "short",
+          "--profile",
+          "extended",
+        ],
+        { ...deps, projectRoot: root },
+      ),
+      "[CLI_INVALID_ARG] --profile may be given only once",
+    );
+    await expectRefusal(
+      runCpmmPoolObservationCli(["--help", "--profile", "short"], { ...deps, projectRoot: root }),
+      "[CLI_INVALID_ARG] --help cannot be combined with other options",
+    );
+    await expectRefusal(
+      runCpmmPoolObservationCli(
+        ["--verify", "obs", "--acquisition-dir", "acq", "--profile", "extended"],
+        { ...deps, projectRoot: root },
+      ),
+      "[CLI_INVALID_ARG] --verify cannot be combined with --profile",
+    );
+
+    const shortHash = createHash("sha256")
+      .update(JSON.stringify(CPMM_OBSERVATION_PROFILE_LIMITS))
+      .digest("hex");
+    expect(shortHash).toBe("8cd48f31a9dd8a157c91341dbee0acb0f773fbf2b29eef20ea4fb978f533cf78");
+
+    expect(CPMM_OBSERVATION_PROFILES).toEqual(["short", "extended"]);
+    expect(Object.isFrozen(CPMM_OBSERVATION_PROFILES)).toBe(true);
+    expect(Object.isFrozen(CPMM_OBSERVATION_PROFILE_LIMITS)).toBe(true);
+    expect(Object.isFrozen(P_EXT)).toBe(true);
+    expect(CPMM_OBSERVATION_PROFILE_STATUS).toBe("PROPOSED_FOR_REVIEW_LIVE_LIMITS_NOT_APPROVED");
+    expect(CPMM_OBSERVATION_LIVE_STATUS).toMatch(/^NOT_APPROVED/);
+
+    expect(P_EXT.session.lifetimeMs).toBe(350_000);
+    expect(P_EXT.session.maxHttpAttempts).toBe(30);
+    expect(P_EXT.session.lanes.SOLANA_RPC.maxAttempts).toBe(30);
+    expect(P_EXT.session.lanes.SOLANA_RPC.pacingMs).toBe(2_500);
+    expect(P_EXT.owner.observationMs).toBe(300_000);
+    expect(P_EXT.owner.drainMs).toBe(25_000);
+    expect(P_EXT.owner.maxPings).toBe(16);
+    expect(P_EXT.owner.maxPongReplies).toBe(16);
+    expect(P_EXT.owner.maxControlFrames).toBe(36);
+    expect(P_EXT.owner.maxOutstandingResolutions).toBe(4);
+    expect(P_EXT.collector.maxEpochBytes).toBe(2_097_152);
+    expect(P_EXT.recorder.maxExchangeRecords).toBe(32);
+    expect(P_EXT.recorder.maxExchangeBodyBytes).toBe(8_388_608);
+
+    expect(used).toEqual([]);
+  });
+
+  it("OC31: dry run with --profile extended builds plan and validates lifetime inequality", async () => {
+    const { used, deps } = untouched();
+    const root = freshRoot();
+    const logs: string[] = [];
+    const args = [
+      "--pool",
+      TARGET.poolAddress,
+      "--mint",
+      TARGET.candidateMint,
+      "--run-id",
+      "r-ext",
+      "--profile",
+      "extended",
+    ];
+    const r = await runCpmmPoolObservationCli(args, {
+      ...deps,
+      projectRoot: root,
+      log: (l) => logs.push(l),
+    });
+    expect(used).toEqual([]);
+    expect(readdirSync(root)).toEqual([]);
+    expect(r).toMatchObject({ mode: "DRY_RUN", exitCode: X.OK });
+    expect(logs.slice(0, 4)).toEqual([
+      "[DRY_RUN] No configuration loaded, no transport opened, no request sent, nothing written.",
+      `[DRY_RUN] Profile: ${CPMM_EXTENDED_OBSERVATION_PROFILE_LABEL} (${CPMM_OBSERVATION_PROFILE_STATUS})`,
+      `[DRY_RUN] Live execution: ${CPMM_OBSERVATION_LIVE_STATUS}`,
+      `[DRY_RUN] Plan digest (sha256): ${r.planDigestSha256}`,
+    ]);
+    const plan = JSON.parse(logs[4]!) as ReturnType<typeof buildCpmmObservationPlan>;
+    expect(plan.mode).toBe("DRY_RUN");
+    expect(plan.profile.label).toBe(CPMM_EXTENDED_OBSERVATION_PROFILE_LABEL);
+    expect(plan.profile.limits).toEqual(P_EXT);
+    expect(plan.budget.sharedSessionLifetimeMs).toBe(350_000);
+    expect(plan.budget.lifetimeComposition).toEqual({
+      acquisitionDurationMs: 15_000,
+      observationMs: 300_000,
+      unsubscribeAckTimeoutMs: 5_000,
+      drainOrCleanupMs: 25_000,
+      requiredMs: 345_000,
+      marginMs: 5_000,
+      extended: true,
+    });
+    expect(plan.budget.http).toMatchObject({
+      maxHttpAttempts: 30,
+      acquisitionRequests: 2,
+      maxTransactionRetrievals: 28,
+      solanaRpcPacingMs: 2_500,
+      maxOutstandingRetrievals: 4,
+    });
+    expect(plan.budget.connection).toMatchObject({
+      connections: 1,
+      subscriptions: 1,
+      pingIntervalMs: 20_000,
+      pongTimeoutMs: 5_000,
+      maxPings: 16,
+    });
+  });
+
+  it("OC32: clean extended observation with zero notifications dispatches punctual 14 pings, exit 0", async () => {
+    const x = await rehearseExtended({}, async (h, c) => {
+      await concludeExtended(h, c);
+    });
+    const { h, r } = x;
+    expect(r.exitCode).toBe(X.OK);
+    expect(r.report!.execution).toMatchObject({
+      status: "SUCCEEDED",
+      firstFailure: null,
+      ownerTerminalCause: "OBSERVATION_COMPLETED",
+      connectionRunClean: true,
+      cleanupFailures: [],
+    });
+    expect(r.report!.requests).toEqual({
+      httpAttempts: 2,
+      acquisitionRequests: 2,
+      observationRequests: 0,
+      webSocketConnections: 1,
+    });
+    expect(r.report!.evidence.acquisition).toMatchObject({
+      integrity: "VERIFIED",
+      computed: "ACQUIRED_REPRODUCED",
+    });
+    expect(r.report!.evidence.observation).toMatchObject({
+      integrity: { ok: true, problems: [] },
+      retention: { status: "COMPLETE", reasons: [] },
+      rederivation: { implementedComponents: "REPRODUCED" },
+      acquisitionBinding: "REPRODUCED",
+    });
+    const m = measure(x.obs)!;
+    expect(m.pings).toBe(14);
+    expect(m.incoming).toMatchObject({ pingsReceived: 0, pongsReceived: 14, controlFrames: 14 });
+    expect(m.drain).toEqual({ status: "COMPLETED", outstandingAtDeadline: 0 });
+    expect(m.cleanup).toBe("SETTLED");
+    expect(expectReported(h, r)).toBeGreaterThan(0);
+  });
+
+  it("OC33: active notifications and swap decoding under extended profile, exit 0", async () => {
+    const x = await rehearseExtended(
+      { transaction: (_n, req, h) => later(h, 500, () => new Response(txBody(req))) },
+      async (h, c) => {
+        await h.to(RECEIVED_AT);
+        for (const n of [1, 2]) {
+          c.message(notif(n));
+          await flush();
+          await h.to(h.state.now + 3_000);
+        }
+        c.message(notif(1));
+        await flush();
+        await h.to(h.state.now + 3_000);
+        await concludeExtended(h, c);
+      },
+    );
+    const { h, r } = x;
+    expect(r.exitCode).toBe(X.OK);
+    expect(r.report!.execution.status).toBe("SUCCEEDED");
+    expect(r.report!.requests).toEqual({
+      httpAttempts: 4,
+      acquisitionRequests: 2,
+      observationRequests: 2,
+      webSocketConnections: 1,
+    });
+    const m = measure(x.obs)!;
+    expect(m.records).toEqual([
+      {
+        disposition: "INGESTED",
+        factKind: "RESOLVED_SWAPS",
+        factCode: null,
+        duplicates: 1,
+        detailsDropped: 0,
+      },
+      {
+        disposition: "INGESTED",
+        factKind: "RESOLVED_SWAPS",
+        factCode: null,
+        duplicates: 0,
+        detailsDropped: 0,
+      },
+    ]);
+    expect(r.report!.evidence.observation.retention).toEqual({ status: "COMPLETE", reasons: [] });
+    expect(r.report!.evidence.observation.rederivation!.implementedComponents).toBe("REPRODUCED");
+    expectReported(h, r);
+  });
+
+  it("OC34: burst of 5 notifications in single tick triggers outstanding limit overflow fail-closed (F1)", async () => {
+    const a = await rehearseExtended({ transaction: () => stalled() }, async (h, c) => {
+      await h.to(RECEIVED_AT);
+      for (const n of [1, 2, 3, 4, 5]) c.message(notif(n));
+      await flush();
+      await h.to(AFTER_ALL_EXT);
+    });
+    expect(a.r.exitCode).toBe(X.RUN_FAILED);
+    expect(a.r.report!.execution).toMatchObject({
+      firstFailure: "OBSERVATION:PROCESSING_OVERFLOW:OUTSTANDING_LIMIT",
+      ownerTerminalCause: "PROCESSING_OVERFLOW",
+      cleanupFailures: [],
+    });
+    expect(a.r.report!.requests).toMatchObject({ httpAttempts: 2, observationRequests: 0 });
+    const ma = measure(a.obs)!;
+    expect(ma.peakOutstanding).toBe(4);
+    expect(ma.uncertainties).toEqual(["UNPROCESSED_ENVELOPES"]);
+    expect(ma.handoff).toMatchObject({ envelopesAccepted: 5, unprocessed: { capacity: 1 } });
+    expectReported(a.h, a.r);
+  });
+
+  it("OC35: 29th distinct signature refused at 30-attempt budget ceiling, exit 3", async () => {
+    const x = await rehearseExtended({}, async (h, c) => {
+      await h.to(RECEIVED_AT);
+      for (let n = 1; n <= 28; n++) {
+        c.message(notif(n));
+        await flush();
+        await h.to(h.state.now + 3_000);
+      }
+      c.message(notif(29));
+      await flush();
+      await h.to(AFTER_ALL_EXT);
+    });
+    const { h, r } = x;
+    expect(r.exitCode).toBe(X.RUN_FAILED);
+    expect(r.report!.execution).toMatchObject({
+      status: "FAILED",
+      firstFailure: "OBSERVATION:SESSION_STOPPED",
+      sessionStopReason: "HTTP_ATTEMPT_CEILING_REACHED",
+      ownerTerminalCause: "SESSION_STOPPED",
+    });
+    expect(r.report!.requests).toEqual({
+      httpAttempts: 30,
+      acquisitionRequests: 2,
+      observationRequests: 28,
+      webSocketConnections: 1,
+    });
+    expect(h.calls).toHaveLength(30);
+    const m = measure(x.obs)!;
+    expect(m.records.at(-1)).toEqual({
+      disposition: "UNRESOLVED",
+      factKind: "REQUEST_REFUSED",
+      factCode: "HTTP_ATTEMPT_CEILING_REACHED",
+      duplicates: 0,
+      detailsDropped: 0,
+    });
+    expect(m.records.slice(0, 28).every((rec) => rec.disposition === "INGESTED")).toBe(true);
+    expectReported(h, r);
+  });
+
+  it("OC36: absolute drain deadline expiry stops waiting for trailing in-flight requests (F3)", async () => {
+    const b = await rehearseExtended({ transaction: () => stalled() }, async (h, c) => {
+      await h.to(NOMINAL_END_EXT - 1_000);
+      for (const n of [1, 2, 3, 4]) c.message(notif(n));
+      await flush();
+      await concludeExtended(h, c);
+    });
+    expect(b.r.exitCode).toBe(X.RUN_FAILED);
+    expect(b.r.report!.execution).toMatchObject({
+      firstFailure: "OBSERVATION:CONNECTION_RUN_NOT_CLEAN",
+      ownerTerminalCause: "OBSERVATION_COMPLETED",
+      connectionRunClean: false,
+    });
+    const mb = measure(b.obs)!;
+    expect(mb.uncertainties).toEqual(["DRAIN_EXPIRED"]);
+    expect(mb.drain).toEqual({ status: "EXPIRED", outstandingAtDeadline: 1 });
+    expect(b.r.report!.evidence.observation.retention).toEqual({
+      status: "INCOMPLETE",
+      reasons: [
+        "EXCHANGE_BODY_NOT_READ",
+        "EXCHANGE_MISSING",
+        "PENDING_WORK:accountSettlementsPending",
+      ],
+    });
+    expectReported(b.h, b.r);
+  });
+
+  it("OC37: 5th duplicate of a signature drops details and marks retention incomplete, exit 2 (F5)", async () => {
+    const s = await rehearseExtended({}, async (h, c) => {
+      await h.to(RECEIVED_AT);
+      c.message(notif(1));
+      await flush();
+      await h.to(RECEIVED_AT + 5_000);
+      for (let i = 0; i < 5; i++) {
+        c.message(notif(1));
+        await flush();
+      }
+      await concludeExtended(h, c);
+    });
+    expect(s.r.exitCode).toBe(X.EVIDENCE_LIMITED);
+    expect(s.r.report!.execution.status).toBe("SUCCEEDED");
+    expect(s.r.report!.evidence.observation.retention).toEqual({
+      status: "INCOMPLETE",
+      reasons: ["LEDGER_DUPLICATE_DETAILS_TRUNCATED"],
+    });
+    expect(measure(s.obs)!.records).toEqual([
+      {
+        disposition: "INGESTED",
+        factKind: "RESOLVED_SWAPS",
+        factCode: null,
+        duplicates: 5,
+        detailsDropped: 1,
+      },
+    ]);
+    expectReported(s.h, s.r);
+  });
+
+  it("OC38: incoming pings plus pongs count toward control frame limits; 17th ping ends run (F6)", async () => {
+    const pings = (n: number, size = P_EXT.owner.maxControlPayloadBytes) =>
+      rehearseExtended({}, async (h, c) => {
+        for (let i = 0; i < n; i++) {
+          await h.to(OBS_START + 1_000 + i * 1_000);
+          c.emit("ping", Buffer.alloc(size, 7));
+          await flush();
+        }
+        await concludeExtended(h, c);
+      });
+    const sixteen = await pings(P_EXT.owner.maxPongReplies);
+    expect(sixteen.r.exitCode).toBe(X.EVIDENCE_LIMITED);
+    expect(sixteen.r.report!.execution.status).toBe("SUCCEEDED");
+    expect(sixteen.r.report!.evidence.observation.retention).toEqual({
+      status: "INCOMPLETE",
+      reasons: ["RECORDS_DROPPED:control"],
+    });
+    const m16 = measure(sixteen.obs)!;
+    expect(m16.pongReplies).toBe(P_EXT.owner.maxPongReplies);
+    expect(m16.incoming).toMatchObject({ pingsReceived: 16, pongsReceived: 14, controlFrames: 30 });
+    expectReported(sixteen.h, sixteen.r);
+
+    const seventeen = await pings(P_EXT.owner.maxPongReplies + 1);
+    expect(seventeen.r.exitCode).toBe(X.RUN_FAILED);
+    expect(seventeen.r.report!.execution.firstFailure).toBe(
+      "OBSERVATION:CONTROL_FRAME_LIMIT:PONG_REPLY_LIMIT",
+    );
+    expectReported(seventeen.h, seventeen.r);
+
+    const oversized = await pings(1, P_EXT.owner.maxControlPayloadBytes + 1);
+    expect(oversized.r.exitCode).toBe(X.RUN_FAILED);
+    expect(oversized.r.report!.execution.firstFailure).toBe(
+      "OBSERVATION:TRANSPORT_ERROR:ERROR_EVENT",
+    );
+    expectReported(oversized.h, oversized.r);
+
+    const pongs = await rehearseExtended({}, async (h, c) => {
+      await h.to(RECEIVED_AT);
+      for (let i = 0; i < P_EXT.owner.maxControlFrames; i++) c.emit("pong", Buffer.from([1]));
+      await flush();
+      await concludeExtended(h, c);
+    });
+    expect(pongs.r.exitCode).toBe(X.RUN_FAILED);
+    expect(pongs.r.report!.execution.firstFailure).toBe(
+      "OBSERVATION:CONTROL_FRAME_LIMIT:INCOMING_CONTROL_FRAMES",
+    );
+    expect(measure(pongs.obs)!.incoming).toMatchObject({
+      controlFrames: P_EXT.owner.maxControlFrames + 1,
+    });
+    expectReported(pongs.h, pongs.r);
+  });
+
+  it("OC39: cancellation, cleanup, and credential protection under extended execution (F8)", async () => {
+    const h = harness();
+    const pending = start(h, LIVE_EXTENDED_ARGS("run-cancel"));
+    const c = await connect(h);
+    await h.to(RECEIVED_AT);
+    c.message(notif(1));
+    await flush();
+    await h.to(RECEIVED_AT + 5_000);
+    const sigint = h.installed.get("SIGINT")?.[0];
+    expect(sigint).toBeDefined();
+    sigint!();
+    await flush();
+    const rCancel = await pending;
+    await h.to(AFTER_ALL_EXT + 60_000);
+    expect(rCancel.exitCode).toBe(X.CANCELLED);
+    expect(rCancel.report!.execution.cancelled).toBe(true);
+    expect(rCancel.report!.evidence.observation.seal).toBe("SEALED");
+    expectReported(h, rCancel);
+
+    const x = await rehearseExtended(
+      {
+        transaction: (_n, req) => {
+          const body = JSON.parse(txBody(req)) as { result: { meta: { logMessages: string[] } } };
+          body.result.meta.logMessages.push(`Program log: ${RPC_URL}`, `Program log: ${SECRET}`);
+          return new Response(JSON.stringify(body));
+        },
+      },
+      async (h2, c2) => {
+        await h2.to(RECEIVED_AT);
+        c2.message(notif(1, `echo ${STREAM_URL}`));
+        await flush();
+        await h2.to(RECEIVED_AT + 5_000);
+        c2.message(Buffer.concat([Buffer.from([0xff, 0xfe]), Buffer.from(SECRET)]));
+        await flush();
+        await h2.to(AFTER_ALL_EXT);
+      },
+      "run-cred",
+    );
+    expect(x.r.exitCode).toBe(X.RUN_FAILED);
+    expect(x.r.report!.execution.firstFailure).toBe("OBSERVATION:COLLECTION_DIRTY:INVALID_UTF8");
+    const m = measure(x.obs)!;
+    expect(m.records.map((rec) => [rec.disposition, rec.factKind, rec.factCode])).toEqual([
+      ["UNRESOLVED", "EVIDENCE_NOT_REPLAYABLE", "CREDENTIAL_MATERIAL"],
+    ]);
+    expect(m.payloads).toMatchObject({ redacted: 3, withheld: 0 });
+    const decoded = expectReported(x.h, x.r);
     expect(decoded).toBeGreaterThanOrEqual(4);
   });
 });
