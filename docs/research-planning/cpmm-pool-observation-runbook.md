@@ -251,3 +251,31 @@ This implements the §14 design. Full detail is in assessment §8.38.24. All wor
   - Prepare a separately approved operator packet.
 
   The v1 fixtures are **synthetic** and are not observed mainnet evidence.
+
+## 16. Bounded Diagnostic Capture `cpmm-observation-04` & Retrospective v1 Retrieval Proposal
+
+Independent review accepted `cpmm-observation-04` (`CYBERLEEK/WSOL`, `--profile extended`) as a **successful bounded diagnostic capture**. It ran at commit `161b24d4e326480338bbe137687067e07eb0be19` via `.tmp/runbooks/cpmm-observation-04-operator.ps1` (SHA-256 `6a0e83cb7fa3c641e89e3e2a41580a5b0eca9fd461923fc2f22b8e66092e7886`). Its approval is **consumed**. Full detail is in assessment §8.38.25.
+
+- **Execution:**
+  - Full `300 s` window (`2026-11-27T10:37:20.431Z`–`10:42:20.431Z`).
+  - `3` HTTP requests (`2` acquisition, `1` `getTransaction`).
+  - `1` WebSocket; `14`/`14` ping/pong; acknowledged unsubscribe; close `1000`; clean shutdown.
+  - Wallet unchanged.
+- **Evidence:**
+  - Acquisition `dddaf814f672ffbf75386619789cdefc911cb17a2ac28216a4807946d8955801`: `VERIFIED` / `ACQUIRED_REPRODUCED`.
+  - Observation `916c26ae6ebf15b84f23fcf38140596348b4cb04e1bc095a42bde3924c6783c0`: integrity `OK`, binding `REPRODUCED`.
+  - Retention `COMPLETE`.
+- **Result:**
+  - One corroborated **BUY** from a **version-0** transaction: `1NzN8L6f…`, slot `474519283`, `10,315` lamports in for `683,735,286` base units out.
+  - Ingested once; corroborated by the credentialed live re-derivation and an offline pure-decoder cross-check.
+- **Policy exercised:** the cap-1 request policy (`maxSupportedTransactionVersion: 1`) and the schema-3 acquisition binding were exercised successfully.
+- **Limitations:**
+  - Credential-free `--verify` exits `2` (`ANALYSIS_CREDENTIALS_NOT_SUPPLIED`); this is **not** full transaction re-analysis.
+  - Genuine v1 payload validation remains **open**: no v1 transaction has been observed.
+  - All five qualification flags remain `false`.
+- **Proposal, design only (assessment §8.38.26):**
+  - What: one bounded retrospective cap-1 `getTransaction` for capture-03 signature `4XcLrDWBcAHkgmK8oF9PqeKitaJy1sNZG2xetTuL8EbazpGjexiCBo2BUGThoV2FgdG8h7AF58imedW2sjtBMimm` (slot `473543189`; `exchanges/000004.json` holds only the cap-0 request and the `-32015` error).
+  - Limits: `1` request, `0` WebSocket, `0` retries or fallback, `10 s` timeout, `15 s` session, `256 KiB` response cap.
+  - Evidence: sealed as separate supplemental evidence under `data/research/cpmm-retrospective-transactions/`, bound read-only to capture 03's verified manifests, exchange, notification and ledger record.
+  - Isolation: never counted as fresh flow, never ingested, never modifying either capture.
+  - Not authorized: no implementation, operator command, credential load, request, socket or rerun.

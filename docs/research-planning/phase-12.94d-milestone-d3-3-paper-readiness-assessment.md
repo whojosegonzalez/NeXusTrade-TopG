@@ -12002,3 +12002,135 @@ The table is exported as `CPMM_EVIDENCE_SCHEMA_POLICIES`. Any other schema is `E
   - Capture 03's five cap-0 requests still match with no `REQUEST_BODY` finding.
   - Capture 03's four `-32015` exchanges are still recorded as `RPC_ERROR` / `JSON_RPC_ERROR`.
   - Transaction analysis remains `UNAVAILABLE (ANALYSIS_CREDENTIALS_NOT_SUPPLIED)`. **This is not full transaction re-analysis**, and no credentials were loaded.
+
+#### 8.38.25 Bounded Diagnostic Capture `cpmm-observation-04` Result (`CYBERLEEK/WSOL`, First v1-Capable Run)
+
+**Status**: Independent review accepted `cpmm-observation-04` as a **successful bounded diagnostic capture**. It ran at pinned commit `161b24d4e326480338bbe137687067e07eb0be19` via `.tmp/runbooks/cpmm-observation-04-operator.ps1` (SHA-256 `6a0e83cb7fa3c641e89e3e2a41580a5b0eca9fd461923fc2f22b8e66092e7886`) with `--profile extended`. Its approval is **consumed**. **All five qualification flags remain `false`.** Genuine v1 payload validation remains **open**.
+
+##### Verified Findings
+
+- **Target, bundles and integrity:**
+  - Target: pool `G8kgi7aUpeX8EVR8VMkrth9SKEv5BietWC33UjAiiMGh`, candidate mint `ApZuxdpzMrbEYTGEzeY9afh5pj9d6qPRJCTgQYiipbKg`, Helius endpoints.
+  - Acquisition bundle `data/research/cpmm-acquisitions/cpmm-observation-04`: manifest SHA-256 `dddaf814f672ffbf75386619789cdefc911cb17a2ac28216a4807946d8955801` (`7` files), integrity `VERIFIED`, computed `ACQUIRED_REPRODUCED`.
+  - Observation bundle `data/research/cpmm-observations/cpmm-observation-04`: manifest `cpmm-observation-manifest.json` SHA-256 `916c26ae6ebf15b84f23fcf38140596348b4cb04e1bc095a42bde3924c6783c0` (`12` files: `11` core documents plus `exchanges/000003.json`), integrity `OK`, acquisition binding `REPRODUCED`, pool context `ACQUIRED_BOUND`.
+  - Retention `COMPLETE`: `38` payloads stored, `0` redacted, withheld or omitted.
+  - Virtual wallet unchanged before and after (`7f2c2353ac2f62cac1bb98703742ab19c74ac5521635af6f49bbe777ad020ed9`).
+- **Full window and clean shutdown:**
+  - The observation ran the full `300 s`, from `2026-11-27T10:37:20.431Z` to the nominal end at `10:42:20.431Z`.
+  - The unsubscribe was acknowledged at `10:42:20.567Z` (`OBSERVATION_COMPLETED` / `UNSUBSCRIBE_RESPONSE`), and the owner settled at `10:42:20.698Z`.
+  - Connection details: `1` WebSocket (`subscriptionId: 9420831`); `14` pings, all `14` pongs matched; close code `1000`; cleanup `SETTLED`; `connectionRunClean: true`.
+- **Requests:** exactly `3` HTTP requests: `2` acquisition requests plus `1` `getTransaction` (`exchanges/000003.json`). `1` pool notification was accepted. Nothing approached the 28-retrieval or 4-handoff ceilings.
+- **Cap-1 request policy and schema-3 binding exercised:**
+  - Manifest `evidenceSchemaVersion: 3`. `pool-context.json` and `report.json` are version `3`, and both `run-plan.json` and `report.json` carry `transactionRequest: { maxSupportedTransactionVersion: 1 }`.
+  - The sealed request (`id: 3`) is the exact cap-1 body: `{"encoding":"json","commitment":"confirmed","maxSupportedTransactionVersion":1}`, original SHA-256 `6237c222d215873d2106560975f2de041157255bc71b3090832e5f3eb759ff50`, `231` bytes.
+- **One corroborated BUY, from a version-0 transaction:**
+  - Signature `1NzN8L6fpJQKzcGtKxvXy74nz9h1s4W47Bkv41o5UoyzDV3pvKjQTqeqWNceA4nWjhC53xg9Jw97nGNUDVob5Kx`.
+  - Notified at slot `474519283`, received `10:37:51.978Z`.
+  - Response: `version: 0` (`5` address lookup tables; `25` writable / `15` readonly loaded addresses), `blockTime: 1795775872` (`10:37:52Z`), `meta.err: null`.
+  - The decoder produced exactly one target swap: a routed **BUY** at outer instruction `2`, position `9`, of `10,315` lamports WSOL in for `683,735,286` candidate base units out (`9` decimals), with logs `CORROBORATED`.
+  - Ledger record `1`: `RESOLVED_SWAPS`, `INGESTED`, ingestion `COMPLETE` (`1` accepted).
+  - Corroboration came from two sources:
+    1. The live run's credentialed re-derivation: `implemented components REPRODUCED; transaction analysis AVAILABLE`, exit `0`.
+    2. An offline pure-decoder cross-check of the sealed response bytes against the pool re-adapted from the sealed accounts. It loaded no credentials and reproduced the identical event under both cap 1 and cap 0.
+- **Credential-free `--verify` exits `2`:**
+  - Acquisition `VERIFIED` / `ACQUIRED_REPRODUCED`; observation integrity `OK`; retention `COMPLETE`; binding `REPRODUCED`.
+  - Re-derivation reports `implemented components MISSING_EVIDENCE; transaction analysis UNAVAILABLE (ANALYSIS_CREDENTIALS_NOT_SUPPLIED)`.
+  - This is **not** full transaction re-analysis.
+- **Open: genuine v1 payload validation.** The only transaction retrieved was version 0. The v1 decoder path (static accounts, `transactionConfig`, SIMD-0385 limits) is still validated only against synthetic fixtures. No observed v1 payload exists in any capture. This capture establishes no notification completeness, no quiet window, no current or future activity rate, and no qualification.
+
+#### 8.38.26 Design-Only Proposal: One Bounded Retrospective Cap-1 `getTransaction` for a `cpmm-observation-03` Signature
+
+**Status**: **Design only, for independent review.** It includes no implementation, operator command, credential load, request, socket or rerun. Approval of this design would not authorize execution: that needs a separately reviewed implementation, an operator packet and an explicit operator approval.
+
+##### Purpose and Source Record
+
+The one open validation gap is a **genuine** v1 transaction payload. The most specific candidate available is a capture-03 signature for which the RPC itself reported a version-1 transaction:
+
+- **Signature:** `4XcLrDWBcAHkgmK8oF9PqeKitaJy1sNZG2xetTuL8EbazpGjexiCBo2BUGThoV2FgdG8h7AF58imedW2sjtBMimm`.
+- **Source capture:** `cpmm-observation-03`, evidence schema `2`.
+  - Observation manifest `12f5fac06c54ba51d17e845a2e607ca8cfa72bf1566440851946a73cf8757f0e`; acquisition manifest `57f6f2329ca20d8e5df72ef167f609e58ddb13e0072b0bc9abdbf7d8390a84eb`.
+  - Collector notification sequence `2`: slot `473543189`, `receivedAtMs: 1795566034813`, `frameSha256` `ab1139ded029ac5a5124f6daf2f8267a9d9804c3512132df4124968dcd30b505`.
+  - Ledger record sequence `2`: `UNRESOLVED` / `TRANSACTION_UNAVAILABLE` / `RPC_ERROR` / `JSON_RPC_ERROR`.
+  - `exchanges/000004.json`: manifest-listed SHA-256 `b3fbf21e56e46ada70366537298cdfe25cf5c01c00d3d3550bbe2ffa961ce827`, `2193` bytes. It holds the **cap-0 request** (`id: 4`, `maxSupportedTransactionVersion: 0`) and the `238`-byte JSON-RPC `-32015` error. It contains **no transaction payload**.
+
+The `-32015` text is the provider's statement about the version. It is not evidence of content. There is no promise that the transaction is still retrievable at `confirmed` commitment, that it is version 1, that it touches the target pool, that it contains a target swap, or that it decodes.
+
+##### Reusable Reviewed Components (Unchanged)
+
+| Component                                                                            | Reuse                                                                                                                                                                                                                   |
+| ------------------------------------------------------------------------------------ | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `PaperRequestSession`                                                                | The only transport: one `SOLANA_RPC` attempt (`maxAttempts: 1`), all other lanes `0`, its own pacing, timeout, body cap and evidence observer.                                                                          |
+| `cpmmGetTransactionRequestBody(signature, id, 1)` / `CPMM_GET_TRANSACTION_V1_CONFIG` | The exact cap-1 request bytes, identical to what a schema-3 run sends.                                                                                                                                                  |
+| `adaptRaydiumCpmmPoolState`                                                          | Re-adapts the pool from capture 03's **sealed** account bytes. No new account acquisition is made.                                                                                                                      |
+| `analyzeCpmmTransactionResponse` (cap `1`) and `decodeRaydiumCpmmTransactionSwaps`   | Response classification and decoding, unbranded and never ingestible.                                                                                                                                                   |
+| `evidence-credential-sanitizer` (`deriveEvidenceSecrets`, `sanitizeEvidenceBytes`)   | Byte-level redaction or withholding before anything is written; a whole-file residue scan.                                                                                                                              |
+| `verifyCpmmObservationEvidence` / `verifyCpmmPoolAcquisitionEvidence`                | Read-only verification of the source capture before the request and in every verify.                                                                                                                                    |
+| `cpmm-pool-activity-check.ts` structure (reviewed)                                   | The template for a single-request supplemental tool: inert import, help and dry run; one bounded request; exclusive-create sealed bundle; offline `--verify`; fixed exit codes and signal handling; non-certifications. |
+| Operator wrapper helpers (03/04, byte-identical)                                     | Process supervision, redaction, private key load, process-scoped endpoints with restoration, pin, clean-tree and wallet checks.                                                                                         |
+
+The new code would be a small, separately reviewed supplemental tool, for example `backend/src/scripts/cpmm-retrospective-transaction.ts` with its own tests. No change to the decoder, adapter, observation evidence module or any capture is proposed.
+
+##### Proposed Limits
+
+| Bound                                               | Value                                                                                                               |
+| --------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------- |
+| HTTP requests                                       | exactly `1` `getTransaction` (`encoding: "json"`, `commitment: "confirmed"`, `maxSupportedTransactionVersion: 1`)   |
+| Other requests and channels                         | `0` account acquisition, `0` `getSignaturesForAddress`, `0` WebSockets, `0` DexScreener / RugCheck / Solana Tracker |
+| Retries, redirects, pagination, fallback, follow-up | `0` / `0` / `0` / none / none                                                                                       |
+| Request timeout                                     | `10,000 ms`                                                                                                         |
+| Session lifetime                                    | `15,000 ms` (one request plus local overhead headroom; sealing happens after the session stops)                     |
+| Response cap                                        | `262,144` bytes (the reviewed extended adapter and lane cap; v1 transactions are at most 4,096 wire bytes)          |
+| Signature set                                       | exactly the one signature above, fixed in the plan; no other signature or discovery                                 |
+| Pacing                                              | `2,500 ms` lane spacing (irrelevant for one request, kept for parity)                                               |
+
+##### Separate Supplemental Evidence
+
+- **Location:** a new root, `data/research/cpmm-retrospective-transactions/<run id>/`, for example `cpmm-retrospective-tx-01`. It is exclusive-create, never written into or beside either capture directory, and refused if it already exists.
+- **Files:** a plan, the source binding, the sealed exchange (sanitized request and response), the analysis report, and a manifest written last. Its own kind is `CPMM_RETROSPECTIVE_TRANSACTION_EVIDENCE`, at schema version `1`.
+- **Classification:** the bundle is labelled `RETROSPECTIVE_SUPPLEMENTAL`, `freshFlow: false`, `ingested: false`. The request uses its own purpose, for example `CPMM_RETROSPECTIVE_GET_TRANSACTION` under owner `RESEARCH`, never `CPMM_GET_TRANSACTION` / `FLOW`. The observation recorder and the adapter's evidence recorder therefore can never accept it.
+- **What it never touches:** no `RollingTradeFlowTracker`, `CpmmResolutionAccountingLedger`, collector, owner or flow metric consumes it. Decoded events are reported as data with `timestampProvenance: ON_CHAIN_BLOCK_TIME` and carry the **source** notification's receipt time only as a binding reference. They never count as fresh flow, activity rate or admission input.
+- **Capture records are unchanged:** neither capture 03's nor capture 04's files, manifests, ledger facts or conclusions are modified. Capture 03's recorded `RPC_ERROR` stays the recorded runtime outcome. The supplemental result is a separate, cross-referenced annotation.
+
+##### Source-Capture Binding
+
+1. **Before any configuration is loaded, and again in every verify:**
+   - Capture 03 must verify read-only: observation integrity `OK`, acquisition `VERIFIED` / `ACQUIRED_REPRODUCED`, binding `REPRODUCED`, both manifest digests equal to the pinned values above.
+   - `exchanges/000004.json` must match its pinned digest.
+   - Its `entry.requestedIdentity`, the collector notification (sequence `2`, slot `473543189`) and the ledger record (sequence `2`, `RPC_ERROR` / `JSON_RPC_ERROR`) must all name the signature.
+   - The source request must be the exact cap-0 body; the source body must be a `-32015` error with no `result`.
+   - Any failure refuses the run before configuration is read.
+2. **The supplemental bundle records:** the source run id; both manifest digests; the source exchange path and digest; the source notification and ledger sequences; and the source request's original digest. It does not copy capture-03 payloads.
+3. **Pool context:** re-adapted from capture 03's sealed pool and vault accounts, and required to equal capture 03's recorded adapted pool. The pool account state is the source capture's snapshot, not current state.
+4. **Response binding:**
+   - The JSON-RPC id must echo, and `transaction.signatures[0]` must equal the signature.
+   - `slot` must equal `473543189`; otherwise the result is `METADATA_CONTRADICTION` / `SLOT_MISMATCH`, recorded, never retried.
+   - The notification carries no `blockTime` (the collector never records one), so none is compared.
+
+##### Offline Analysis and Outcome Taxonomy
+
+- **Live sealing** applies `analyzeCpmmTransactionResponse` with cap `1` to the exact complete response bytes, with the re-adapted pool and the source notification identity.
+- **Credential-free verify:** the retained body has already been scanned and sanitized at seal time, so a credential-free `--verify` should be able to replay the classification. Two options are open for review:
+  - (a) export a small reviewed classification function with no credential scan; or
+  - (b) replay through `decodeRaydiumCpmmTransactionSwaps` (cap `1`) plus the binding checks above.
+
+  Either option must keep decoded outcomes, recorded facts and their comparison separate, and must report `LIMITED_BY_REDACTION` or `MISSING_EVIDENCE` explicitly when bytes are not exact.
+
+- **Outcomes,** all final and never retried:
+
+  | Response                                         | Recorded outcome                                                                                                                                                     |
+  | ------------------------------------------------ | -------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+  | `version: 1`, decoded                            | **First genuine v1 payload**: `SWAP_DECODED` or `NO_MATCHING_SWAPS`, with v1 structure facts (static accounts, `transactionConfig` values, recomputed size) recorded |
+  | `version: 1`, refused by the decoder             | `UNRESOLVED` with its fixed reason and detail. This is still genuine v1 evidence, and it identifies a decoder gap for review.                                        |
+  | `version` other than `1`                         | Recorded as a contradiction of the source `-32015` statement                                                                                                         |
+  | `result: null`                                   | `TRANSACTION_NOT_FOUND` (historical availability), not a decoder result                                                                                              |
+  | `-32015` or another JSON-RPC error under cap 1   | `RPC_ERROR` with code; a `-32015` here is reported as contradicting the request policy                                                                               |
+  | HTTP or transport error, oversize, withheld body | Their fixed session or retention codes                                                                                                                               |
+
+- **Non-certifications:** the five qualification flags stay `false`. In addition: no flow, notification completeness, quiet window, activity rate, admission or change to any capture's conclusions.
+
+##### Before Any Execution
+
+1. Independent review of this design.
+2. Implementation with synthetic-only tests (including a synthetic v1 response, a not-found response, a slot mismatch, a `-32015` under cap 1, source-binding tampering and a refused existing output directory), reviewed separately.
+3. A new operator packet (pinned commit, script hash, plan digests, inert default path), reviewed separately.
+4. Explicit operator approval of that exact command. None of these steps is authorized by this proposal.
