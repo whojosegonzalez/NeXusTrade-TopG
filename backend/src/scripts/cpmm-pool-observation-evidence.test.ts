@@ -84,6 +84,7 @@ import {
   CPMM_GET_TRANSACTION_CONFIG,
   CPMM_TX_PURPOSE,
   RaydiumCpmmTransactionSourceAdapter,
+  cpmmGetTransactionRequestBody,
   createCpmmExchangeEvidenceRecorder,
 } from "../candidate-scanner/RaydiumCpmmTransactionSourceAdapter.js";
 import { RollingTradeFlowTracker } from "../candidate-scanner/RollingTradeFlowTracker.js";
@@ -92,7 +93,9 @@ import {
   CPMM_EVIDENCE_FALSE_FLAGS,
   CPMM_EVIDENCE_FILES,
   CPMM_EVIDENCE_ROOT_SEGMENTS,
+  CPMM_EVIDENCE_SCHEMA_POLICIES,
   CPMM_EVIDENCE_VERIFIER_LIMITS,
+  CPMM_V1_CAPABLE_EVIDENCE_SCHEMA_VERSION,
   sealCpmmObservationEvidence,
   verifyCpmmObservationEvidence,
   type CpmmLedgerStructuralCheck,
@@ -512,6 +515,8 @@ function env(
     /** The owner's cancellation signal. */
     signal?: AbortSignal | undefined;
     ownerLimits?: Partial<CpmmConnectionOwnerLimits> | undefined;
+    /** The adapter's request policy (default 0, the historical cap). */
+    maxSupportedTransactionVersion?: 0 | 1 | undefined;
   } = {},
   ledgerLimits: typeof LEDGER_LIMITS = LEDGER_LIMITS,
 ) {
@@ -565,6 +570,7 @@ function env(
     rpcUrl: RPC_URL,
     secrets: [RPC_URL, SECRET],
     ...ADAPTER_LIMITS,
+    maxSupportedTransactionVersion: transport.maxSupportedTransactionVersion ?? 0,
   });
   const ledger = new CpmmResolutionAccountingLedger({
     binding: adapter.getBinding(),
@@ -677,6 +683,8 @@ async function genuineRun(
     unsubscribeResponse?: Buffer;
     ownerLimits?: Partial<CpmmConnectionOwnerLimits>;
     subscribeBeforeOpen?: boolean;
+    /** The adapter's request policy (default 0, the historical cap). */
+    maxSupportedTransactionVersion?: 0 | 1;
   } = {},
 ) {
   const ledgerLimits = o.ledgerLimits ?? LEDGER_LIMITS;
@@ -689,6 +697,7 @@ async function genuineRun(
       onExchange: o.onExchange,
       signal: o.signal,
       ownerLimits: o.ownerLimits,
+      maxSupportedTransactionVersion: o.maxSupportedTransactionVersion,
     },
     ledgerLimits,
   );
@@ -6833,5 +6842,432 @@ describe("Collector replay: application sends placed by the owner's attempts (re
     ]);
     expect(lu).toMatchObject({ epochReportCompared: false, countersCompared: false });
     expect(lu.replayedFrames).toBe(lu.handedOverMessages);
+  });
+});
+
+// ---------------------------------------------------------------------------------------------
+// Evidence schema 3: acquisition-bound, v1-capable (SIMD-0385) runs
+// ---------------------------------------------------------------------------------------------
+//
+// The v1 transaction result served below is SYNTHETIC: the legacy builder's static-only message
+// given `version: 1` and the four-key `transactionConfig` Agave 318c00ca serializes. The -32015
+// body is modelled on Agave's `UnsupportedTransactionVersion` error text. Neither is captured
+// evidence; the sealed historical captures are not read by these tests.
+
+describe("Evidence schema 3: acquisition-bound, v1-capable request policy", () => {
+  type Run = Awaited<ReturnType<typeof genuineRun>>;
+  const V1_REQUEST = { maxSupportedTransactionVersion: 1 } as const;
+  /** Seal without any plan policy (the historical schema 1/2 writer path). */
+  const NO_POLICY = Symbol("NO_POLICY");
+  const v1TxResult = (sig: string): unknown => {
+    const t = txResult(sig) as Record<string, unknown> & {
+      transaction: { message: Record<string, unknown> };
+    };
+    t.version = 1;
+    t.transaction.message.transactionConfig = {
+      priorityFee: 5_000,
+      computeUnitLimit: 200_000,
+      loadedAccountsDataSizeLimit: null,
+      heapSize: null,
+    };
+    return t;
+  };
+  const v1Responder: Responder = async ({ id }) =>
+    new Response(JSON.stringify({ jsonrpc: "2.0", id, result: v1TxResult(signatureOf(1)) }), {
+      status: 200,
+    });
+  const unsupportedVersion: Responder = async ({ id }) =>
+    new Response(
+      JSON.stringify({
+        jsonrpc: "2.0",
+        id,
+        error: {
+          code: -32015,
+          message:
+            'Transaction version (1) is not supported by the requesting client. Please try the request again with the following configuration parameter: "maxSupportedTransactionVersion": 1',
+        },
+      }),
+      { status: 200 },
+    );
+  const inputFor = (
+    run: Run,
+    over: Partial<SealCpmmObservationInput> = {},
+    transactionRequest: unknown = V1_REQUEST,
+  ) =>
+    sealInput(
+      run.snapshot,
+      run.recorder,
+      {
+        plan: {
+          ...plan(run.recorderLimits, run.collectorLimits),
+          ...(transactionRequest === NO_POLICY ? {} : { transactionRequest }),
+        } as SealCpmmObservationInput["plan"],
+        ...over,
+      },
+      run.recorderLimits,
+      run.collectorLimits,
+    );
+  const sealed = (input: SealCpmmObservationInput) => {
+    const r = sealCpmmObservationEvidence(input);
+    if (!r.ok) throw new Error(`seal failed: ${r.code}`);
+    return r.outDir;
+  };
+  const exchangePathOf = (dir: string) =>
+    (readJson(dir, CPMM_EVIDENCE_FILES.exchangeIndex).exchanges as { path: string }[])[0]!.path;
+  const txOf = (v: ReturnType<typeof verifyCpmmObservationEvidence>) =>
+    v.rederivation.components!.transactionAnalysis;
+
+  let fixture: Awaited<ReturnType<typeof createV1>> | undefined;
+  async function createV1() {
+    const run = await genuineRun({ maxSupportedTransactionVersion: 1, responder: v1Responder });
+    const acquisition = await sealAcquisition("success", "acquisition-v1");
+    const input = inputFor(run, { acquisitionDir: acquisition.outDir });
+    return { run, acquisition, input, dir: sealed(input) };
+  }
+  const v1Bundle = async () => (fixture ??= await createV1());
+
+  it("S3-1: a v1-capable run seals as schema 3 and verifies with its dependency and a matched v1 swap", async () => {
+    const { acquisition, dir } = await v1Bundle();
+    expect(CPMM_EVIDENCE_SCHEMA_POLICIES).toEqual({
+      1: { acquisitionBound: false, maxSupportedTransactionVersion: 0 },
+      2: { acquisitionBound: true, maxSupportedTransactionVersion: 0 },
+      3: { acquisitionBound: true, maxSupportedTransactionVersion: 1 },
+    });
+    expect(readJson(dir, CPMM_EVIDENCE_FILES.manifest)).toMatchObject({
+      evidenceSchemaVersion: CPMM_V1_CAPABLE_EVIDENCE_SCHEMA_VERSION,
+    });
+    expect(readJson(dir, CPMM_EVIDENCE_FILES.poolContext)).toMatchObject({
+      version: 3,
+      acquisition: "ACQUIRED_BOUND",
+      acquisitionManifestSha256: acquisition.manifestSha256,
+    });
+    expect(readJson(dir, CPMM_EVIDENCE_FILES.report)).toMatchObject({
+      version: 3,
+      transactionRequest: V1_REQUEST,
+      poolContextProvenance: "ACQUIRED_BOUND",
+    });
+    expect(get(readJson(dir, CPMM_EVIDENCE_FILES.plan), "plan", "transactionRequest")).toEqual(
+      V1_REQUEST,
+    );
+    // The sealed request is the adapter's exact v1-capable body.
+    const ex = readJson(dir, exchangePathOf(dir));
+    const id = get(ex, "entry", "jsonRpcId") as number;
+    const expected = cpmmGetTransactionRequestBody(signatureOf(1), id, 1);
+    expect(get(ex, "requestBody", "originalSha256")).toBe(sha(expected));
+    expect(get(ex, "requestBody", "stored")).toBe(expected);
+    expect(expected).toContain('"maxSupportedTransactionVersion":1');
+    const record = (
+      get(readJson(dir, CPMM_EVIDENCE_FILES.ledger), "records", "value") as unknown[]
+    )[0];
+    expect(record).toMatchObject({ factKind: "RESOLVED_SWAPS", factCode: null });
+    // Credentialed: dependency reproduced, the synthetic v1 swap decoded and matched.
+    const v = verifyCpmmObservationEvidence(dir, {
+      ...ANALYSIS,
+      acquisitionDir: acquisition.outDir,
+    });
+    expect(v).toMatchObject({
+      integrity: { ok: true, problems: [] },
+      retention: { status: "COMPLETE" },
+      poolContextProvenance: "ACQUIRED_BOUND",
+      acquisitionProvenance: "ACQUIRED_BOUND",
+      acquisitionBinding: { status: "REPRODUCED", findings: [] },
+      rederivation: { implementedComponents: "REPRODUCED" },
+    });
+    expect(txOf(v)).toMatchObject(MATCHED_SWAP);
+    expect(v.flags).toEqual(CPMM_EVIDENCE_FALSE_FLAGS);
+    // Without credentials: the binding still holds and the analysis is explicitly unavailable.
+    const plain = verifyCpmmObservationEvidence(dir, { acquisitionDir: acquisition.outDir });
+    expect(plain).toMatchObject({
+      integrity: { ok: true },
+      acquisitionBinding: { status: "REPRODUCED" },
+    });
+    expect(txOf(plain)).toMatchObject(UNCREDENTIALED);
+  });
+
+  it("S3-2: schema 3 always verifies its acquisition dependency; nothing falls through to supplied handling", async () => {
+    const { acquisition, dir } = await v1Bundle();
+    for (const [options, finding] of [
+      [ANALYSIS, "MISSING_EVIDENCE:ACQUISITION_DIRECTORY_NOT_SUPPLIED"],
+      [{ acquisitionDir: path.join(freshRoot(), "absent") }, "MISSING_EVIDENCE:ACQUISITION:BUNDLE"],
+    ] as const) {
+      const v = verifyCpmmObservationEvidence(dir, options);
+      expect(v).toMatchObject({
+        integrity: { ok: true },
+        poolContextProvenance: null,
+        acquisitionProvenance: "OPEN_G3",
+        acquisitionBinding: { status: "MISSING_EVIDENCE", findings: [finding] },
+      });
+    }
+    // A different (even reproducing) dependency, and a tampered one, are mismatches.
+    const other = await sealAcquisition("success", "other-acquisition-v1");
+    expect(verifyCpmmObservationEvidence(dir, { acquisitionDir: other.outDir })).toMatchObject({
+      integrity: { ok: true },
+      poolContextProvenance: null,
+      acquisitionBinding: {
+        status: "MISMATCH",
+        findings: ["MISMATCH:ACQUISITION_MANIFEST_DIGEST"],
+      },
+    });
+    const corrupt = path.join(freshRoot(), path.basename(acquisition.outDir));
+    cpSync(acquisition.outDir, corrupt, { recursive: true });
+    const accountsPath = path.join(corrupt, "accounts.json");
+    const bytes = readFileSync(accountsPath);
+    bytes[1] = 0x20;
+    writeFileSync(accountsPath, bytes);
+    expect(verifyCpmmObservationEvidence(dir, { acquisitionDir: corrupt })).toMatchObject({
+      integrity: { ok: true },
+      poolContextProvenance: null,
+      acquisitionBinding: {
+        status: "MISMATCH",
+        findings: ["MISMATCH:ACQUISITION_INTEGRITY:FILE_HASH_MISMATCH"],
+      },
+    });
+    // Removing or relabelling the dependency reference is an integrity failure, not schema 1.
+    const integrityProblems = (mutate: (d: string) => void): readonly string[] => {
+      const copy = copyOf(dir);
+      mutate(copy);
+      const v = verifyCpmmObservationEvidence(copy, { acquisitionDir: acquisition.outDir });
+      expect(v.integrity.ok).toBe(false);
+      expect(v.poolContextProvenance).toBeNull();
+      expect(v.acquisitionBinding).toBeUndefined();
+      return v.integrity.problems;
+    };
+    expect(
+      integrityProblems((d) =>
+        reseal(d, CPMM_EVIDENCE_FILES.poolContext, (c) => delete c.acquisitionManifestSha256),
+      ),
+    ).toContain("POOL_CONTEXT_ACQUISITION_REFERENCE_INVALID");
+    expect(
+      integrityProblems((d) =>
+        reseal(d, CPMM_EVIDENCE_FILES.poolContext, (c) => (c.acquisition = "SUPPLIED_UNVERIFIED")),
+      ),
+    ).toContain("POOL_CONTEXT_PROVENANCE_INVALID");
+    expect(
+      integrityProblems((d) =>
+        reseal(d, CPMM_EVIDENCE_FILES.report, (r) => {
+          r.poolContextProvenance = "SUPPLIED_UNVERIFIED";
+          r.acquisitionProvenance = "OPEN_G3";
+        }),
+      ),
+    ).toEqual(
+      expect.arrayContaining([
+        "REPORT_POOL_PROVENANCE_INVALID",
+        "REPORT_ACQUISITION_PROVENANCE_INVALID",
+      ]),
+    );
+  });
+
+  it("S3-3: the writer refuses inconsistent request policies before any directory exists", async () => {
+    const { run, acquisition } = await v1Bundle();
+    const refusedWith = (input: SealCpmmObservationInput, code: string) => {
+      const r = sealCpmmObservationEvidence(input);
+      expect(r, code).toMatchObject({ ok: false, status: "SEAL_INPUT_INVALID", code });
+      expect(existsSync(outDirOf(input.projectRoot))).toBe(false);
+    };
+    // Schema 3 exists only with an acquisition dependency.
+    refusedWith(inputFor(run), "TRANSACTION_REQUEST_POLICY_REQUIRES_ACQUISITION");
+    // The plan may state only the v1-capable policy, exactly.
+    const withAcq = { acquisitionDir: acquisition.outDir };
+    for (const [request, code] of [
+      [{ maxSupportedTransactionVersion: 0 }, "PLAN_TRANSACTION_REQUEST_INVALID"],
+      [{ maxSupportedTransactionVersion: 2 }, "PLAN_TRANSACTION_REQUEST_INVALID"],
+      [{ maxSupportedTransactionVersion: "1" }, "PLAN_TRANSACTION_REQUEST_INVALID"],
+      [{ maxSupportedTransactionVersion: 1, extra: 1 }, "PLAN_TRANSACTION_REQUEST_UNEXPECTED_KEY"],
+      [{}, "PLAN_TRANSACTION_REQUEST_MISSING_KEY"],
+      [null, "PLAN_TRANSACTION_REQUEST_NOT_PLAIN_OBJECT"],
+      [[1], "PLAN_TRANSACTION_REQUEST_NOT_PLAIN_OBJECT"],
+    ] as const) {
+      refusedWith(inputFor(run, withAcq, request), code);
+    }
+    // A cap-0 run's requests cannot be sealed under the v1-capable schema.
+    const cap0 = (await shared).run;
+    refusedWith(inputFor(cap0, withAcq), "SNAPSHOT_EXCHANGE_REQUEST_POLICY_MISMATCH");
+    // The schema-2 writer is unchanged: a cap-1 run sealed without the policy still seals, and
+    // verification enforces schema 2's cap-0 request against it (never inferring the policy).
+    const asSchema2 = sealed(inputFor(run, withAcq, NO_POLICY));
+    expect(readJson(asSchema2, CPMM_EVIDENCE_FILES.manifest)).toMatchObject({
+      evidenceSchemaVersion: 2,
+    });
+    const v = verifyCpmmObservationEvidence(asSchema2, { ...ANALYSIS, ...withAcq });
+    expect(v).toMatchObject({
+      integrity: { ok: true },
+      acquisitionBinding: { status: "REPRODUCED" },
+    });
+    expect(txOf(v).findings).toEqual(
+      expect.arrayContaining(["MISMATCH:REQUEST_BODY", "MISMATCH:FACT_MISMATCH"]),
+    );
+    expect(txOf(v).exchanges[0]).toMatchObject({
+      decoded: { kind: "UNRESOLVED", code: "UNSUPPORTED_TRANSACTION_VERSION" },
+      recorded: { factKind: "RESOLVED_SWAPS" },
+      comparison: "MISMATCH",
+    });
+  });
+
+  it("S3-4: manifest, report, context and plan policies must agree; unknown schemas are refused", async () => {
+    const { acquisition, dir } = await v1Bundle();
+    const options = { ...ANALYSIS, acquisitionDir: acquisition.outDir };
+    const problemsOf = (
+      base: string,
+      ...edits: [string, (d: Record<string, unknown>) => void][]
+    ) => {
+      const copy = copyOf(base);
+      for (const [file, mutate] of edits) reseal(copy, file, mutate);
+      return verifyCpmmObservationEvidence(copy, options);
+    };
+    const M = CPMM_EVIDENCE_FILES.manifest;
+    const R = CPMM_EVIDENCE_FILES.report;
+    const C = CPMM_EVIDENCE_FILES.poolContext;
+    const P = CPMM_EVIDENCE_FILES.plan;
+    // Unknown schemas stop at the manifest.
+    for (const schema of [0, 4, "3", null, 3.5, 99]) {
+      const v = problemsOf(dir, [M, (m) => (m.evidenceSchemaVersion = schema)]);
+      expect(v.integrity).toEqual({ ok: false, problems: ["EVIDENCE_SCHEMA_VERSION_UNSUPPORTED"] });
+      expect(v.retention.status).toBe("NOT_EVALUATED");
+    }
+    // The manifest's schema alone changed: the documents contradict it.
+    for (const schema of [1, 2]) {
+      const v = problemsOf(dir, [M, (m) => (m.evidenceSchemaVersion = schema)]);
+      expect(v.integrity.ok).toBe(false);
+      expect(v.integrity.problems).toEqual(
+        expect.arrayContaining([`FILE_VERSION_UNSUPPORTED:${C}`, `FILE_VERSION_UNSUPPORTED:${R}`]),
+      );
+    }
+    for (const [file, problem] of [
+      [C, `FILE_VERSION_UNSUPPORTED:${C}`],
+      [R, `FILE_VERSION_UNSUPPORTED:${R}`],
+    ] as const) {
+      const v = problemsOf(dir, [file, (d) => (d.version = 2)]);
+      expect(v.integrity.problems).toContain(problem);
+    }
+    // The plan's and the report's policy records.
+    const planPolicy = (value: unknown) => (d: Record<string, unknown>) => {
+      const p = d.plan as Record<string, unknown>;
+      if (value === undefined) delete p.transactionRequest;
+      else p.transactionRequest = value;
+    };
+    const reportPolicy = (value: unknown) => (d: Record<string, unknown>) => {
+      if (value === undefined) delete d.transactionRequest;
+      else d.transactionRequest = value;
+    };
+    for (const value of [
+      undefined,
+      { maxSupportedTransactionVersion: 0 },
+      { maxSupportedTransactionVersion: "1" },
+      { maxSupportedTransactionVersion: 1, extra: true },
+      null,
+    ]) {
+      expect(problemsOf(dir, [P, planPolicy(value)]).integrity.problems).toEqual([
+        "PLAN_TRANSACTION_REQUEST_POLICY_INVALID",
+      ]);
+      expect(problemsOf(dir, [R, reportPolicy(value)]).integrity.problems).toEqual([
+        "REPORT_TRANSACTION_REQUEST_POLICY_INVALID",
+      ]);
+    }
+    // A consistent downgrade to schema 2: integrity holds, but schema 2's cap-0 request policy is
+    // enforced against the cap-1 requests (and the cap-0 decoder against the v1 response).
+    const downgraded = problemsOf(
+      dir,
+      [C, (d) => (d.version = 2)],
+      [R, (d) => ((d.version = 2), delete d.transactionRequest)],
+      [P, planPolicy(undefined)],
+      [M, (m) => (m.evidenceSchemaVersion = 2)],
+    );
+    expect(downgraded.integrity).toEqual({ ok: true, problems: [] });
+    expect(downgraded.acquisitionBinding?.status).toBe("REPRODUCED");
+    expect(txOf(downgraded).findings).toEqual(
+      expect.arrayContaining(["MISMATCH:REQUEST_BODY", "MISMATCH:FACT_MISMATCH"]),
+    );
+    expect(downgraded.rederivation.implementedComponents).toBe("MISMATCH");
+    // A cap-0 schema-2 bundle relabelled consistently as schema 3: its requests contradict it.
+    const cap0 = await genuineRun({ responder: unsupportedVersion });
+    const schema2 = sealed(inputFor(cap0, { acquisitionDir: acquisition.outDir }, NO_POLICY));
+    const upgraded = problemsOf(
+      schema2,
+      [C, (d) => (d.version = 3)],
+      [R, (d) => ((d.version = 3), (d.transactionRequest = { ...V1_REQUEST }))],
+      [P, planPolicy({ ...V1_REQUEST })],
+      [M, (m) => (m.evidenceSchemaVersion = 3)],
+    );
+    expect(upgraded.integrity).toEqual({ ok: true, problems: [] });
+    expect(txOf(upgraded).findings).toContain("MISMATCH:REQUEST_BODY");
+    // Policy records are never accepted on schemas 1 and 2.
+    expect(problemsOf(schema2, [P, planPolicy({ ...V1_REQUEST })]).integrity.problems).toEqual([
+      "PLAN_TRANSACTION_REQUEST_POLICY_INVALID",
+    ]);
+    expect(
+      problemsOf((await shared).dir, [R, reportPolicy({ ...V1_REQUEST })]).integrity.problems,
+    ).toEqual(["REPORT_TRANSACTION_REQUEST_POLICY_INVALID"]);
+    // An unbound schema-1 bundle relabelled as schema 3 has no dependency: integrity fails.
+    const relabelled = problemsOf(
+      (await shared).dir,
+      [C, (d) => (d.version = 3)],
+      [R, (d) => ((d.version = 3), (d.transactionRequest = { ...V1_REQUEST }))],
+      [P, planPolicy({ ...V1_REQUEST })],
+      [M, (m) => (m.evidenceSchemaVersion = 3)],
+    );
+    expect(relabelled.integrity.ok).toBe(false);
+    expect(relabelled.integrity.problems).toEqual(
+      expect.arrayContaining([
+        "POOL_CONTEXT_PROVENANCE_INVALID",
+        "POOL_CONTEXT_ACQUISITION_REFERENCE_INVALID",
+      ]),
+    );
+    expect(relabelled.poolContextProvenance).toBeNull();
+  });
+
+  it("S3-5: a historical-shaped schema-2 cap-0 bundle with retained -32015 errors verifies unchanged", async () => {
+    const { acquisition } = await v1Bundle();
+    const run = await genuineRun({ responder: unsupportedVersion });
+    const dir = sealed(inputFor(run, { acquisitionDir: acquisition.outDir }, NO_POLICY));
+    expect(readJson(dir, CPMM_EVIDENCE_FILES.manifest)).toMatchObject({ evidenceSchemaVersion: 2 });
+    expect(get(readJson(dir, CPMM_EVIDENCE_FILES.plan), "plan", "transactionRequest")).toBe(
+      undefined,
+    );
+    expect(readJson(dir, CPMM_EVIDENCE_FILES.report).transactionRequest).toBe(undefined);
+    const ex = readJson(dir, exchangePathOf(dir));
+    const id = get(ex, "entry", "jsonRpcId") as number;
+    expect(get(ex, "requestBody", "stored")).toBe(
+      JSON.stringify({
+        jsonrpc: "2.0",
+        id,
+        method: "getTransaction",
+        params: [signatureOf(1), CPMM_GET_TRANSACTION_CONFIG],
+      }),
+    );
+    const record = (
+      get(readJson(dir, CPMM_EVIDENCE_FILES.ledger), "records", "value") as unknown[]
+    )[0];
+    expect(record).toMatchObject({ factKind: "RPC_ERROR", factCode: "JSON_RPC_ERROR" });
+    // Without credentials (as for cpmm-observation-03): binding verified, no request mismatch,
+    // and the analysis explicitly unavailable rather than claimed.
+    const plain = verifyCpmmObservationEvidence(dir, { acquisitionDir: acquisition.outDir });
+    expect(plain).toMatchObject({
+      integrity: { ok: true, problems: [] },
+      retention: { status: "COMPLETE" },
+      poolContextProvenance: "ACQUIRED_BOUND",
+      acquisitionBinding: { status: "REPRODUCED" },
+    });
+    expect(txOf(plain)).toMatchObject(UNCREDENTIALED);
+    expect(txOf(plain).exchanges[0]).toMatchObject({
+      notAnalysed: "ANALYSIS_CREDENTIALS_NOT_SUPPLIED",
+      recorded: { factKind: "RPC_ERROR", factCode: "JSON_RPC_ERROR" },
+      comparison: "NOT_COMPARED_ANALYSIS_UNAVAILABLE",
+    });
+    // With the synthetic run's credentials the retained error re-classifies and matches.
+    const full = verifyCpmmObservationEvidence(dir, {
+      ...ANALYSIS,
+      acquisitionDir: acquisition.outDir,
+    });
+    expect(txOf(full)).toMatchObject({
+      status: "REPRODUCED",
+      findings: [],
+      exchanges: [
+        {
+          decoded: { kind: "RPC_ERROR", code: "JSON_RPC_ERROR" },
+          recorded: { factKind: "RPC_ERROR", factCode: "JSON_RPC_ERROR" },
+          comparison: "MATCHED",
+        },
+      ],
+    });
   });
 });

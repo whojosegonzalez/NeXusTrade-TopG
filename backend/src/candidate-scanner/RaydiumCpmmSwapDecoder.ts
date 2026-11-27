@@ -3,7 +3,8 @@
  *
  * Decodes `swap_base_input` / `swap_base_output` invocations of the Raydium CPMM program
  * against one verified pool (the Stage 1 adapter's `RaydiumCpmmPoolStateSuccess`) from a
- * `getTransaction` response in `encoding: "json"` (legacy or v0). It performs no network,
+ * `getTransaction` response in `encoding: "json"` (legacy, v0, or v1 when the caller's request
+ * policy allowed it; see "Transaction versions" below). It performs no network,
  * RPC, timer, clock, wallet or filesystem access, and is not connected to flow tracking,
  * admission or any failed-transaction (zero-swap) policy.
  *
@@ -30,6 +31,29 @@
  *    core/cpi (privilege rules, stack depth), rpc/http/gettransaction (fields), and the
  *    solana-cpi `invoke` documentation (a failed callee fails the whole transaction).
  *  Deployed-bytecode correspondence is not verified.
+ *
+ * Transaction versions (`SOLANA_TRANSACTION_VERSION_SOURCE_REFERENCES`, pinned):
+ *  - The response's `version` must be present and one of `"legacy"`, `0` or `1`, and must not
+ *    exceed the request policy's `maxSupportedTransactionVersion` (option; default `0`, the
+ *    historical policy, under which v1 is refused exactly as before). Agave's `validate_version`
+ *    returns v1 only when the request allowed it, so a v1 body under a cap of 0 contradicts the
+ *    request and is refused (UNSUPPORTED_TRANSACTION_VERSION). Any other value is refused.
+ *  - v1 (SIMD-0385) has static accounts only: `addressTableLookups` must be absent (Agave omits
+ *    it) and `meta.loadedAddresses`, if present, must be empty, as for legacy. Agave serializes
+ *    `transactionConfig` only for v1, as an object with exactly four keys whose unset values are
+ *    JSON `null`; legacy and v0 messages must not carry the key at all.
+ *  - Protocol constraints (SIMD-0385, `SOLANA_V1_PROTOCOL_LIMITS`): at most 12 signatures, 64
+ *    static accounts, 64 instructions, 255 accounts per instruction and 4,096 serialized bytes
+ *    (recomputed exactly from the JSON fields and the SIMD-0385 wire layout); a heap size, when
+ *    set, is a 1 KiB multiple in [32 KiB, 256 KiB]; u32 fields are in [0, 2^32 - 1]. Violations
+ *    are INVALID_PAYLOAD. The reference SDK sanitizer (solana-sdk 7b382f65) does not itself
+ *    enforce the 64/12/4,096/heap bounds; this decoder applies the SIMD's stated rules and fails
+ *    closed on a body that breaks them.
+ *  - Application limit (narrower supported subset): `priorityFee` is a u64 on chain, but only
+ *    values that survive JSON parsing exactly (at most Number.MAX_SAFE_INTEGER) are accepted;
+ *    larger values are EVIDENCE_LIMIT_EXCEEDED, never rounded. CPMM_DECODER_LIMITS apply as well.
+ *  - ComputeBudgetProgram instructions in a v1 message are configuration no-ops (SIMD-0385); they
+ *    are ordinary non-CPMM instructions to this decoder and need no special handling.
  */
 
 import { PublicKey } from "@solana/web3.js";
@@ -107,6 +131,60 @@ export const CPMM_DECODER_LIMITS = Object.freeze({
   maxStackHeight: 9,
 });
 
+/**
+ * Primary specification and source revisions for transaction-version handling (pinned commits).
+ * SIMD-0385's revision is the latest commit touching the proposal ("Mark SIMDs as Activated").
+ */
+export const SOLANA_TRANSACTION_VERSION_SOURCE_REFERENCES = Object.freeze({
+  simd0385:
+    "https://github.com/solana-foundation/solana-improvement-documents/blob/6cc17538e26601e65beca89bbfa761e755720956/proposals/0385-transaction-v1.md",
+  agaveUiRawMessage:
+    "https://github.com/anza-xyz/agave/blob/318c00ca5aab27ad348e19f7a0c3c3ae7f229ed6/transaction-status-client-types/src/lib.rs",
+  agaveValidateVersion:
+    "https://github.com/anza-xyz/agave/blob/318c00ca5aab27ad348e19f7a0c3c3ae7f229ed6/transaction-status/src/lib.rs",
+  agaveUnsupportedVersionError:
+    "https://github.com/anza-xyz/agave/blob/318c00ca5aab27ad348e19f7a0c3c3ae7f229ed6/rpc-client-api/src/custom_error.rs",
+  sdkTransactionVersion:
+    "https://github.com/anza-xyz/solana-sdk/blob/7b382f65da053cb91e7debc912aaf969a01a5859/transaction/src/versioned/mod.rs",
+  sdkV1Message:
+    "https://github.com/anza-xyz/solana-sdk/blob/7b382f65da053cb91e7debc912aaf969a01a5859/message/src/versions/v1/mod.rs",
+  sdkV1Config:
+    "https://github.com/anza-xyz/solana-sdk/blob/7b382f65da053cb91e7debc912aaf969a01a5859/message/src/versions/v1/config.rs",
+});
+
+/** Transaction versions this decoder can read (the request policy may allow fewer). */
+export type CpmmTransactionVersion = "legacy" | 0 | 1;
+/** The `maxSupportedTransactionVersion` values a request policy may use. */
+export type CpmmMaxSupportedTransactionVersion = 0 | 1;
+
+/** SIMD-0385 protocol constraints for v1 transactions (not application limits). */
+export const SOLANA_V1_PROTOCOL_LIMITS = Object.freeze({
+  maxTransactionBytes: 4_096,
+  maxSignatures: 12,
+  maxStaticAccounts: 64,
+  maxInstructions: 64,
+  maxAccountsPerInstruction: 255,
+  minHeapSizeBytes: 32 * 1024,
+  maxHeapSizeBytes: 256 * 1024,
+  heapSizeGranularityBytes: 1_024,
+  maxU32: 0xffff_ffff,
+  /** VersionByte, LegacyHeader (3), TransactionConfigMask (u32), LifetimeSpecifier, two u8 counts. */
+  fixedHeaderBytes: 1 + 3 + 4 + 32 + 1 + 1,
+  /** (ProgramAccountIndex u8, NumInstructionAccounts u8, NumInstructionDataBytes u16). */
+  instructionHeaderBytes: 4,
+  /** Priority fee occupies two 4-byte ConfigValues slots (both mask bits 0 and 1). */
+  priorityFeeConfigBytes: 8,
+  u32ConfigBytes: 4,
+});
+
+/** The exact `UiTransactionConfig` keys Agave serializes (camelCase, no skipped fields). */
+export const SOLANA_V1_TRANSACTION_CONFIG_KEYS = Object.freeze([
+  "priorityFee",
+  "computeUnitLimit",
+  "loadedAccountsDataSizeLimit",
+  "heapSize",
+] as const);
+
 /** blockTime (seconds) for which blockTime * 1000 is still a safe integer. */
 export const MAX_BLOCK_TIME_SEC = Math.floor(Number.MAX_SAFE_INTEGER / 1000);
 
@@ -117,6 +195,11 @@ export const MAX_BLOCK_TIME_SEC = Math.floor(Number.MAX_SAFE_INTEGER / 1000);
 export interface DecodeCpmmSwapOptions {
   /** Host receipt time in integer milliseconds; required (the decoder has no clock). */
   readonly receiptTimestampMs: number;
+  /**
+   * The `maxSupportedTransactionVersion` the request carried (0 or 1). Omitted means 0, the
+   * historical policy: legacy and v0 only. A response version above it contradicts the request.
+   */
+  readonly maxSupportedTransactionVersion?: CpmmMaxSupportedTransactionVersion;
 }
 
 /**
@@ -336,16 +419,104 @@ interface ResolvedMessage {
   readonly numRequiredSignatures: number;
 }
 
+/** Empty `meta.loadedAddresses` (or none) for a message without address table lookups. */
+function requireNoLoadedAddresses(loaded: unknown, detail: string, label: string): void {
+  if (loaded === undefined || loaded === null) return;
+  if (
+    !isPlainObject(loaded) ||
+    !Array.isArray(loaded.writable) ||
+    !Array.isArray(loaded.readonly) ||
+    loaded.writable.length !== 0 ||
+    loaded.readonly.length !== 0
+  ) {
+    refuse("MALFORMED_ACCOUNT_KEYS", detail, `${label} message with loaded addresses`);
+  }
+}
+
+interface V1Config {
+  /** Serialized ConfigValues bytes implied by the non-null fields (mask popcount x 4). */
+  readonly configBytes: number;
+}
+
+/**
+ * The v1 `transactionConfig` (Agave `UiTransactionConfig`): a plain object with exactly the four
+ * documented keys, each `null` (mask bit unset) or a valid value for its field.
+ */
+function validateV1TransactionConfig(raw: unknown): V1Config {
+  const P = SOLANA_V1_PROTOCOL_LIMITS;
+  const bad = (m: string): never => refuse("INVALID_PAYLOAD", "TRANSACTION_CONFIG", m);
+  if (!isPlainObject(raw)) return bad("v1 transactionConfig must be an object");
+  const c = raw as Record<string, unknown>;
+  const keys = Object.keys(c);
+  if (
+    keys.length !== SOLANA_V1_TRANSACTION_CONFIG_KEYS.length ||
+    !SOLANA_V1_TRANSACTION_CONFIG_KEYS.every((k) => hasOwn(c, k))
+  ) {
+    bad("v1 transactionConfig must have exactly the four documented keys");
+  }
+  let configBytes = 0;
+  const fee = c.priorityFee;
+  if (fee !== null) {
+    if (typeof fee !== "number" || !Number.isInteger(fee) || fee < 0) {
+      bad("priorityFee must be null or a non-negative integer");
+    }
+    if (!Number.isSafeInteger(fee)) {
+      refuse(
+        "EVIDENCE_LIMIT_EXCEEDED",
+        "TRANSACTION_CONFIG_UNSAFE_INTEGER",
+        "priorityFee exceeds the exactly representable range (application limit)",
+      );
+    }
+    configBytes += P.priorityFeeConfigBytes;
+  }
+  for (const k of ["computeUnitLimit", "loadedAccountsDataSizeLimit", "heapSize"] as const) {
+    const v = c[k];
+    if (v === null) continue;
+    if (typeof v !== "number" || !Number.isSafeInteger(v) || v < 0 || v > P.maxU32) {
+      bad(`${k} must be null or a u32`);
+    }
+    configBytes += P.u32ConfigBytes;
+  }
+  const heap = c.heapSize;
+  if (
+    heap !== null &&
+    ((heap as number) % P.heapSizeGranularityBytes !== 0 ||
+      (heap as number) < P.minHeapSizeBytes ||
+      (heap as number) > P.maxHeapSizeBytes)
+  ) {
+    bad("heapSize must be a 1 KiB multiple in [32 KiB, 256 KiB]");
+  }
+  return { configBytes };
+}
+
 function resolveAccounts(
   message: Record<string, unknown>,
   meta: Record<string, unknown>,
-  version: "legacy" | 0,
+  version: CpmmTransactionVersion,
   signatures: readonly unknown[],
-): ResolvedMessage {
+): ResolvedMessage & { readonly v1: V1Config | null } {
   const L = CPMM_DECODER_LIMITS;
+  const P = SOLANA_V1_PROTOCOL_LIMITS;
+  // transactionConfig is serialized for v1 only (Agave omits it for legacy and v0).
+  let v1: V1Config | null = null;
+  if (version === 1) {
+    if (!hasOwn(message, "transactionConfig")) {
+      refuse("INVALID_PAYLOAD", "TRANSACTION_CONFIG", "v1 message lacks transactionConfig");
+    }
+    v1 = validateV1TransactionConfig(message.transactionConfig);
+  } else if (hasOwn(message, "transactionConfig")) {
+    refuse(
+      "INVALID_PAYLOAD",
+      "TRANSACTION_CONFIG_FORBIDDEN",
+      "transactionConfig is only defined for v1 messages",
+    );
+  }
   const keys = message.accountKeys;
   if (!Array.isArray(keys)) refuse("INVALID_PAYLOAD", null, "message.accountKeys must be an array");
   const staticKeys = keys as unknown[];
+  if (version === 1 && staticKeys.length > P.maxStaticAccounts) {
+    refuse("INVALID_PAYLOAD", "V1_ACCOUNT_KEYS", "v1 allows at most 64 static accounts");
+  }
   if (staticKeys.length > L.maxAccountKeys) {
     refuse("EVIDENCE_LIMIT_EXCEEDED", "ACCOUNT_KEYS", "too many static account keys");
   }
@@ -374,6 +545,9 @@ function resolveAccounts(
   if (signatures.length !== req || !signatures.every((s) => isValidSolanaSignature(s))) {
     refuse("INVALID_PAYLOAD", "SIGNATURES", "signatures must match numRequiredSignatures");
   }
+  if (version === 1 && (req as number) > P.maxSignatures) {
+    refuse("INVALID_PAYLOAD", "V1_SIGNATURES", "v1 allows at most 12 signatures");
+  }
   let writable: unknown[] = [];
   let readonly: unknown[] = [];
   const loaded = meta.loadedAddresses;
@@ -382,17 +556,13 @@ function resolveAccounts(
     if (lookups !== undefined) {
       refuse("MALFORMED_ACCOUNT_KEYS", "LEGACY_LOOKUPS", "legacy message carries lookups");
     }
-    if (loaded !== undefined && loaded !== null) {
-      if (
-        !isPlainObject(loaded) ||
-        !Array.isArray(loaded.writable) ||
-        !Array.isArray(loaded.readonly) ||
-        loaded.writable.length !== 0 ||
-        loaded.readonly.length !== 0
-      ) {
-        refuse("MALFORMED_ACCOUNT_KEYS", "LEGACY_LOADED", "legacy message with loaded addresses");
-      }
+    requireNoLoadedAddresses(loaded, "LEGACY_LOADED", "legacy");
+  } else if (version === 1) {
+    // SIMD-0385: no address lookup tables; Agave omits the key (never null or []).
+    if (hasOwn(message, "addressTableLookups")) {
+      refuse("MALFORMED_ACCOUNT_KEYS", "V1_LOOKUPS", "v1 message carries addressTableLookups");
     }
+    requireNoLoadedAddresses(loaded, "V1_LOADED", "v1");
   } else {
     if (!Array.isArray(lookups)) {
       refuse("MALFORMED_ACCOUNT_KEYS", "V0_LOOKUPS", "v0 message lacks addressTableLookups");
@@ -436,7 +606,36 @@ function resolveAccounts(
   if (new Set(all).size !== all.length) {
     refuse("MALFORMED_ACCOUNT_KEYS", "DUPLICATE", "duplicate account key");
   }
-  return { accounts: all as string[], numRequiredSignatures: req as number };
+  return { accounts: all as string[], numRequiredSignatures: req as number, v1 };
+}
+
+/**
+ * SIMD-0385 instruction constraints and the exact serialized size of a v1 transaction, from its
+ * JSON fields: fixed header, 32 bytes per static address, the ConfigValues implied by the non-null
+ * config fields, a 4-byte header plus account indexes and data per instruction, 64 bytes per
+ * signature. JSON encoding carries no wire bytes, so this recomputation is the size check.
+ */
+function checkV1Size(
+  top: readonly CompiledInstruction[],
+  staticAccounts: number,
+  signatures: number,
+  v1: V1Config,
+): void {
+  const P = SOLANA_V1_PROTOCOL_LIMITS;
+  let bytes = P.fixedHeaderBytes + 32 * staticAccounts + v1.configBytes + 64 * signatures;
+  for (const ix of top) {
+    if (ix.accountIndexes.length > P.maxAccountsPerInstruction) {
+      refuse(
+        "INVALID_PAYLOAD",
+        "V1_INSTRUCTION_ACCOUNTS",
+        "v1 allows 255 accounts per instruction",
+      );
+    }
+    bytes += P.instructionHeaderBytes + ix.accountIndexes.length + ix.data.length;
+  }
+  if (bytes > P.maxTransactionBytes) {
+    refuse("INVALID_PAYLOAD", "V1_TRANSACTION_SIZE", "v1 transaction exceeds 4,096 bytes");
+  }
 }
 
 interface CompiledInstruction {
@@ -859,7 +1058,23 @@ export function decodeRaydiumCpmmTransactionSwaps(
     // 1. Options: a required injected receipt time and nothing else (no clock, no override).
     if (!isPlainObject(options)) refuse("INVALID_OPTIONS", null, "options are required");
     for (const k of Object.keys(options)) {
-      if (k !== "receiptTimestampMs") refuse("INVALID_OPTIONS", k, `unsupported option ${k}`);
+      if (k !== "receiptTimestampMs" && k !== "maxSupportedTransactionVersion") {
+        refuse("INVALID_OPTIONS", k, `unsupported option ${k}`);
+      }
+    }
+    // The request policy: omitted means the historical cap of 0; only 0 and 1 are defined.
+    let maxVersion: CpmmMaxSupportedTransactionVersion = 0;
+    if (hasOwn(options, "maxSupportedTransactionVersion")) {
+      const cap = (options as { maxSupportedTransactionVersion?: unknown })
+        .maxSupportedTransactionVersion;
+      if (cap !== 0 && cap !== 1) {
+        refuse(
+          "INVALID_OPTIONS",
+          "maxSupportedTransactionVersion",
+          "maxSupportedTransactionVersion must be 0 or 1",
+        );
+      }
+      maxVersion = cap as CpmmMaxSupportedTransactionVersion;
     }
     const receiptTimestampMs = options.receiptTimestampMs;
     if (!Number.isSafeInteger(receiptTimestampMs) || receiptTimestampMs <= 0) {
@@ -888,11 +1103,15 @@ export function decodeRaydiumCpmmTransactionSwaps(
       refuse("INVALID_SLOT", null, "slot must be a non-negative safe integer");
     slot = rawSlot as number;
     const version = (payload as Record<string, unknown>).version;
-    if (version !== "legacy" && version !== 0) {
+    // "legacy" is accepted under every cap; a number only up to the request's cap. A v1 body under
+    // a cap of 0 contradicts the request and is refused exactly as before v1 was supported.
+    if (version !== "legacy" && !(version === 0 || (version === 1 && maxVersion >= 1))) {
       refuse(
         "UNSUPPORTED_TRANSACTION_VERSION",
         version === undefined ? "VERSION_MISSING" : String(version),
-        "only legacy and v0 are supported, with the version field present",
+        maxVersion === 0
+          ? "only legacy and v0 are supported, with the version field present"
+          : "only legacy, v0 and v1 are supported, with the version field present",
       );
     }
     if (!isPlainObject(meta) || !hasOwn(meta, "err") || meta.err === undefined) {
@@ -900,17 +1119,27 @@ export function decodeRaydiumCpmmTransactionSwaps(
     }
     const m = meta as Record<string, unknown>;
     // 4. Accounts and top-level instructions (preconditions of every later result).
-    const resolved = resolveAccounts(t.message, m, version as "legacy" | 0, t.signatures);
+    const resolved = resolveAccounts(t.message, m, version as CpmmTransactionVersion, t.signatures);
     const A = resolved.accounts;
     const rawTop = t.message.instructions;
     if (!Array.isArray(rawTop))
       refuse("INVALID_PAYLOAD", null, "message.instructions must be an array");
+    if (
+      resolved.v1 !== null &&
+      (rawTop as unknown[]).length > SOLANA_V1_PROTOCOL_LIMITS.maxInstructions
+    ) {
+      refuse("INVALID_PAYLOAD", "V1_INSTRUCTIONS", "v1 allows at most 64 instructions");
+    }
     if ((rawTop as unknown[]).length > L.maxTopLevelInstructions) {
       refuse("EVIDENCE_LIMIT_EXCEEDED", "TOP_LEVEL", "too many top-level instructions");
     }
     const top = (rawTop as unknown[]).map((ix, i) =>
       parseInstruction(ix, A, `instruction ${i}`, false),
     );
+    if (resolved.v1 !== null) {
+      // Static accounts only (lookups refused above), so every account is a static address.
+      checkV1Size(top, A.length, resolved.numRequiredSignatures, resolved.v1);
+    }
     // 5. Recorded failure: not zero-swap evidence.
     if (m.err !== null) {
       return { ok: false, status: "TRANSACTION_FAILED", signature, slot, events: [] };

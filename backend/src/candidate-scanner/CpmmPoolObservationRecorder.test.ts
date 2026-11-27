@@ -650,6 +650,7 @@ function env(o: EnvOptions = {}) {
     secrets: [RPC_URL, SECRET],
     maxTrackedSignatures: 32,
     maxResponseBytes: 100_000,
+    maxSupportedTransactionVersion: 0,
   });
   const ledger = new CpmmResolutionAccountingLedger({
     binding: adapter.getBinding(),

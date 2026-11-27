@@ -1390,3 +1390,360 @@ describe("Raydium CPMM swap decoder (synthetic, offline)", () => {
     expectRefused(decode(hostile), "INVALID_PAYLOAD");
   });
 });
+
+// ---------------------------------------------------------------------------------------------
+// Solana transaction v1 (SIMD-0385): SYNTHETIC, specification-grounded fixtures
+// ---------------------------------------------------------------------------------------------
+//
+// Every v1 payload below is SYNTHETIC: built in memory from the JSON shape Agave serializes for a
+// v1 message (agave 318c00ca, transaction-status-client-types `UiRawMessage`: no
+// `addressTableLookups`, a `transactionConfig` object of exactly four camelCase keys with unset
+// values serialized as `null`; `version` serialized as the number 1 by the untagged
+// `TransactionVersion`, solana-sdk 7b382f65) and the constraints of SIMD-0385 (6cc17538). None of
+// it is observed mainnet evidence: the four version-1 exchanges of cpmm-observation-03 hold only
+// JSON-RPC -32015 errors (no v1 transaction payload), and no relabelled v0 capture is used here.
+
+const COMPUTE_BUDGET = "ComputeBudget111111111111111111111111111111";
+/** SetComputeUnitLimit(200_000): a configuration no-op in a v1 transaction (SIMD-0385). */
+const computeBudgetNoOp = (): Ix => ({
+  program: COMPUTE_BUDGET,
+  accounts: [],
+  data: Uint8Array.from([2, 0x40, 0x0d, 0x03, 0x00]),
+});
+const memoIx = (data: Uint8Array = Uint8Array.from([1]), accounts: string[] = []): Ix => ({
+  program: MEMO,
+  accounts,
+  data,
+});
+const V1_CONFIG = Object.freeze({
+  priorityFee: 5_000,
+  computeUnitLimit: 200_000,
+  loadedAccountsDataSizeLimit: 65_536,
+  heapSize: null,
+});
+const NULL_CONFIG = Object.freeze({
+  priorityFee: null,
+  computeUnitLimit: null,
+  loadedAccountsDataSizeLimit: null,
+  heapSize: null,
+});
+const CAP1 = { ...RECEIPT, maxSupportedTransactionVersion: 1 } as const;
+const CAP0 = { ...RECEIPT, maxSupportedTransactionVersion: 0 } as const;
+/** A synthetic v1 response: the builder's static-only message, version 1, and a config. */
+function v1Tx(spec: Partial<TxSpec> = {}, config: unknown = { ...V1_CONFIG }): Loose {
+  const p = build({ signers: [PAYER], top: [swapIx({ side: "BUY" })], ...spec, version: 1 });
+  p.transaction.message.transactionConfig = config;
+  return p;
+}
+const B58 = "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz";
+const decodeB58Length = (s: string): number => {
+  let n = 0n;
+  for (const ch of s) n = n * 58n + BigInt(B58.indexOf(ch));
+  let bytes = 0;
+  while (n > 0n) {
+    bytes++;
+    n >>= 8n;
+  }
+  for (const ch of s) {
+    if (ch !== "1") break;
+    bytes++;
+  }
+  return bytes;
+};
+/** The SIMD-0385 serialized size of a synthetic v1 payload (an independent recomputation). */
+function v1Bytes(p: Loose): number {
+  const c = p.transaction.message.transactionConfig as Record<string, unknown>;
+  const config =
+    (c.priorityFee === null ? 0 : 8) +
+    4 *
+      ["computeUnitLimit", "loadedAccountsDataSizeLimit", "heapSize"].filter((k) => c[k] !== null)
+        .length;
+  let instructions = 0;
+  for (const ix of p.transaction.message.instructions as Loose[]) {
+    instructions += 4 + ix.accounts.length + decodeB58Length(ix.data);
+  }
+  const header = 1 + 3 + 4 + 32 + 1 + 1;
+  return (
+    header +
+    32 * p.transaction.message.accountKeys.length +
+    config +
+    instructions +
+    64 * p.transaction.signatures.length
+  );
+}
+
+describe("Raydium CPMM swap decoder: Solana v1 (SIMD-0385), synthetic fixtures", () => {
+  it("V1-01: a valid synthetic v1 swap decodes under cap 1 exactly as the same legacy swap", () => {
+    const legacy = expectDecoded(decode(simpleBuy()));
+    const v1 = expectDecoded(decode(v1Tx(), POOL_A, CAP1));
+    expect(v1.events).toEqual(legacy.events);
+    expect(v1.diagnostics).toEqual(legacy.diagnostics);
+    expect(Object.isFrozen(v1.events[0])).toBe(true);
+    // ComputeBudgetProgram instructions are configuration no-ops: ordinary non-CPMM instructions.
+    const withBudget = expectDecoded(
+      decode(v1Tx({ top: [computeBudgetNoOp(), swapIx({ side: "BUY" })] }), POOL_A, CAP1),
+    );
+    expect(withBudget.events[0]).toMatchObject({ outerInstructionIndex: 1, side: "BUY" });
+    expect(withBudget.diagnostics).toMatchObject({ topLevelInstructions: 2, targetSwaps: 1 });
+    // SELL, the other orientation, an all-null config, and every field at its documented edges.
+    expectDecoded(decode(v1Tx({ top: [swapIx({ side: "SELL" })] }), POOL_A, CAP1));
+    expectDecoded(decode(v1Tx({ top: [swapIx({ side: "BUY", pool: POOL_B })] }), POOL_B, CAP1));
+    expectDecoded(decode(v1Tx({}, { ...NULL_CONFIG }), POOL_A, CAP1));
+    for (const config of [
+      { ...NULL_CONFIG, priorityFee: 0, computeUnitLimit: 0, loadedAccountsDataSizeLimit: 0 },
+      { ...NULL_CONFIG, priorityFee: Number.MAX_SAFE_INTEGER },
+      { ...NULL_CONFIG, computeUnitLimit: 0xffff_ffff, loadedAccountsDataSizeLimit: 0xffff_ffff },
+      { ...NULL_CONFIG, heapSize: 32 * 1024 },
+      { ...NULL_CONFIG, heapSize: 64 * 1024 },
+      { ...NULL_CONFIG, heapSize: 256 * 1024 },
+    ]) {
+      expectDecoded(decode(v1Tx({}, config), POOL_A, CAP1));
+    }
+    // loadedAddresses may be empty, absent or null (static accounts only).
+    for (const loaded of [undefined, null]) {
+      const p = v1Tx();
+      if (loaded === undefined) delete p.meta.loadedAddresses;
+      else p.meta.loadedAddresses = loaded;
+      expectDecoded(decode(p, POOL_A, CAP1));
+    }
+    // No target swap, and a recorded failure, keep their usual outcomes on v1.
+    const none = decode(v1Tx({ top: [memoIx(undefined, [PAYER])] }), POOL_A, CAP1);
+    expect(none.status).toBe("NO_MATCHING_SWAPS");
+    expect(decode(v1Tx({ err: { InstructionError: [0, { Custom: 1 }] } }), POOL_A, CAP1)).toEqual({
+      ok: false,
+      status: "TRANSACTION_FAILED",
+      signature: signatureOf(1),
+      slot: 312_000_000,
+      events: [],
+    });
+  });
+
+  it("V1-02: response versions are bound to the request policy; legacy and v0 are unchanged", () => {
+    // Cap 0 (explicit, or omitted: the historical default) refuses v1 exactly as before.
+    for (const options of [RECEIPT, CAP0]) {
+      const r = decode(v1Tx(), POOL_A, options);
+      expectRefused(r, "UNSUPPORTED_TRANSACTION_VERSION", "1");
+      expect((r as Loose).message).toBe(
+        "only legacy and v0 are supported, with the version field present",
+      );
+    }
+    // Legacy and v0 decode identically under every policy (regression).
+    const v0 = () =>
+      build({ signers: [PAYER], top: [swapIx({ side: "BUY" })], loaded: [USER_WSOL, USER_TOKEN] });
+    for (const options of [RECEIPT, CAP0, CAP1]) {
+      expect(decode(simpleBuy(), POOL_A, options)).toEqual(decode(simpleBuy()));
+      expect(decode(v0(), POOL_A, options)).toEqual(decode(v0()));
+    }
+    expectDecoded(decode(v0(), POOL_A, CAP1));
+    // Unknown and malformed versions stay refused under cap 1 (a number above the cap included).
+    const cases: [unknown, string][] = [
+      [2, "2"],
+      [-1, "-1"],
+      ["1", "1"],
+      ["v1", "v1"],
+      [null, "null"],
+      [true, "true"],
+      [1.5, "1.5"],
+      [129, "129"],
+    ];
+    for (const [version, detail] of cases) {
+      const p = v1Tx();
+      p.version = version;
+      expectRefused(decode(p, POOL_A, CAP1), "UNSUPPORTED_TRANSACTION_VERSION", detail);
+    }
+    const missing = v1Tx();
+    delete missing.version;
+    expectRefused(
+      decode(missing, POOL_A, CAP1),
+      "UNSUPPORTED_TRANSACTION_VERSION",
+      "VERSION_MISSING",
+    );
+    // The policy itself must be exactly 0 or 1.
+    for (const cap of [2, -1, "1", null, 1.5, true, undefined]) {
+      expectRefused(
+        decode(v1Tx(), POOL_A, { ...RECEIPT, maxSupportedTransactionVersion: cap }),
+        "INVALID_OPTIONS",
+        "maxSupportedTransactionVersion",
+      );
+    }
+  });
+
+  it("V1-03: v1 is static-only, and transactionConfig belongs to v1 alone", () => {
+    const refusedV1 = (edit: (p: Loose) => void, reason: string, detail: string) => {
+      const p = v1Tx();
+      edit(p);
+      expectRefused(decode(p, POOL_A, CAP1), reason, detail);
+    };
+    // No address lookup tables in any form (Agave omits the key for v1).
+    const lookupForms = [
+      [],
+      null,
+      [{ accountKey: key(98), writableIndexes: [0], readonlyIndexes: [] }],
+    ];
+    for (const lookups of lookupForms) {
+      refusedV1(
+        (p) => (p.transaction.message.addressTableLookups = lookups),
+        "MALFORMED_ACCOUNT_KEYS",
+        "V1_LOOKUPS",
+      );
+    }
+    for (const loaded of [
+      { writable: [key(50)], readonly: [] },
+      { writable: [], readonly: [key(50)] },
+      [],
+      { writable: [] },
+    ]) {
+      refusedV1((p) => (p.meta.loadedAddresses = loaded), "MALFORMED_ACCOUNT_KEYS", "V1_LOADED");
+    }
+    // Static keys stay unique and canonical, and signatures match the header, on v1.
+    refusedV1(
+      (p) => p.transaction.message.accountKeys.push(p.transaction.message.accountKeys[1]),
+      "MALFORMED_ACCOUNT_KEYS",
+      "DUPLICATE",
+    );
+    refusedV1(
+      (p) => (p.transaction.message.accountKeys[2] = "not-a-key"),
+      "MALFORMED_ACCOUNT_KEYS",
+      "KEY",
+    );
+    refusedV1(
+      (p) => p.transaction.signatures.push(signatureOf(9)),
+      "INVALID_PAYLOAD",
+      "SIGNATURES",
+    );
+    // transactionConfig is required on v1 ...
+    refusedV1(
+      (p) => delete p.transaction.message.transactionConfig,
+      "INVALID_PAYLOAD",
+      "TRANSACTION_CONFIG",
+    );
+    // ... and forbidden on legacy and v0 (even null), under every policy.
+    const v0 = build({ signers: [PAYER], top: [swapIx({ side: "BUY" })], loaded: [USER_WSOL] });
+    for (const base of [simpleBuy(), v0]) {
+      for (const config of [{ ...V1_CONFIG }, null]) {
+        const p = JSON.parse(JSON.stringify(base));
+        p.transaction.message.transactionConfig = config;
+        for (const options of [RECEIPT, CAP1]) {
+          expectRefused(
+            decode(p, POOL_A, options),
+            "INVALID_PAYLOAD",
+            "TRANSACTION_CONFIG_FORBIDDEN",
+          );
+        }
+      }
+    }
+  });
+
+  it("V1-04: malformed configurations and unsafe values are refused; nothing is rounded", () => {
+    const refused = (config: unknown, reason = "INVALID_PAYLOAD", detail = "TRANSACTION_CONFIG") =>
+      expectRefused(decode(v1Tx({}, config), POOL_A, CAP1), reason, detail);
+    refused(null);
+    refused([]);
+    refused("config");
+    refused({});
+    const without = (k: keyof typeof V1_CONFIG) =>
+      Object.fromEntries(Object.entries(V1_CONFIG).filter(([key]) => key !== k));
+    const missingHeap = without("heapSize");
+    refused(missingHeap);
+    refused({ ...V1_CONFIG, priority_fee: 1 });
+    refused({ ...V1_CONFIG, requestedHeapSize: 32_768 });
+    // Exactly four keys, one of them renamed (snake_case is not Agave's serialization).
+    refused({ ...missingHeap, heap_size: null });
+    refused({ ...without("priorityFee"), priority_fee: 5_000 });
+    const fields = ["priorityFee", "computeUnitLimit", "loadedAccountsDataSizeLimit", "heapSize"];
+    for (const field of fields) {
+      for (const bad of [-1, 1.5, "5", true, {}, [], Number.NaN, Number.POSITIVE_INFINITY]) {
+        refused({ ...V1_CONFIG, [field]: bad });
+      }
+    }
+    for (const field of ["computeUnitLimit", "loadedAccountsDataSizeLimit", "heapSize"]) {
+      refused({ ...V1_CONFIG, [field]: 2 ** 32 });
+      refused({ ...V1_CONFIG, [field]: 2 ** 53 });
+    }
+    // Heap size: a 1 KiB multiple in [32 KiB, 256 KiB] when set.
+    for (const heap of [0, 1_024, 32_767, 32_768 + 512, 33_000, 256 * 1024 + 1_024]) {
+      refused({ ...V1_CONFIG, heapSize: heap });
+    }
+    // A u64 priority fee beyond exact JSON representation: an application limit, never rounded.
+    for (const fee of [2 ** 53, Number.MAX_SAFE_INTEGER + 2, 1e300]) {
+      refused(
+        { ...V1_CONFIG, priorityFee: fee },
+        "EVIDENCE_LIMIT_EXCEEDED",
+        "TRANSACTION_CONFIG_UNSAFE_INTEGER",
+      );
+    }
+    // A config refusal comes before anything else is read (here, missing inner instructions).
+    const early = v1Tx({ innerNull: true }, { ...V1_CONFIG, heapSize: 1 });
+    expectRefused(decode(early, POOL_A, CAP1), "INVALID_PAYLOAD", "TRANSACTION_CONFIG");
+  });
+
+  it("V1-05: SIMD-0385 protocol constraints are distinct from application limits", () => {
+    const extraKeys = (n: number) => Array.from({ length: n }, (_, i) => key(120 + i));
+    // Signatures: at most 12 on v1 (legacy is unaffected).
+    const signers = (n: number) => [PAYER, ...extraKeys(n - 1)];
+    expectDecoded(decode(v1Tx({ signers: signers(12) }), POOL_A, CAP1));
+    expectRefused(
+      decode(v1Tx({ signers: signers(13) }), POOL_A, CAP1),
+      "INVALID_PAYLOAD",
+      "V1_SIGNATURES",
+    );
+    expectDecoded(decode(simpleBuy({ signers: signers(13) })));
+    // Static accounts: at most 64 (the application limit of 256 is wider).
+    const withKeys = (base: Loose, total: number) => {
+      const have = base.transaction.message.accountKeys.length as number;
+      base.transaction.message.accountKeys.push(...extraKeys(total - have));
+      return base;
+    };
+    expectDecoded(decode(withKeys(v1Tx(), 64), POOL_A, CAP1));
+    expectRefused(decode(withKeys(v1Tx(), 65), POOL_A, CAP1), "INVALID_PAYLOAD", "V1_ACCOUNT_KEYS");
+    expectDecoded(decode(withKeys(simpleBuy(), 65)));
+    // Instructions: at most 64 (a protocol refusal, before the application's own bound).
+    const memos = (n: number) => Array.from({ length: n }, () => memoIx());
+    expectDecoded(decode(v1Tx({ top: [swapIx({ side: "BUY" }), ...memos(63)] }), POOL_A, CAP1));
+    expectRefused(
+      decode(v1Tx({ top: [swapIx({ side: "BUY" }), ...memos(64)] }), POOL_A, CAP1),
+      "INVALID_PAYLOAD",
+      "V1_INSTRUCTIONS",
+    );
+    expectRefused(
+      decode(simpleBuy({ top: [swapIx({ side: "BUY" }), ...memos(64)] })),
+      "EVIDENCE_LIMIT_EXCEEDED",
+      "TOP_LEVEL",
+    );
+    // Accounts per instruction: at most 255 on v1 (the application allows 256).
+    const wide = (n: number) =>
+      memoIx(
+        undefined,
+        Array.from({ length: n }, () => PAYER),
+      );
+    expectDecoded(decode(v1Tx({ top: [swapIx({ side: "BUY" }), wide(255)] }), POOL_A, CAP1));
+    expectRefused(
+      decode(v1Tx({ top: [swapIx({ side: "BUY" }), wide(256)] }), POOL_A, CAP1),
+      "INVALID_PAYLOAD",
+      "V1_INSTRUCTION_ACCOUNTS",
+    );
+    expectDecoded(decode(simpleBuy({ top: [swapIx({ side: "BUY" }), wide(256)] })));
+    // Serialized size: exactly 4,096 bytes is accepted, one more byte is refused.
+    const sized = (dataBytes: number, config: unknown = { ...V1_CONFIG }) =>
+      v1Tx({ top: [swapIx({ side: "BUY" }), memoIx(new Uint8Array(dataBytes).fill(7))] }, config);
+    const base = v1Bytes(sized(1)) - 1;
+    const atLimit = sized(4_096 - base);
+    expect(v1Bytes(atLimit)).toBe(4_096);
+    expectDecoded(decode(atLimit, POOL_A, CAP1));
+    const over = sized(4_097 - base);
+    expect(v1Bytes(over)).toBe(4_097);
+    expectRefused(decode(over, POOL_A, CAP1), "INVALID_PAYLOAD", "V1_TRANSACTION_SIZE");
+    // Config values count towards the size (V1_CONFIG: an 8-byte priority fee and two u32s, 16 bytes).
+    const fits = sized(4_096 - base + 16, { ...NULL_CONFIG });
+    expect(v1Bytes(fits)).toBe(4_096);
+    expectDecoded(decode(fits, POOL_A, CAP1));
+    const heapOver = sized(4_096 - base + 16, { ...NULL_CONFIG, heapSize: 32 * 1024 });
+    expect(v1Bytes(heapOver)).toBe(4_100);
+    expectRefused(decode(heapOver, POOL_A, CAP1), "INVALID_PAYLOAD", "V1_TRANSACTION_SIZE");
+    // The size bound is v1-only: the same oversized message decodes as legacy.
+    const legacyOver = simpleBuy({
+      top: [swapIx({ side: "BUY" }), memoIx(new Uint8Array(4_097 - base).fill(7))],
+    });
+    expectDecoded(decode(legacyOver));
+  });
+});

@@ -38,11 +38,14 @@ import {
   decodeRaydiumCpmmTransactionSwaps,
 } from "./RaydiumCpmmSwapDecoder.js";
 import {
+  CPMM_GET_TRANSACTION_CONFIG,
+  CPMM_GET_TRANSACTION_V1_CONFIG,
   CPMM_MAX_ANALYSIS_RESPONSE_BYTES,
   CPMM_RESPONSE_ANALYSIS_NOT_PROVEN,
   CPMM_TX_PURPOSE,
   RaydiumCpmmTransactionSourceAdapter,
   analyzeCpmmTransactionResponse,
+  cpmmGetTransactionRequestBody,
   createCpmmExchangeEvidenceRecorder,
   type CpmmLifecycleGate,
   type CpmmResolutionFact,
@@ -308,6 +311,7 @@ interface HarnessOptions {
   maxResponseBytes?: number;
   laneMaxResponseBytes?: number;
   open?: boolean;
+  maxSupportedTransactionVersion?: 0 | 1;
 }
 
 function harness(o: HarnessOptions = {}) {
@@ -387,6 +391,7 @@ function harness(o: HarnessOptions = {}) {
     secrets: SECRETS,
     maxTrackedSignatures: o.maxTracked ?? 32,
     maxResponseBytes: o.maxResponseBytes ?? 100_000,
+    maxSupportedTransactionVersion: o.maxSupportedTransactionVersion ?? 0,
   };
   const adapter = new RaydiumCpmmTransactionSourceAdapter(options);
   return {
@@ -1756,6 +1761,7 @@ describe("Raydium CPMM transaction source adapter (synthetic, offline)", () => {
     responseBytes: bytes,
     maxResponseBytes: 6_000,
     secrets: SECRETS,
+    maxSupportedTransactionVersion: 0,
     ...extra,
   });
   const outcomeOf = (a: ReturnType<typeof analyzeCpmmTransactionResponse>) => {
@@ -2318,3 +2324,241 @@ function structuredCloneable(pool: RaydiumCpmmPoolStateSuccess): RaydiumCpmmPool
     verification: { ...pool.verification, slotProvenance: { ...pool.verification.slotProvenance } },
   };
 }
+
+// ---------------------------------------------------------------------------------------------
+// Request policy and Solana v1 (SIMD-0385): SYNTHETIC fixtures
+// ---------------------------------------------------------------------------------------------
+//
+// The v1 result below is SYNTHETIC: the legacy builder's static-only message given `version: 1`
+// and a `transactionConfig` of the four keys Agave 318c00ca serializes (unset values `null`). The
+// -32015 body is modelled on Agave's `RpcCustomError::UnsupportedTransactionVersion` text; it is
+// not read from any capture. Neither is observed mainnet evidence.
+
+/** A synthetic v1 getTransaction result (static accounts only, config present). */
+function v1Result(sig: string, top: Ix[] = [swapIx("BUY")]): Loose {
+  const r = txResult(sig, top);
+  r.version = 1;
+  r.transaction.message.transactionConfig = {
+    priorityFee: 5_000,
+    computeUnitLimit: 200_000,
+    loadedAccountsDataSizeLimit: null,
+    heapSize: null,
+  };
+  return r;
+}
+const unsupportedVersionError = (id: number) =>
+  JSON.stringify({
+    jsonrpc: "2.0",
+    id,
+    error: {
+      code: -32015,
+      message:
+        'Transaction version (1) is not supported by the requesting client. Please try the request again with the following configuration parameter: "maxSupportedTransactionVersion": 1',
+    },
+  });
+
+describe("Raydium CPMM transaction source adapter: request policy and v1 (synthetic)", () => {
+  it("P-01: the historical cap-0 configuration is preserved; the v1-capable one is explicit", () => {
+    expect(CPMM_GET_TRANSACTION_CONFIG).toEqual({
+      encoding: "json",
+      commitment: "confirmed",
+      maxSupportedTransactionVersion: 0,
+    });
+    expect(CPMM_GET_TRANSACTION_V1_CONFIG).toEqual({
+      encoding: "json",
+      commitment: "confirmed",
+      maxSupportedTransactionVersion: 1,
+    });
+    expect(Object.isFrozen(CPMM_GET_TRANSACTION_CONFIG)).toBe(true);
+    expect(Object.isFrozen(CPMM_GET_TRANSACTION_V1_CONFIG)).toBe(true);
+    // The exact body bytes of each policy (cap 0 identical to the historical request).
+    expect(cpmmGetTransactionRequestBody(signatureOf(1), 3, 0)).toBe(
+      `{"jsonrpc":"2.0","id":3,"method":"getTransaction","params":["${signatureOf(1)}",` +
+        `{"encoding":"json","commitment":"confirmed","maxSupportedTransactionVersion":0}]}`,
+    );
+    expect(cpmmGetTransactionRequestBody(signatureOf(1), 3, 1)).toBe(
+      `{"jsonrpc":"2.0","id":3,"method":"getTransaction","params":["${signatureOf(1)}",` +
+        `{"encoding":"json","commitment":"confirmed","maxSupportedTransactionVersion":1}]}`,
+    );
+    for (const bad of [2, -1, "1", null, undefined]) {
+      expect(() => cpmmGetTransactionRequestBody(signatureOf(1), 3, bad as never)).toThrow(
+        /maxSupportedTransactionVersion/,
+      );
+    }
+  });
+
+  it("P-02: construction requires an explicit policy of 0 or 1 (no default)", () => {
+    const h = harness();
+    const ctor =
+      (over: Record<string, unknown>, drop = false) =>
+      () => {
+        const o: Record<string, unknown> = { ...h.options, ...over };
+        if (drop) delete o.maxSupportedTransactionVersion;
+        return new RaydiumCpmmTransactionSourceAdapter(
+          o as unknown as CpmmTransactionSourceOptions,
+        );
+      };
+    // A fresh recorder each time: a recorder binds once, but construction never binds it.
+    expect(ctor({ maxSupportedTransactionVersion: 1 })).not.toThrow();
+    expect(ctor({}, true)).toThrow(/maxSupportedTransactionVersion must be 0 or 1/);
+    for (const bad of [2, -1, "1", "0", null, 1.5, true]) {
+      expect(ctor({ maxSupportedTransactionVersion: bad })).toThrow(
+        /maxSupportedTransactionVersion must be 0 or 1/,
+      );
+    }
+  });
+
+  it("P-03: live dispatch sends the policy's exact body; response versions are bound to it", async () => {
+    // Cap 1: the v1-capable body, and a synthetic v1 swap resolves and ingests.
+    const h1 = harness({ maxSupportedTransactionVersion: 1 });
+    const id1 = 1;
+    const v1 = await h1.resolve(notice(1), rpcResult(v1Result(signatureOf(1)))());
+    expect(kindOf(v1)).toEqual(["RESOLVED_SWAPS", null, null]);
+    expect(v1.ingestible).toBe(true);
+    expect(h1.calls[0]!.body).toBe(cpmmGetTransactionRequestBody(signatureOf(1), id1, 1));
+    expect(v1.exchange?.requestBody).toBe(h1.calls[0]!.body);
+    const t = tracker();
+    expect(h1.adapter.ingest(v1, t)).toMatchObject({ status: "COMPLETE", accepted: 1 });
+    // Legacy still resolves under cap 1, with the same events as under cap 0.
+    const legacy1 = await h1.resolve(notice(2), okSwap(2)());
+    const h0 = harness({ maxSupportedTransactionVersion: 0 });
+    const legacy0 = await h0.resolve(notice(2), okSwap(2)());
+    expect(kindOf(legacy1)).toEqual(["RESOLVED_SWAPS", null, null]);
+    expect(legacy1.events).toEqual(legacy0.events);
+    expect(h0.calls[0]!.body).toBe(cpmmGetTransactionRequestBody(signatureOf(2), 1, 0));
+    // Cap 0: a v1 body contradicts the request and is refused exactly as before v1 support.
+    const contradicted = await h0.resolve(notice(3), rpcResult(v1Result(signatureOf(3)))());
+    expect(contradicted.kind).toBe("UNRESOLVED");
+    expect(contradicted.code).toBe("UNSUPPORTED_TRANSACTION_VERSION");
+    expect(contradicted.ingestible).toBe(false);
+    expect(contradicted.events).toEqual([]);
+    // Cap 1: an unknown version (above the cap) is refused too.
+    const v2 = v1Result(signatureOf(4));
+    v2.version = 2;
+    const unknown = await h1.resolve(notice(4), rpcResult(v2)());
+    expect([unknown.kind, unknown.code]).toEqual(["UNRESOLVED", "UNSUPPORTED_TRANSACTION_VERSION"]);
+    // A -32015 error is an RPC error under either policy (fixed codes only; the message is never
+    // part of the fact's codes, though the unchanged body itself is stored as evidence).
+    for (const h of [h0, h1]) {
+      const f = await h.resolve(notice(5), reply(unsupportedVersionError)());
+      expect([f.kind, f.code, f.rpcErrorCode]).toEqual(["RPC_ERROR", "JSON_RPC_ERROR", -32015]);
+      expect(f.detail).toBeNull();
+      expect(f.decoder).toBeNull();
+      expect(f.exchange?.body.retainedBytes).toBe(238);
+    }
+  });
+
+  it("P-04: v1 decoder refusals keep their fixed detail codes in facts", async () => {
+    const cases: [string, (r: Loose) => void, string, string][] = [
+      [
+        "lookups",
+        (r) => (r.transaction.message.addressTableLookups = []),
+        "MALFORMED_ACCOUNT_KEYS",
+        "V1_LOOKUPS",
+      ],
+      [
+        "loaded",
+        (r) => (r.meta.loadedAddresses = { writable: [key(50)], readonly: [] }),
+        "MALFORMED_ACCOUNT_KEYS",
+        "V1_LOADED",
+      ],
+      [
+        "config missing",
+        (r) => delete r.transaction.message.transactionConfig,
+        "INVALID_PAYLOAD",
+        "TRANSACTION_CONFIG",
+      ],
+      [
+        "config extra key",
+        (r) => (r.transaction.message.transactionConfig.extra = 1),
+        "INVALID_PAYLOAD",
+        "TRANSACTION_CONFIG",
+      ],
+      [
+        "unsafe fee",
+        (r) => (r.transaction.message.transactionConfig.priorityFee = 2 ** 53),
+        "EVIDENCE_LIMIT_EXCEEDED",
+        "TRANSACTION_CONFIG_UNSAFE_INTEGER",
+      ],
+      [
+        "legacy with config",
+        (r) => (r.version = "legacy"),
+        "INVALID_PAYLOAD",
+        "TRANSACTION_CONFIG_FORBIDDEN",
+      ],
+    ];
+    const h = harness({ maxSupportedTransactionVersion: 1, maxHttpAttempts: 40 });
+    let n = 10;
+    for (const [label, edit, code, detail] of cases) {
+      const r = v1Result(signatureOf(n));
+      edit(r);
+      const f = await h.resolve(notice(n), rpcResult(r)());
+      expect(kindOf(f), label).toEqual(["UNRESOLVED", code, detail]);
+      expect(f.decoder, label).toEqual({ status: "UNRESOLVED_EVIDENCE", reason: code, detail });
+      n++;
+    }
+  });
+
+  it("P-05: the analysis export takes the request policy explicitly and agrees with the live adapter", async () => {
+    const bytesOf = (id: number, result: unknown) =>
+      Buffer.from(JSON.stringify({ jsonrpc: "2.0", id, result }));
+    const input = (bytes: Uint8Array, cap: unknown, drop = false) => {
+      const i: Record<string, unknown> = {
+        notification: notice(1),
+        jsonRpcId: 7,
+        pool: POOL,
+        responseBytes: bytes,
+        maxResponseBytes: 100_000,
+        secrets: SECRETS,
+        maxSupportedTransactionVersion: cap,
+      };
+      if (drop) delete i.maxSupportedTransactionVersion;
+      return i;
+    };
+    const v1Bytes = bytesOf(7, v1Result(signatureOf(1)));
+    // The policy is required and must be 0 or 1: it is never inferred from the response.
+    expect(analyzeCpmmTransactionResponse(input(v1Bytes, 1, true))).toMatchObject({
+      status: "INPUT_INVALID",
+      code: "INPUT_MISSING_KEY",
+    });
+    for (const bad of [2, -1, "1", null, 1.5]) {
+      expect(analyzeCpmmTransactionResponse(input(v1Bytes, bad))).toMatchObject({
+        status: "INPUT_INVALID",
+        code: "MAX_SUPPORTED_TRANSACTION_VERSION_INVALID",
+      });
+    }
+    const a1 = analyzeCpmmTransactionResponse(input(v1Bytes, 1));
+    const a0 = analyzeCpmmTransactionResponse(input(v1Bytes, 0));
+    expect(a1.status === "ANALYZED" && [a1.kind, a1.code]).toEqual(["RESOLVED_SWAPS", null]);
+    expect(a0.status === "ANALYZED" && [a0.kind, a0.code]).toEqual([
+      "UNRESOLVED",
+      "UNSUPPORTED_TRANSACTION_VERSION",
+    ]);
+    // The live cap-1 adapter on the same bytes reaches the same outcome and events.
+    const h = harness({ maxSupportedTransactionVersion: 1 });
+    const live = await h.resolve(notice(1), async () => new Response(v1Bytes, { status: 200 }));
+    expect(live.exchange?.jsonRpcId).toBe(1);
+    const liveBytes = bytesOf(1, v1Result(signatureOf(1)));
+    const again = analyzeCpmmTransactionResponse({ ...input(liveBytes, 1), jsonRpcId: 1 });
+    const fresh = await harness({ maxSupportedTransactionVersion: 1 }).resolve(
+      notice(1),
+      rpcResult(v1Result(signatureOf(1)))(),
+    );
+    expect(again.status === "ANALYZED" && again.events).toEqual(fresh.events);
+    expect(again.status === "ANALYZED" && again.kind).toBe(fresh.kind);
+    // Legacy and the -32015 error classify identically under both policies.
+    const legacyBytes = bytesOf(7, txResult(signatureOf(1), [swapIx("BUY")]));
+    const errBytes = Buffer.from(unsupportedVersionError(7));
+    for (const bytes of [legacyBytes, errBytes]) {
+      const x0 = analyzeCpmmTransactionResponse(input(bytes, 0));
+      const x1 = analyzeCpmmTransactionResponse(input(bytes, 1));
+      expect(x1).toEqual(x0);
+    }
+    const err = analyzeCpmmTransactionResponse(input(errBytes, 0));
+    expect(err.status === "ANALYZED" && [err.kind, err.code, err.rpcErrorCode]).toEqual([
+      "RPC_ERROR",
+      "JSON_RPC_ERROR",
+      -32015,
+    ]);
+  });
+});

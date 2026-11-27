@@ -224,3 +224,30 @@ Approved extended capture `cpmm-observation-03` on `CYBERLEEK/WSOL` (`G8kgi7aUpe
   1. **Decoder (`RaydiumCpmmSwapDecoder.ts`)**: Extend `version` check (`"legacy" | 0 | 1`); branch `version === 1` separately in `resolveAccounts()` (SIMD-0385 has no `addressTableLookups` and empty `meta.loadedAddresses`, matching `"legacy"`, unlike the current `v0` `else` branch); validate `message.transactionConfig` (`UiTransactionConfig` `{ priorityFee, computeUnitLimit, loadedAccountsDataSizeLimit, heapSize }`, forbidden on `"legacy"`/`0`); ignore v1 `ComputeBudgetProgram` no-op instructions.
   2. **Adapter & Evidence Verifier (`RaydiumCpmmTransactionSourceAdapter.ts`, `cpmm-pool-observation-evidence.ts`)**: Keep `CPMM_GET_TRANSACTION_CONFIG` (`maxSupportedTransactionVersion: 0`) intact and add `CPMM_GET_TRANSACTION_V1_CONFIG` (`maxSupportedTransactionVersion: 1`), gating `expectedRequestBody` by evidence schema version (preserving schema v1/v2 `maxSupportedTransactionVersion: 0` so `cpmm-observation-03` does **not** fail with `MISMATCH:REQUEST_BODY`, while enforcing `1` on schema v3+).
   3. **Tests & Fixture Provenance**: Add regression tests preserving `"legacy"`/`0` + historical `03` replay, rejecting unknown/malformed versions or invalid `v1` fields, and testing a synthetic `SIMD-0385` `v1` payload. Note explicitly that `000004.json`–`000007.json` hold only `-32015` errors (zero v1 payload); synthetic `v1` test fixtures must never be presented—and relabelled `v0` fixtures must never be substituted—as genuine observed `v1` mainnet evidence.
+
+## 15. Solana v1 (`SIMD-0385`) Compatibility: Implemented Offline
+
+This implements the §14 design. Full detail is in assessment §8.38.24. All work was offline: no RPC, socket, credential read, live execution or operator packet. No capture was modified. All qualification flags remain `false`.
+
+- **Request policy:**
+  - `CPMM_GET_TRANSACTION_CONFIG` (cap `0`) is preserved for historical evidence.
+  - New runs send `CPMM_GET_TRANSACTION_V1_CONFIG` (cap `1`), exported as `CPMM_RUN_TRANSACTION_REQUEST`.
+  - The adapter's `maxSupportedTransactionVersion` is required, and response versions are bound to it: cap 0 accepts legacy/v0; cap 1 accepts legacy/v0/v1. A contradictory or unknown version is `UNRESOLVED` / `UNSUPPORTED_TRANSACTION_VERSION`.
+- **Decoder:**
+  - v1 is static-only: no `addressTableLookups`, and `loadedAddresses` empty.
+  - `transactionConfig` must have exactly four keys, with `null` when unset; it is forbidden on legacy/v0.
+  - SIMD-0385 limits are enforced: 12 signatures, 64 accounts, 64 instructions, 255 accounts per instruction, 4,096 bytes recomputed exactly, and the heap range.
+  - Application limit: `priorityFee` must be at most `Number.MAX_SAFE_INTEGER`.
+  - Sources are pinned: SIMD `6cc17538`, Agave `318c00ca` and solana-sdk `7b382f65`.
+- **Evidence schemas:**
+  - Schema 1: unbound, cap 0.
+  - Schema 2: bound, cap 0 (for example, `cpmm-observation-03`).
+  - Schema 3: bound, cap 1, with `transactionRequest` stated in the plan and the report. New runs seal schema 3.
+  - Every acquisition-bound schema verifies its dependency. Unknown schemas and inconsistent manifest/report/context/plan policies are refused. The policy comes from the manifest and is never inferred from a response.
+- **Historical verification:** credential-free verification of captures `01`–`03` is byte-identical before and after the change. Capture `03` still has five cap-0 requests matched and four retained `-32015` exchanges recorded as `RPC_ERROR` / `JSON_RPC_ERROR`. Its transaction analysis is still `UNAVAILABLE` without credentials, which is not full re-analysis.
+- **Before any new capture:**
+  - Refresh the stale `adapter`/`decoder` component pins (`2fd2f16`/`3bc17a9`) under the pin policy in a follow-up commit.
+  - Recompute the plan digests: the CLI plan now includes `transactionRequest`.
+  - Prepare a separately approved operator packet.
+
+  The v1 fixtures are **synthetic** and are not observed mainnet evidence.

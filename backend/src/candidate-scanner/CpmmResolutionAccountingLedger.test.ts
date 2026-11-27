@@ -444,6 +444,7 @@ function harness(o: HarnessOptions = {}) {
     secrets: SECRETS,
     maxTrackedSignatures: o.maxTracked ?? 32,
     maxResponseBytes: 100_000,
+    maxSupportedTransactionVersion: 0,
   };
   const adapter = new HookedAdapter(options);
   const tracker = newTracker();

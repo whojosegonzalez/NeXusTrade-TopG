@@ -1182,6 +1182,7 @@ function ownerEnv(s: Script) {
     secrets: [RPC_URL, SECRET],
     maxTrackedSignatures: 8,
     maxResponseBytes: 100_000,
+    maxSupportedTransactionVersion: 0,
   });
   const ledger = new CpmmResolutionAccountingLedger({
     binding: adapter.getBinding(),

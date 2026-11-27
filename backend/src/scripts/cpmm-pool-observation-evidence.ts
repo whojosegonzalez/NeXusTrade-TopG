@@ -47,10 +47,11 @@ import {
 } from "../candidate-scanner/CpmmResolutionAccountingLedger.js";
 import { isValidSolanaSignature } from "../candidate-scanner/ExactPoolHistoryEnumerator.js";
 import {
-  CPMM_GET_TRANSACTION_CONFIG,
   CPMM_MIN_SECRET_CHARS,
   CPMM_TX_PURPOSE,
   analyzeCpmmTransactionResponse,
+  cpmmGetTransactionRequestBody,
+  type CpmmMaxSupportedTransactionVersion,
 } from "../candidate-scanner/RaydiumCpmmTransactionSourceAdapter.js";
 import {
   verifyCpmmPoolAcquisitionForBinding,
@@ -71,6 +72,59 @@ export const CPMM_EVIDENCE_MANIFEST_KIND = "CPMM_POOL_OBSERVATION_EVIDENCE_MANIF
 export const CPMM_EVIDENCE_MANIFEST_VERSION = 1 as const;
 export const CPMM_EVIDENCE_SCHEMA_VERSION = 1 as const;
 const BOUND_SCHEMA_VERSION = 2 as const;
+/** Acquisition-bound evidence whose requests carried `maxSupportedTransactionVersion: 1`. */
+export const CPMM_V1_CAPABLE_EVIDENCE_SCHEMA_VERSION = 3 as const;
+type EvidenceSchemaVersion =
+  | typeof CPMM_EVIDENCE_SCHEMA_VERSION
+  | typeof BOUND_SCHEMA_VERSION
+  | typeof CPMM_V1_CAPABLE_EVIDENCE_SCHEMA_VERSION;
+
+/**
+ * What each evidence schema binds, explicitly (no schema is inferred from another or from a
+ * response): whether the observation is bound to a sealed acquisition dependency, and the
+ * `getTransaction` request policy every sealed request must have carried exactly.
+ *  - 1: unbound, cap 0 (historical); 2: acquisition-bound, cap 0 (historical, e.g.
+ *    cpmm-observation-03); 3: acquisition-bound, cap 1 (v1-capable; new runs).
+ * Any other schema is unsupported. Schema 3 has no unbound variant.
+ */
+export interface CpmmEvidenceSchemaPolicy {
+  readonly acquisitionBound: boolean;
+  readonly maxSupportedTransactionVersion: CpmmMaxSupportedTransactionVersion;
+}
+export const CPMM_EVIDENCE_SCHEMA_POLICIES: Readonly<
+  Record<EvidenceSchemaVersion, CpmmEvidenceSchemaPolicy>
+> = Object.freeze({
+  [CPMM_EVIDENCE_SCHEMA_VERSION]: Object.freeze({
+    acquisitionBound: false,
+    maxSupportedTransactionVersion: 0,
+  }),
+  [BOUND_SCHEMA_VERSION]: Object.freeze({
+    acquisitionBound: true,
+    maxSupportedTransactionVersion: 0,
+  }),
+  [CPMM_V1_CAPABLE_EVIDENCE_SCHEMA_VERSION]: Object.freeze({
+    acquisitionBound: true,
+    maxSupportedTransactionVersion: 1,
+  }),
+});
+/** The policy of a known schema; null for anything else (no prototype lookup, no coercion). */
+function schemaPolicy(v: unknown): CpmmEvidenceSchemaPolicy | null {
+  switch (v) {
+    case CPMM_EVIDENCE_SCHEMA_VERSION:
+    case BOUND_SCHEMA_VERSION:
+    case CPMM_V1_CAPABLE_EVIDENCE_SCHEMA_VERSION:
+      return CPMM_EVIDENCE_SCHEMA_POLICIES[v];
+    default:
+      return null;
+  }
+}
+/**
+ * The request-policy record a v1-capable plan and report carry (schema 3 only; schemas 1 and 2
+ * never carry it, which keeps their sealed bytes and checks unchanged).
+ */
+export const CPMM_V1_CAPABLE_TRANSACTION_REQUEST = Object.freeze({
+  maxSupportedTransactionVersion: 1,
+} as const);
 const ACQUIRED_BOUND = "ACQUIRED_BOUND" as const;
 const BINDING_POSITIONS = [
   ["pool", "POOL"],
@@ -630,6 +684,7 @@ function readPlan(v: unknown, budget: { nodes: number }): Record<string, unknown
       "endpointLabels",
     ],
     "PLAN",
+    ["transactionRequest"],
   );
   const kinds = asRecord(copyPlain(p.kinds, budget, 0), "PLAN_KINDS_INVALID");
   for (const k of Object.keys(kinds)) {
@@ -656,7 +711,17 @@ function readPlan(v: unknown, budget: { nodes: number }): Record<string, unknown
     subscribeRequestId: safeInt(p.subscribeRequestId, "PLAN_REQUEST_ID_INVALID"),
     unsubscribeRequestId: safeInt(p.unsubscribeRequestId, "PLAN_REQUEST_ID_INVALID"),
     endpointLabels: labels,
+    ...(p.transactionRequest === undefined
+      ? {}
+      : { transactionRequest: readTransactionRequest(p.transactionRequest) }),
   };
+}
+
+/** The only explicit request policy a plan may state: the v1-capable one (cap 1). */
+function readTransactionRequest(v: unknown): Record<string, unknown> {
+  const r = exactRecord(v, ["maxSupportedTransactionVersion"], "PLAN_TRANSACTION_REQUEST");
+  if (r.maxSupportedTransactionVersion !== 1) invalid("PLAN_TRANSACTION_REQUEST_INVALID");
+  return { ...CPMM_V1_CAPABLE_TRANSACTION_REQUEST };
 }
 
 function readAccount(v: unknown, code: string, sealer: PayloadSealer): Record<string, unknown> {
@@ -811,6 +876,11 @@ function prepare(input: unknown): {
   const plan = readPlan(i.plan, budget);
   const sealer = payloadSealer(secrets);
   const poolContext = readPoolContext(i.poolContext, budget, sealer);
+  // A v1-capable plan seals schema 3, which exists only with an acquisition dependency.
+  const v1Capable = plan.transactionRequest !== undefined;
+  if (v1Capable && i.acquisitionDir === undefined) {
+    invalid("TRANSACTION_REQUEST_POLICY_REQUIRES_ACQUISITION");
+  }
   let acquisitionManifestSha256: string | null = null;
   if (i.acquisitionDir !== undefined) {
     if (typeof i.acquisitionDir !== "string") invalid("ACQUISITION_DIRECTORY_INVALID");
@@ -821,8 +891,13 @@ function prepare(input: unknown): {
     }
     acquisitionManifestSha256 = binding.manifestSha256;
   }
-  const schemaVersion =
-    acquisitionManifestSha256 === null ? CPMM_EVIDENCE_SCHEMA_VERSION : BOUND_SCHEMA_VERSION;
+  const schemaVersion: EvidenceSchemaVersion =
+    acquisitionManifestSha256 === null
+      ? CPMM_EVIDENCE_SCHEMA_VERSION
+      : v1Capable
+        ? CPMM_V1_CAPABLE_EVIDENCE_SCHEMA_VERSION
+        : BOUND_SCHEMA_VERSION;
+  const requestPolicy = CPMM_EVIDENCE_SCHEMA_POLICIES[schemaVersion];
   const late =
     i.lateActivity === null
       ? null
@@ -910,6 +985,28 @@ function prepare(input: unknown): {
       invalid("SNAPSHOT_EXCHANGE_INVALID");
     }
     const ordinal = safeInt(ex.ordinal, "SNAPSHOT_ORDINAL_INVALID", 1);
+    const requestBody = sealer.seal(ex.requestBody, TEXT_SCOPE);
+    // Schema 3's writer refuses a request that did not carry its policy exactly (schemas 1 and 2
+    // keep their historical behaviour: verification reports such a request as a mismatch).
+    if (schemaVersion === CPMM_V1_CAPABLE_EVIDENCE_SCHEMA_VERSION) {
+      const sig = entry.requestedIdentity;
+      const id = entry.jsonRpcId;
+      if (ex.method !== "POST" || !isValidSolanaSignature(sig) || !isInt(id) || id < 1) {
+        invalid("SNAPSHOT_EXCHANGE_REQUEST_POLICY_MISMATCH");
+      }
+      const expected = cpmmGetTransactionRequestBody(
+        sig as string,
+        id as number,
+        requestPolicy.maxSupportedTransactionVersion,
+      );
+      if (
+        requestBody === null ||
+        requestBody.originalSha256 !== sha256(expected) ||
+        requestBody.originalBytes !== Buffer.byteLength(expected)
+      ) {
+        invalid("SNAPSHOT_EXCHANGE_REQUEST_POLICY_MISMATCH");
+      }
+    }
     exchanges.push({
       seq,
       ordinal,
@@ -920,7 +1017,7 @@ function prepare(input: unknown): {
         endpoint: CPMM_EXCHANGE_ENDPOINT_LABEL,
         entry,
         method: ex.method,
-        requestBody: sealer.seal(ex.requestBody, TEXT_SCOPE),
+        requestBody,
         responseHeaders: ex.responseHeaders,
         responseHeadersTruncated: ex.responseHeadersTruncated,
         bodyState: ex.bodyState,
@@ -1059,6 +1156,7 @@ function prepare(input: unknown): {
     poolContextProvenance:
       acquisitionManifestSha256 === null ? "SUPPLIED_UNVERIFIED" : ACQUIRED_BOUND,
     acquisitionProvenance: acquisitionManifestSha256 === null ? "OPEN_G3" : ACQUIRED_BOUND,
+    ...(v1Capable ? { transactionRequest: { ...CPMM_V1_CAPABLE_TRANSACTION_REQUEST } } : {}),
     rederivation: { status: "NOT_IMPLEMENTED" },
     credentialsRecorded: false,
     endpointUrlsRecorded: false,
@@ -1203,7 +1301,10 @@ export interface CpmmEvidenceVerification {
   /** Null for an unverified bound claim or an observation integrity failure. */
   readonly poolContextProvenance: "SUPPLIED_UNVERIFIED" | "ACQUIRED_BOUND" | null;
   readonly acquisitionProvenance: "OPEN_G3" | "ACQUIRED_BOUND";
-  /** Only for version 2 after observation integrity passes. Never changes observation integrity. */
+  /**
+   * Only for acquisition-bound schemas (2 and 3) after observation integrity passes. Never changes
+   * observation integrity.
+   */
   readonly acquisitionBinding?: CpmmAcquisitionBinding;
   readonly flags: typeof CPMM_EVIDENCE_FALSE_FLAGS;
 }
@@ -1288,7 +1389,7 @@ export interface CpmmTransactionRederivation extends CpmmComponentRederivation {
 export interface CpmmEvidenceVerificationOptions {
   /** The credential values the run's adapter was given (the adapter's own `secrets` rule). */
   readonly analysisSecrets?: readonly string[];
-  /** Absolute path to the acquisition bundle for a version 2 observation. */
+  /** Absolute path to the acquisition bundle for a version 2 or 3 observation. */
   readonly acquisitionDir?: string;
 }
 
@@ -2025,9 +2126,9 @@ export function verifyCpmmObservationEvidence(
   if (m.kind !== CPMM_EVIDENCE_MANIFEST_KIND) problems.push("MANIFEST_KIND_INVALID");
   if (m.version !== CPMM_EVIDENCE_MANIFEST_VERSION) problems.push("MANIFEST_VERSION_UNSUPPORTED");
   const schemaVersion = m.evidenceSchemaVersion;
-  if (schemaVersion !== CPMM_EVIDENCE_SCHEMA_VERSION && schemaVersion !== BOUND_SCHEMA_VERSION) {
-    problems.push("EVIDENCE_SCHEMA_VERSION_UNSUPPORTED");
-  }
+  // Unknown schemas are refused; a known one fixes the binding and the request policy.
+  const policy = schemaPolicy(schemaVersion);
+  if (policy === null) problems.push("EVIDENCE_SCHEMA_VERSION_UNSUPPORTED");
   if (
     !sameKeys(m.componentVersions, CPMM_COMPONENT_VERSION_KEYS) ||
     !Object.values(m.componentVersions as object).every(
@@ -2040,9 +2141,8 @@ export function verifyCpmmObservationEvidence(
     problems.push("MANIFEST_FILES_INVALID");
     return integrityFailure();
   }
-  if (problems.length > 0) return integrityFailure();
-  const evidenceVersion =
-    schemaVersion === BOUND_SCHEMA_VERSION ? BOUND_SCHEMA_VERSION : CPMM_EVIDENCE_SCHEMA_VERSION;
+  if (problems.length > 0 || policy === null) return integrityFailure();
+  const evidenceVersion = schemaVersion as EvidenceSchemaVersion;
 
   // 2. Entries: schema, confined unique sorted paths, bounded sizes, required files.
   const listed = new Map<string, { bytes: number; sha256: string }>();
@@ -2140,15 +2240,16 @@ export function verifyCpmmObservationEvidence(
       runOutcome: copyJson(report.runOutcome),
     };
     const ctx = docs.get(CPMM_EVIDENCE_FILES.poolContext)!;
-    const acquisitionBinding =
-      evidenceVersion === BOUND_SCHEMA_VERSION
-        ? checkAcquisitionBinding(
-            ctx,
-            get(docs.get(CPMM_EVIDENCE_FILES.plan), "plan", "binding"),
-            acquisitionDirectory(options),
-            ctx.acquisitionManifestSha256 as string,
-          )
-        : undefined;
+    // Every acquisition-bound schema (2 and 3) verifies its dependency; none falls through to
+    // the supplied/unverified handling of schema 1.
+    const acquisitionBinding = policy.acquisitionBound
+      ? checkAcquisitionBinding(
+          ctx,
+          get(docs.get(CPMM_EVIDENCE_FILES.plan), "plan", "binding"),
+          acquisitionDirectory(options),
+          ctx.acquisitionManifestSha256 as string,
+        )
+      : undefined;
     return result(
       { status: reasons.length === 0 ? "COMPLETE" : "INCOMPLETE", reasons },
       acquisitionBinding === undefined
@@ -2156,7 +2257,7 @@ export function verifyCpmmObservationEvidence(
         : acquisitionBinding.status === "REPRODUCED"
           ? ACQUIRED_BOUND
           : null,
-      rederive(docs, credentials),
+      rederive(docs, credentials, policy.maxSupportedTransactionVersion),
       claims,
       acquisitionBinding,
     );
@@ -2203,8 +2304,9 @@ function checkDocuments(
   docs: Map<string, Record<string, unknown>>,
   listed: Map<string, { bytes: number; sha256: string }>,
   problems: string[],
-  schemaVersion: typeof CPMM_EVIDENCE_SCHEMA_VERSION | typeof BOUND_SCHEMA_VERSION,
+  schemaVersion: EvidenceSchemaVersion,
 ): void {
+  const policy = CPMM_EVIDENCE_SCHEMA_POLICIES[schemaVersion];
   // Kinds and versions.
   for (const [p, doc] of docs) {
     const kind = EXCHANGE_FILE.test(p) ? EXCHANGE_FILE_KIND : FILE_KINDS[p];
@@ -2233,7 +2335,7 @@ function checkDocuments(
   }
   if (!sameKeys(report.rederivation, ["status"]))
     problems.push("REPORT_REDERIVATION_CLAIM_INVALID");
-  const bound = schemaVersion === BOUND_SCHEMA_VERSION;
+  const bound = policy.acquisitionBound;
   const provenance = bound ? ACQUIRED_BOUND : "SUPPLIED_UNVERIFIED";
   if (report.acquisitionProvenance !== (bound ? ACQUIRED_BOUND : "OPEN_G3"))
     problems.push("REPORT_ACQUISITION_PROVENANCE_INVALID");
@@ -2266,6 +2368,23 @@ function checkDocuments(
   ) {
     problems.push("POOL_CONTEXT_ACQUISITION_REFERENCE_INVALID");
   }
+  // The request policy: schema 3's plan and report state the v1-capable policy exactly; schemas
+  // 1 and 2 state none (their cap of 0 is implied by the schema). The manifest's schema decides;
+  // a disagreeing record is a contradiction, never a reason to switch policy.
+  const planBody = get(docs.get(CPMM_EVIDENCE_FILES.plan), "plan");
+  const policyRecordOk = (owner: unknown): boolean => {
+    if (!isRec(owner)) return false;
+    const has = Object.prototype.hasOwnProperty.call(owner, "transactionRequest");
+    if (policy.maxSupportedTransactionVersion === 0) return !has;
+    const r = owner.transactionRequest;
+    return (
+      has &&
+      sameKeys(r, Object.keys(CPMM_V1_CAPABLE_TRANSACTION_REQUEST)) &&
+      get(r, "maxSupportedTransactionVersion") === policy.maxSupportedTransactionVersion
+    );
+  };
+  if (!policyRecordOk(planBody)) problems.push("PLAN_TRANSACTION_REQUEST_POLICY_INVALID");
+  if (!policyRecordOk(report)) problems.push("REPORT_TRANSACTION_REQUEST_POLICY_INVALID");
 
   // Structure: payload presence, component sections, recorder and collector accounting.
   const recordsValue = get(docs.get(CPMM_EVIDENCE_FILES.transportRecords), "records");
@@ -3214,6 +3333,7 @@ const NOTIFICATION_KEYS = [
 function rederive(
   docs: Map<string, Record<string, unknown>>,
   credentials: AnalysisCredentials,
+  maxSupportedTransactionVersion: CpmmMaxSupportedTransactionVersion,
 ): CpmmRederivation {
   const failed = (): Findings => {
     const f = new Findings();
@@ -3249,7 +3369,13 @@ function rederive(
   // Event counts decoded from matched swap responses, by signature (for the ledger's totals).
   const decodedEvents = new Map<string, DecodedSwapEvents>();
   try {
-    transactionAnalysis = analyzeTransactions(docs, pool, credentials, decodedEvents);
+    transactionAnalysis = analyzeTransactions(
+      docs,
+      pool,
+      credentials,
+      decodedEvents,
+      maxSupportedTransactionVersion,
+    );
   } catch {
     decodedEvents.clear();
     const f = failed();
@@ -3432,21 +3558,24 @@ const recordedSettlementValid = (c: Record<string, unknown>): boolean =>
   c.firstSequence === null &&
   c.code === null;
 
-/** The request body the accepted adapter sends for one signature and id (exact bytes). */
-const expectedRequestBody = (signature: string, id: number): string =>
-  JSON.stringify({
-    jsonrpc: "2.0",
-    id,
-    method: "getTransaction",
-    params: [signature, CPMM_GET_TRANSACTION_CONFIG],
-  });
+/**
+ * The request body the accepted adapter sends for one signature, id and the schema's request
+ * policy (exact bytes): `CPMM_GET_TRANSACTION_CONFIG` (cap 0) for schemas 1 and 2,
+ * `CPMM_GET_TRANSACTION_V1_CONFIG` (cap 1) for schema 3.
+ */
+const expectedRequestBody = (
+  signature: string,
+  id: number,
+  maxSupportedTransactionVersion: CpmmMaxSupportedTransactionVersion,
+): string => cpmmGetTransactionRequestBody(signature, id, maxSupportedTransactionVersion);
 
 /**
  * Transaction-response analysis and its binding (items C and G), over the validated documents:
  * - binding, independent of analysis and of redaction: one sealed exchange per signature (its
  *   CPMM purpose is bound by integrity to the session ledger); a POST whose original digest
  *   equals the accepted adapter's exact `getTransaction` body for that signature, the sealed
- *   JSON-RPC id and `CPMM_GET_TRANSACTION_CONFIG`; the first retained
+ *   JSON-RPC id and the schema's request policy (cap 0 for schemas 1 and 2, cap 1 for schema 3;
+ *   from the manifest, never from a response); the first retained
  *   collector notification of that signature; the first `account()` call (receipt and epoch); its
  *   settlement and the ledger record (sequence, fact, slot, receipt, epoch); dispatch not before
  *   the notification's receipt; every recorded fact that implies a dispatch has a request, and
@@ -3463,6 +3592,7 @@ function analyzeTransactions(
   pool: unknown,
   credentials: AnalysisCredentials,
   decodedEvents: Map<string, DecodedSwapEvents>,
+  maxSupportedTransactionVersion: CpmmMaxSupportedTransactionVersion,
 ): CpmmTransactionRederivation {
   const f = new Findings();
   const plan = get(docs.get(CPMM_EVIDENCE_FILES.plan), "plan");
@@ -3581,7 +3711,7 @@ function analyzeTransactions(
     const rb = get(ex, "requestBody");
     if (get(ex, "method") !== "POST") f.add("MISMATCH", "REQUEST_METHOD");
     else if (signature !== null && isInt(id)) {
-      const expected = expectedRequestBody(signature, id);
+      const expected = expectedRequestBody(signature, id, maxSupportedTransactionVersion);
       const digest = get(rb, "originalSha256");
       if (typeof digest !== "string") f.add("MISSING_EVIDENCE", "REQUEST_BODY_UNVERIFIABLE");
       else if (
@@ -3740,6 +3870,7 @@ function analyzeTransactions(
         responseBytes: body.bytes,
         maxResponseBytes: get(ex, "maxResponseBytes"),
         secrets: credentials.status === "SUPPLIED" ? credentials.secrets : [],
+        maxSupportedTransactionVersion,
       }) as unknown as Record<string, unknown>;
       if (a.status !== "ANALYZED") {
         if (a.code === "SECRETS_INVALID") {

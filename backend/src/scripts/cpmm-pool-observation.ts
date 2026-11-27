@@ -47,6 +47,8 @@ import {
 } from "./cpmm-pool-observation-evidence.js";
 import {
   CPMM_ACQUISITION_ROOT_SEGMENTS,
+  CPMM_RUN_EVIDENCE_SCHEMA_VERSION,
+  CPMM_RUN_TRANSACTION_REQUEST,
   runCpmmPoolObservation,
   type CpmmObservationRunLimits,
   type CpmmObservationRunResult,
@@ -544,6 +546,16 @@ export function buildCpmmObservationPlan(input: {
         verifierMaxTotalBytes: CPMM_EVIDENCE_VERIFIER_LIMITS.maxTotalBytes,
         verifierMaxEntries: CPMM_EVIDENCE_VERIFIER_LIMITS.maxEntries,
       },
+    },
+    transactionRequest: {
+      method: "getTransaction",
+      encoding: "json",
+      commitment: "confirmed",
+      maxSupportedTransactionVersion: CPMM_RUN_TRANSACTION_REQUEST.maxSupportedTransactionVersion,
+      acceptedResponseVersions: ["legacy", 0, 1],
+      observationEvidenceSchemaVersion: CPMM_RUN_EVIDENCE_SCHEMA_VERSION,
+      description:
+        "v1-capable (SIMD-0385): a response version above the requested maximum is refused. Historical cap-0 evidence (schemas 1 and 2) is verified with its own recorded policy; this run never sends it.",
     },
     componentVersions: CPMM_OBSERVATION_COMPONENT_VERSIONS,
     sequence: [

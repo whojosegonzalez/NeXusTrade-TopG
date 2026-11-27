@@ -467,6 +467,7 @@ function ledgerHarness() {
     secrets: [RPC_URL, SECRET_KEY],
     maxTrackedSignatures: 32,
     maxResponseBytes: 100_000,
+    maxSupportedTransactionVersion: 0,
   });
   const tracker = new RollingTradeFlowTracker({
     poolId: POOL.poolAddress,

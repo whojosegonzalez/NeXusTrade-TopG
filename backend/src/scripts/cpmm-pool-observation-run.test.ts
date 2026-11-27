@@ -63,7 +63,9 @@ import {
 import {
   CPMM_ACQUISITION_ROOT_SEGMENTS,
   CPMM_RUN_STOP_ABANDONED,
+  CPMM_RUN_EVIDENCE_SCHEMA_VERSION,
   CPMM_RUN_STOP_FINISHED,
+  CPMM_RUN_TRANSACTION_REQUEST,
   runCpmmPoolObservation,
   type CpmmObservationRunOptions,
   type CpmmObservationRunResult,
@@ -1822,5 +1824,68 @@ describe("CPMM observation run: composition core (item 17 T)", () => {
       (r as { status: string }).status = "FAILED";
     }).toThrow(TypeError);
     expect(h.queue.size).toBe(0);
+  });
+});
+
+describe("CPMM observation run: v1-capable request policy (SIMD-0385)", () => {
+  const readSealed = (dir: string, rel: string) =>
+    JSON.parse(readFileSync(path.join(dir, ...rel.split("/")), "utf8")) as Record<string, unknown>;
+
+  it("RV1: new runs send the explicit cap-1 request and seal schema 3 with the policy in plan and report", async () => {
+    const { h, r } = await shared;
+    expect(CPMM_RUN_TRANSACTION_REQUEST).toEqual({ maxSupportedTransactionVersion: 1 });
+    expect(CPMM_RUN_EVIDENCE_SCHEMA_VERSION).toBe(3);
+    const tx = h.calls.find((c) => c.method === "getTransaction")!;
+    expect(tx.params[1]).toEqual({
+      encoding: "json",
+      commitment: "confirmed",
+      maxSupportedTransactionVersion: 1,
+    });
+    expect(r.status).toBe("SUCCEEDED");
+    const dir = observationDirOf(h.root);
+    expect(readSealed(dir, "cpmm-observation-manifest.json").evidenceSchemaVersion).toBe(3);
+    expect(readSealed(dir, "pool-context.json").version).toBe(3);
+    expect(readSealed(dir, "report.json")).toMatchObject({
+      version: 3,
+      transactionRequest: { maxSupportedTransactionVersion: 1 },
+    });
+    expect(
+      (readSealed(dir, "run-plan.json").plan as Record<string, unknown>).transactionRequest,
+    ).toEqual({ maxSupportedTransactionVersion: 1 });
+  });
+
+  it("RV2: a SYNTHETIC v1 response decodes, ingests and re-derives as a matched swap", async () => {
+    // SYNTHETIC SIMD-0385 fixture (Agave 318c00ca JSON shape): never observed mainnet evidence.
+    const v1Response = (req: RpcRequest) => {
+      const result = txResult(req.params[0] as string) as Record<string, unknown> & {
+        transaction: { message: Record<string, unknown> };
+      };
+      result.version = 1;
+      result.transaction.message.transactionConfig = {
+        priorityFee: 1_000,
+        computeUnitLimit: null,
+        loadedAccountsDataSizeLimit: null,
+        heapSize: 64 * 1024,
+      };
+      return new Response(JSON.stringify({ jsonrpc: "2.0", id: req.id, result }), { status: 200 });
+    };
+    const { r } = await cleanRun({ transaction: v1Response });
+    expect(r.status).toBe("SUCCEEDED");
+    expect(r.firstFailure).toBeNull();
+    const v = r.observationEvidence.verification!;
+    expect(v.integrity).toEqual({ ok: true, problems: [] });
+    expect(v.acquisitionBinding).toMatchObject({ status: "REPRODUCED" });
+    expect(v.rederivation.components!.transactionAnalysis).toMatchObject({
+      status: "REPRODUCED",
+      analysis: "AVAILABLE",
+      comparedExchanges: 1,
+      exchanges: [
+        {
+          decoded: { kind: "RESOLVED_SWAPS" },
+          recorded: { factKind: "RESOLVED_SWAPS" },
+          comparison: "MATCHED",
+        },
+      ],
+    });
   });
 });

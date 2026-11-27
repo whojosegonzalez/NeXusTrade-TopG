@@ -68,6 +68,8 @@ import {
   CPMM_COMPONENT_VERSION_KEYS,
   CPMM_EVIDENCE_FALSE_FLAGS,
   CPMM_EVIDENCE_ROOT_SEGMENTS,
+  CPMM_V1_CAPABLE_EVIDENCE_SCHEMA_VERSION,
+  CPMM_V1_CAPABLE_TRANSACTION_REQUEST,
   sealCpmmObservationEvidence,
   verifyCpmmObservationEvidence,
   type CpmmEvidenceVerification,
@@ -87,6 +89,14 @@ export const CPMM_ACQUISITION_ROOT_SEGMENTS: readonly string[] = Object.freeze([
 /** The run's own session stop reasons (the session keeps the first cause). */
 export const CPMM_RUN_STOP_FINISHED = "CPMM_OBSERVATION_RUN_FINISHED" as const;
 export const CPMM_RUN_STOP_ABANDONED = "CPMM_OBSERVATION_RUN_ABANDONED" as const;
+/**
+ * The explicit `getTransaction` request policy of every new run: v1-capable (cap 1, SIMD-0385).
+ * The adapter sends it, the sealed plan and report state it, and the observation is sealed as
+ * evidence schema 3 (acquisition-bound and v1-capable). Historical cap-0 evidence (schemas 1 and
+ * 2) stays verifiable unchanged; runs never send the cap-0 configuration again.
+ */
+export const CPMM_RUN_TRANSACTION_REQUEST = CPMM_V1_CAPABLE_TRANSACTION_REQUEST;
+export const CPMM_RUN_EVIDENCE_SCHEMA_VERSION = CPMM_V1_CAPABLE_EVIDENCE_SCHEMA_VERSION;
 
 /** The acquisition's own ceilings (`CpmmPoolAccountAcquisition`). */
 const ACQUISITION_MAX_DURATION_MS = 30_000;
@@ -962,6 +972,7 @@ export async function runCpmmPoolObservation(
         rpcUrl: o.rpcUrl,
         secrets: [...o.analysisSecrets],
         ...L.adapter,
+        maxSupportedTransactionVersion: CPMM_RUN_TRANSACTION_REQUEST.maxSupportedTransactionVersion,
       });
       ledger = new CpmmResolutionAccountingLedger({
         binding: adapter.getBinding(),
@@ -1065,6 +1076,7 @@ export async function runCpmmPoolObservation(
       subscribeRequestId: o.subscribeRequestId,
       unsubscribeRequestId: o.unsubscribeRequestId,
       endpointLabels: { rpc: "SOLANA_RPC_HTTP", stream: "SOLANA_RPC_WEBSOCKET" },
+      transactionRequest: { ...CPMM_RUN_TRANSACTION_REQUEST },
     };
     const account = (a: {
       address: string;

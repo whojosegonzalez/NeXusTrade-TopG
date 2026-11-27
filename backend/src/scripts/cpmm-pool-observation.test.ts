@@ -2072,6 +2072,27 @@ describe("CPMM pool observation CLI (item 17 T, roadmap step 3)", () => {
     expect(g.queue.size).toBe(0);
   });
 
+  it("OC19b: the plan states the run's v1-capable getTransaction policy and its evidence schema", () => {
+    for (const profile of ["short", "extended"] as const) {
+      const plan = buildCpmmObservationPlan({
+        mode: "DRY_RUN",
+        runId: "r-1",
+        target: TARGET,
+        acquisitionDir: acquisitionRel("r-1"),
+        observationDir: observationRel("r-1"),
+        profile,
+      });
+      expect(plan.transactionRequest).toMatchObject({
+        method: "getTransaction",
+        encoding: "json",
+        commitment: "confirmed",
+        maxSupportedTransactionVersion: 1,
+        acceptedResponseVersions: ["legacy", 0, 1],
+        observationEvidenceSchemaVersion: 3,
+      });
+    }
+  });
+
   it("OC19: the plan places each bundle's sealing correctly and claims no hard wall-clock bound", async () => {
     const plan = buildCpmmObservationPlan({
       mode: "DRY_RUN",

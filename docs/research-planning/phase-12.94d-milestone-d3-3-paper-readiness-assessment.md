@@ -11864,3 +11864,139 @@ Queried strictly via non-credentialed public REST APIs (`api-v3.raydium.io` and 
 
 4. **Fixture Provenance Constraint**:
    - The four `-32015` exchanges in `cpmm-observation-03` (`exchanges/000004.json`–`000007.json`) contain **only** JSON-RPC error objects (`code: -32015`) and hold **zero v1 transaction payloads**. Because no live RPC queries are authorized offline, any v1 unit/verifier test fixture created during implementation must be explicitly documented as a **synthetic SIMD-0385 / Agave-spec fixture**. A relabelled `v0` transaction fixture **must never** be presented or treated as genuine observed `v1` mainnet evidence.
+
+#### 8.38.24 Solana v1 (`SIMD-0385`) Compatibility Implementation (Offline Only)
+
+**Status**: The §8.38.23 design is implemented on top of `cf63de95bd4ebfc18c62620da5b678877f297c86` and validated **offline only**. Work included no RPC request, socket, configuration or credential read, live execution or new operator packet. No sealed capture, operator script, budget, duration, pacing, profile limit, owner/transport/session behaviour, dependency, configuration or wallet was changed. **All five qualification flags remain `false`.** This section is not an approval for any capture.
+
+##### Primary Specification and Source Revisions (Pinned)
+
+| Source                                                                                   | Revision                                                                                                | Used for                                                                                                                                                                                                                                                                                                                                                                                                    |
+| ---------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| SIMD-0385 `proposals/0385-transaction-v1.md` (solana-improvement-documents)              | `6cc17538e26601e65beca89bbfa761e755720956` (latest commit touching the file, "Mark SIMDs as Activated") | No address lookup tables; limits of 12 signatures, 64 static accounts, 64 instructions, 255 accounts per instruction and 4,096 bytes; wire layout; `TransactionConfigMask` (priority fee u64 = 2 slots, three u32 fields); heap size a 1 KiB multiple in `[32 KiB, 256 KiB]`; ComputeBudgetProgram instructions are configuration no-ops.                                                                   |
+| Agave `transaction-status-client-types/src/lib.rs`                                       | `318c00ca5aab27ad348e19f7a0c3c3ae7f229ed6`                                                              | `UiRawMessage`: `addressTableLookups` and `transactionConfig` are `skip_serializing_if = "Option::is_none"`. For v1, lookups are omitted and `transactionConfig` is present. For legacy/v0, `transactionConfig` is omitted. `UiTransactionConfig` has exactly `priorityFee`, `computeUnitLimit`, `loadedAccountsDataSizeLimit` and `heapSize`, with no skip attribute, so unset values serialize as `null`. |
+| Agave `transaction-status/src/lib.rs`                                                    | `318c00ca…`                                                                                             | `validate_version`: a numeric version is returned only when it is at most the requested `maxSupportedTransactionVersion`. Otherwise the response is `UnsupportedTransactionVersion`.                                                                                                                                                                                                                        |
+| Agave `rpc-client-api/src/custom_error.rs`                                               | `318c00ca…`                                                                                             | `-32015` and its message text, used for the synthetic error fixture.                                                                                                                                                                                                                                                                                                                                        |
+| solana-sdk `transaction/src/versioned/mod.rs`, `message/src/versions/v1/{mod,config}.rs` | `7b382f65da053cb91e7debc912aaf969a01a5859`                                                              | `TransactionVersion` is `untagged`, so v1 serializes as the JSON number `1`. Also the v1 `TransactionConfig` field types and the heap constants.                                                                                                                                                                                                                                                            |
+
+The decoder exports these URLs as `SOLANA_TRANSACTION_VERSION_SOURCE_REFERENCES`.
+
+**Discrepancy recorded:** the reference SDK sanitizer at `7b382f65` (`Message::validate`) does **not** enforce SIMD-0385's 64/12/4,096 limits or its heap range; its own tests accept values over them. The decoder applies the SIMD's stated rules and fails closed. A response that breaks them is refused as `INVALID_PAYLOAD`. It is never decoded.
+
+##### Decoder (`RaydiumCpmmSwapDecoder.ts`)
+
+- **Version gate bound to the request policy.** A new optional option, `maxSupportedTransactionVersion` (`0 | 1`), defaults to `0`, the historical policy.
+  - Under cap 0, a v1 body is refused exactly as before: `UNSUPPORTED_TRANSACTION_VERSION`, detail `"1"`, with the same message.
+  - Under cap 1, `"legacy"`, `0` and `1` are accepted.
+  - A missing version, any other value (`2`, `-1`, `"1"`, `"v1"`, `null`, `true`, `1.5`, `129`), or a version above the cap is refused.
+  - Any other option value is `INVALID_OPTIONS` with detail `maxSupportedTransactionVersion`.
+- **v1 accounts are static only.**
+  - Any `addressTableLookups` key, including `[]` or `null`, is refused (`V1_LOOKUPS`).
+  - `meta.loadedAddresses` must be absent, `null` or empty; otherwise it is refused (`V1_LOADED`).
+  - Static keys must be canonical and unique, and the signature count must equal the header count. These rules are unchanged.
+- **`transactionConfig`** is required on v1 and forbidden on legacy/v0, even when `null` (`TRANSACTION_CONFIG_FORBIDDEN`). On v1 it must be a plain object with exactly the four keys. Each value is `null` or valid:
+  - `priorityFee`: a non-negative integer.
+  - The three u32 fields: values in `[0, 2^32 − 1]`.
+  - `heapSize`: a 1 KiB multiple in `[32768, 262144]`.
+
+  Anything else is refused as `INVALID_PAYLOAD` / `TRANSACTION_CONFIG`. Nothing is rounded.
+
+- **Protocol constraints** (SIMD-0385, `SOLANA_V1_PROTOCOL_LIMITS`, v1 only, all `INVALID_PAYLOAD`):
+
+  | Constraint                               | Detail                                                                     |
+  | ---------------------------------------- | -------------------------------------------------------------------------- |
+  | Signatures ≤ 12                          | `V1_SIGNATURES`                                                            |
+  | Static accounts ≤ 64                     | `V1_ACCOUNT_KEYS`                                                          |
+  | Instructions ≤ 64                        | `V1_INSTRUCTIONS` (checked before the application's own `TOP_LEVEL` bound) |
+  | Accounts per top-level instruction ≤ 255 | `V1_INSTRUCTION_ACCOUNTS`                                                  |
+  | Serialized size ≤ 4,096 bytes            | `V1_TRANSACTION_SIZE`                                                      |
+
+  The size is recomputed exactly from the JSON fields with the SIMD wire layout: 42-byte fixed header, 32 bytes per address, 8/4 bytes per set config value, a 4-byte header plus indexes plus data per instruction, and 64 bytes per signature. JSON carries no wire bytes, so this recomputation is the size check.
+
+- **Application limits (the narrower supported subset):**
+  - `priorityFee` is a u64 on chain. Only values up to `Number.MAX_SAFE_INTEGER` are accepted, since only those survive JSON parsing exactly. Larger values are refused as `EVIDENCE_LIMIT_EXCEEDED` / `TRANSACTION_CONFIG_UNSAFE_INTEGER`.
+  - `CPMM_DECODER_LIMITS` also apply. For example, decoded instruction data is limited to 10,240 bytes, narrower than the u16 format bound.
+- **Unchanged:** swap-frame extraction, `TransferChecked` binding, call-tree reconstruction and log corroboration. ComputeBudgetProgram instructions are ordinary non-CPMM instructions to the decoder, so v1 configuration no-ops need no handling.
+- **Not checked (stated limitations):**
+  - The `-32015` error message is never parsed. An error naming a version within the cap is still classified `RPC_ERROR` / `JSON_RPC_ERROR`, never as a contradiction.
+  - The SDK rule that program index `0` is invalid is not enforced, as before for legacy.
+  - Inner (CPI) instructions are not subject to message-format limits.
+
+##### Request and Response Policy (`RaydiumCpmmTransactionSourceAdapter.ts`)
+
+- `CPMM_GET_TRANSACTION_CONFIG` (`maxSupportedTransactionVersion: 0`) is **unchanged** for historical evidence.
+- The new exports are:
+  - `CPMM_GET_TRANSACTION_V1_CONFIG` (`maxSupportedTransactionVersion: 1`).
+  - `CPMM_GET_TRANSACTION_CONFIGS`.
+  - `cpmmGetTransactionConfig()`.
+  - `cpmmGetTransactionRequestBody()`, the single source of the exact request bytes used by the adapter, the evidence writer and the verifier.
+- The adapter option `maxSupportedTransactionVersion` is **required, with no default**; only `0` or `1` is accepted.
+  - It selects the request body sent, and it is passed to the decoder, so response acceptance is bound to the request actually made:
+
+    | Request cap | Accepted response versions |
+    | ----------- | -------------------------- |
+    | 0           | legacy, v0                 |
+    | 1           | legacy, v0, v1             |
+
+  - A contradictory version (v1 under cap 0, or any version above the cap) is `UNRESOLVED` / `UNSUPPORTED_TRANSACTION_VERSION` and is never ingestible.
+  - The new decoder detail codes are retained verbatim in facts.
+
+- `analyzeCpmmTransactionResponse()` requires a `maxSupportedTransactionVersion` input key (`INPUT_MISSING_KEY` / `MAX_SUPPORTED_TRANSACTION_VERSION_INVALID`). The caller supplies it from trusted request evidence; it is never inferred from the response. Legacy responses and the `-32015` error classify identically under both caps.
+
+##### Evidence Schemas (`cpmm-pool-observation-evidence.ts`)
+
+| `evidenceSchemaVersion`                    | Acquisition dependency       | Request policy every sealed request must carry | Plan/report `transactionRequest`                     |
+| ------------------------------------------ | ---------------------------- | ---------------------------------------------- | ---------------------------------------------------- |
+| 1 (historical)                             | none (`SUPPLIED_UNVERIFIED`) | cap 0 (`CPMM_GET_TRANSACTION_CONFIG`)          | must be absent                                       |
+| 2 (historical, e.g. `cpmm-observation-03`) | required, verified           | cap 0                                          | must be absent                                       |
+| 3 (new, v1-capable)                        | required, verified           | cap 1 (`CPMM_GET_TRANSACTION_V1_CONFIG`)       | must equal `{ "maxSupportedTransactionVersion": 1 }` |
+
+The table is exported as `CPMM_EVIDENCE_SCHEMA_POLICIES`. Any other schema is `EVIDENCE_SCHEMA_VERSION_UNSUPPORTED`. Schema 3 has no unbound variant.
+
+- **Writer:** a plan carrying `transactionRequest: { maxSupportedTransactionVersion: 1 }` seals schema 3. That record is the only one allowed (`PLAN_TRANSACTION_REQUEST_*`).
+  - Sealing refuses schema 3 without an acquisition dependency (`TRANSACTION_REQUEST_POLICY_REQUIRES_ACQUISITION`).
+  - Sealing also refuses any sealed request that is not the exact cap-1 body (`SNAPSHOT_EXCHANGE_REQUEST_POLICY_MISMATCH`), before any directory exists.
+  - The schema 1/2 writer path and its sealed bytes are unchanged.
+- **Verifier audit of every version-sensitive branch.** The manifest's schema alone selects the policy; nothing is inferred from a response or a request body.
+  1. Manifest gate: an explicit switch over 1/2/3.
+  2. Schema narrowing: previously, any non-2 schema was treated as 1. It is now the exact schema.
+  3. Acquisition binding: now every acquisition-bound schema (2 and 3) is verified. Previously the check was `=== 2`, so schema 3 would have fallen through to supplied/unverified handling.
+  4. `checkDocuments` provenance and pool-context reference checks: use `acquisitionBound`.
+  5. New integrity checks: `PLAN_TRANSACTION_REQUEST_POLICY_INVALID` and `REPORT_TRANSACTION_REQUEST_POLICY_INVALID`.
+  6. Re-derivation: request-body matching (`MISMATCH:REQUEST_BODY`) and transaction analysis both use the schema's cap.
+
+  File `version` fields keep their rule: the pool context and the report carry the schema, and every other file carries `1`.
+
+##### Composition and CLI Wiring
+
+- `cpmm-pool-observation-run.ts` exports:
+  - `CPMM_RUN_TRANSACTION_REQUEST` (`{ maxSupportedTransactionVersion: 1 }`).
+  - `CPMM_RUN_EVIDENCE_SCHEMA_VERSION` (`3`).
+- New runs pass the cap to the adapter and state it in the sealed plan, so observations seal as schema 3. Runs never send the cap-0 configuration again.
+- The CLI dry-run/help plan gains a `transactionRequest` section: method, encoding, commitment, cap 1, accepted versions and observation schema 3. Plan digests therefore change: any future packet must use newly computed digests.
+- Profile limits are unchanged. The short-profile limits hash `8cd48f31a9dd8a157c91341dbee0acb0f773fbf2b29eef20ea4fb978f533cf78` is still asserted.
+- **Component version pins were not changed (pin policy preserved).** As a result, `adapter: 2fd2f16` and `decoder: 3bc17a9` in `CPMM_OBSERVATION_COMPONENT_VERSIONS` no longer name the last commit that changed those files. A commit cannot name its own hash, so refreshing them under the pin policy is a separate follow-up and a **prerequisite of any future operator packet**.
+
+##### Validation (Offline, Each Suite Under an External 60 s Limit)
+
+- **Fixture provenance:** every v1 payload is an explicitly labelled **synthetic** SIMD-0385/Agave-shape fixture. The `-32015` fixture is modelled on Agave's error text; its 238-byte body matches the size of the captured bodies. No capture file is read by any test, and no relabelled v0 capture is used. `cpmm-observation-03`'s `exchanges/000004.json`–`000007.json` hold only `-32015` errors and **zero v1 transaction payloads**.
+- **Suites (all passed):**
+
+  | Suite    | Tests           | New tests | Covers                                                                                                                                                                                                                                                                                                           |
+  | -------- | --------------- | --------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+  | Decoder  | 21              | V1-01–05  | Valid v1 swaps (with a ComputeBudget no-op, SELL, both orientations, every config edge), legacy/v0 regressions under every cap, version/request contradictions, malformed configurations, protocol vs application limits, exact 4,096/4,097-byte boundary                                                        |
+  | Adapter  | 33              | P-01–05   | Preserved cap-0 bytes, required policy, live dispatch per policy, contradiction handling, retained detail codes, analysis/live agreement                                                                                                                                                                         |
+  | Evidence | 78 (about 30 s) | S3-1–5    | Schema-3 seal and credentialed matched v1 swap, dependency missing/different/tampered/relabelled, writer refusals, manifest/report/context/plan contradictions, consistent up/downgrades caught by `MISMATCH:REQUEST_BODY`, a historical-shaped schema-2 cap-0 bundle with retained `-32015` verifying unchanged |
+  | Run      | 36              | RV1–2     | Cap-1 request; schema 3 sealed; synthetic v1 run matched end to end                                                                                                                                                                                                                                              |
+  | CLI      | 41              | OC19b     | Plan states the request policy                                                                                                                                                                                                                                                                                   |
+
+  The owner, collector, recorder, WebSocket and ledger suites also passed (55/24/21/22/25), and so did TypeScript and ESLint on the changed files.
+
+- **Targeted mutations:** 35 single-guard mutations covered the decoder, adapter and evidence guards. **33 were killed.** The two survivors are equivalent mutants: the explicit "config present" and "exactly the four keys" checks are also enforced by per-field validation, because a missing key reads as `undefined` and is refused.
+- **Historical captures:** credential-free verification of `cpmm-observation-01`, `-02` and `-03` was run before and after the change, with each acquisition bundle, through the library verifier. The serialized results are **byte-identical**:
+  - Observation manifests: `f8026f11…`, `ee813da6…` and `12f5fac06c54ba51d17e845a2e607ca8cfa72bf1566440851946a73cf8757f0e`.
+  - Acquisition manifests: `49273a4f…`, `960b66a1…` and `57f6f2329ca20d8e5df72ef167f609e58ddb13e0072b0bc9abdbf7d8390a84eb`.
+  - Each capture: integrity `OK`, retention `COMPLETE`, binding `REPRODUCED`.
+  - Capture 03's five cap-0 requests still match with no `REQUEST_BODY` finding.
+  - Capture 03's four `-32015` exchanges are still recorded as `RPC_ERROR` / `JSON_RPC_ERROR`.
+  - Transaction analysis remains `UNAVAILABLE (ANALYSIS_CREDENTIALS_NOT_SUPPLIED)`. **This is not full transaction re-analysis**, and no credentials were loaded.

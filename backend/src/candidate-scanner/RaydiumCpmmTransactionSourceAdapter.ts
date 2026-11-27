@@ -10,6 +10,11 @@
  *   CPMM_GET_TRANSACTION, the signature as requested identity, a session-unique JSON-RPC id). The
  *   session alone paces, counts, bounds and stops; this module has no clock, timer, budget or
  *   network access of its own and never stops the session.
+ * - Request policy (explicit, required): `maxSupportedTransactionVersion` 0 sends the historical
+ *   `CPMM_GET_TRANSACTION_CONFIG` (legacy and v0 accepted); 1 sends
+ *   `CPMM_GET_TRANSACTION_V1_CONFIG` (legacy, v0 and SIMD-0385 v1 accepted). The decoder refuses a
+ *   response version above the cap the request carried; the analysis export takes the same cap
+ *   from its caller and never infers it from the response.
  * - Evidence: response bytes come only from the session's exchange observer, bound to the returned
  *   ledger entry and the exact request; the session's decoded response string is never used.
  * - Retention: only unchanged, credential-free, valid UTF-8 JSON bodies are stored; everything else
@@ -36,8 +41,11 @@ import type { RaydiumCpmmPoolStateSuccess } from "./RaydiumCpmmPoolStateAdapter.
 import {
   MAX_BLOCK_TIME_SEC,
   decodeRaydiumCpmmTransactionSwaps,
+  type CpmmMaxSupportedTransactionVersion,
   type DecodeRaydiumCpmmTransactionResult,
 } from "./RaydiumCpmmSwapDecoder.js";
+
+export type { CpmmMaxSupportedTransactionVersion };
 import type { RollingTradeFlowTracker, TradeEvent } from "./RollingTradeFlowTracker.js";
 
 // ---------------------------------------------------------------------------------------------
@@ -58,12 +66,52 @@ const MAX_DECODE_ROUNDS = 4;
 /** Upper bound for a response body given to `analyzeCpmmTransactionResponse` (64 MiB). */
 export const CPMM_MAX_ANALYSIS_RESPONSE_BYTES = 64 * 1024 * 1024;
 
-/** getTransaction parameters (fixed). */
+/**
+ * getTransaction parameters of the historical policy (cap 0: legacy and v0). Unchanged: sealed
+ * evidence of schemas 1 and 2 (e.g. cpmm-observation-03) recorded exactly this request body.
+ */
 export const CPMM_GET_TRANSACTION_CONFIG = Object.freeze({
   encoding: "json",
   commitment: "confirmed",
   maxSupportedTransactionVersion: 0,
 } as const);
+
+/** getTransaction parameters of the v1-capable policy (cap 1: legacy, v0 and SIMD-0385 v1). */
+export const CPMM_GET_TRANSACTION_V1_CONFIG = Object.freeze({
+  encoding: "json",
+  commitment: "confirmed",
+  maxSupportedTransactionVersion: 1,
+} as const);
+
+/** The explicit request policies, by `maxSupportedTransactionVersion`. */
+export const CPMM_GET_TRANSACTION_CONFIGS = Object.freeze({
+  0: CPMM_GET_TRANSACTION_CONFIG,
+  1: CPMM_GET_TRANSACTION_V1_CONFIG,
+} as const);
+
+/** The getTransaction parameters a request policy sends (0 or 1 only). */
+export function cpmmGetTransactionConfig(
+  maxSupportedTransactionVersion: CpmmMaxSupportedTransactionVersion,
+): (typeof CPMM_GET_TRANSACTION_CONFIGS)[CpmmMaxSupportedTransactionVersion] {
+  if (maxSupportedTransactionVersion !== 0 && maxSupportedTransactionVersion !== 1) {
+    throw new Error("[CPMM_TX_SOURCE] maxSupportedTransactionVersion must be 0 or 1");
+  }
+  return CPMM_GET_TRANSACTION_CONFIGS[maxSupportedTransactionVersion];
+}
+
+/** The exact request body the adapter sends for one signature, id and request policy. */
+export function cpmmGetTransactionRequestBody(
+  signature: string,
+  id: number,
+  maxSupportedTransactionVersion: CpmmMaxSupportedTransactionVersion,
+): string {
+  return JSON.stringify({
+    jsonrpc: "2.0",
+    id,
+    method: "getTransaction",
+    params: [signature, cpmmGetTransactionConfig(maxSupportedTransactionVersion)],
+  });
+}
 
 /** Session refusal codes recognised for requests that were never dispatched. */
 const SESSION_REFUSAL_CODES: ReadonlySet<string> = new Set([
@@ -112,6 +160,16 @@ const DECODER_DETAIL_CODES: ReadonlySet<string> = new Set([
   "LEGACY_LOOKUPS",
   "V0_LOADED",
   "V0_LOOKUPS",
+  "V1_LOADED",
+  "V1_LOOKUPS",
+  "V1_SIGNATURES",
+  "V1_ACCOUNT_KEYS",
+  "V1_INSTRUCTIONS",
+  "V1_INSTRUCTION_ACCOUNTS",
+  "V1_TRANSACTION_SIZE",
+  "TRANSACTION_CONFIG",
+  "TRANSACTION_CONFIG_FORBIDDEN",
+  "TRANSACTION_CONFIG_UNSAFE_INTEGER",
   "GROUP",
   "ACCOUNT_KEY_NOT_STRING",
   "VERSION_MISSING",
@@ -205,6 +263,12 @@ export interface CpmmTransactionSourceOptions {
   readonly maxTrackedSignatures: number;
   /** Must not exceed the session's SOLANA_RPC lane limit. */
   readonly maxResponseBytes: number;
+  /**
+   * The explicit request policy (required): 0 sends `CPMM_GET_TRANSACTION_CONFIG` and accepts
+   * legacy and v0; 1 sends `CPMM_GET_TRANSACTION_V1_CONFIG` and also accepts v1. A response
+   * version above it is refused as contradicting the request.
+   */
+  readonly maxSupportedTransactionVersion: CpmmMaxSupportedTransactionVersion;
 }
 
 export type CpmmWithheldReason =
@@ -366,6 +430,11 @@ export interface CpmmTransactionResponseAnalysisInput {
   readonly maxResponseBytes: number;
   /** The configured credential values (same rule as the adapter's `secrets`). */
   readonly secrets: readonly string[];
+  /**
+   * The request policy the request actually carried (0 or 1), supplied by the caller from trusted
+   * request evidence; never inferred from the response.
+   */
+  readonly maxSupportedTransactionVersion: CpmmMaxSupportedTransactionVersion;
 }
 
 /** What the analysis can never establish (fixed and always listed). */
@@ -670,6 +739,7 @@ const OPTION_KEYS: ReadonlySet<string> = new Set([
   "secrets",
   "maxTrackedSignatures",
   "maxResponseBytes",
+  "maxSupportedTransactionVersion",
 ]);
 const ENTRY_FIELDS = [
   ["seq", "ENTRY_SEQ"],
@@ -702,6 +772,7 @@ export class RaydiumCpmmTransactionSourceAdapter {
   private readonly needles: readonly string[];
   private readonly maxTrackedSignatures: number;
   private readonly maxResponseBytes: number;
+  private readonly maxSupportedTransactionVersion: CpmmMaxSupportedTransactionVersion;
   private readonly reserved = new Set<string>();
   private readonly produced = new WeakSet<object>();
   private readonly binding: CpmmAdapterBinding;
@@ -760,6 +831,9 @@ export class RaydiumCpmmTransactionSourceAdapter {
     ) {
       fail("maxResponseBytes must be a positive integer within the session's SOLANA_RPC limit");
     }
+    // The request policy is explicit: no default, and only the two defined caps.
+    const cap = o.maxSupportedTransactionVersion;
+    if (cap !== 0 && cap !== 1) fail("maxSupportedTransactionVersion must be 0 or 1");
     this.pool = o.pool as RaydiumCpmmPoolStateSuccess;
     this.session = session;
     this.recorder = rec!;
@@ -767,6 +841,7 @@ export class RaydiumCpmmTransactionSourceAdapter {
     this.needles = credentialNeedles(secrets as string[]);
     this.maxTrackedSignatures = maxTracked as number;
     this.maxResponseBytes = maxBytes as number;
+    this.maxSupportedTransactionVersion = cap as CpmmMaxSupportedTransactionVersion;
     this.binding = Object.freeze({
       poolAddress: this.pool.poolAddress,
       candidateMint: this.pool.candidateMint,
@@ -817,12 +892,11 @@ export class RaydiumCpmmTransactionSourceAdapter {
     }
     // 4. Dispatch: one POST through the session, which paces, counts, bounds and stops.
     const id = this.session.nextJsonRpcId();
-    const requestBody = JSON.stringify({
-      jsonrpc: "2.0",
+    const requestBody = cpmmGetTransactionRequestBody(
+      n.signature,
       id,
-      method: "getTransaction",
-      params: [n.signature, CPMM_GET_TRANSACTION_CONFIG],
-    });
+      this.maxSupportedTransactionVersion,
+    );
     const signals: readonly AbortSignal[] = g.signal ? [g.signal] : [];
     let exchange: PaperRequestExchange;
     try {
@@ -915,7 +989,14 @@ export class RaydiumCpmmTransactionSourceAdapter {
     return this.fact({
       ...base,
       postAwaitCheck: check,
-      ...classifyRetainedResponse(ex.body, retained.parsed, n, id, this.pool),
+      ...classifyRetainedResponse(
+        ex.body,
+        retained.parsed,
+        n,
+        id,
+        this.pool,
+        this.maxSupportedTransactionVersion,
+      ),
     });
   }
 
@@ -1295,6 +1376,7 @@ function classifyRetainedResponse(
   n: ValidNotification,
   id: number,
   pool: RaydiumCpmmPoolStateSuccess,
+  maxSupportedTransactionVersion: CpmmMaxSupportedTransactionVersion,
 ): ResponseClassification {
   if (body.state !== "STORED" || parsed === undefined) {
     if (
@@ -1309,7 +1391,7 @@ function classifyRetainedResponse(
     }
     return { kind: "MALFORMED_RESPONSE", code: body.withheldReason ?? "BODY_NOT_STORED" };
   }
-  return classifyParsedResponse(parsed, n, id, pool);
+  return classifyParsedResponse(parsed, n, id, pool, maxSupportedTransactionVersion);
 }
 
 function classifyParsedResponse(
@@ -1317,6 +1399,7 @@ function classifyParsedResponse(
   n: ValidNotification,
   id: number,
   pool: RaydiumCpmmPoolStateSuccess,
+  maxSupportedTransactionVersion: CpmmMaxSupportedTransactionVersion,
 ): ResponseClassification {
   const malformed = (code: string): ResponseClassification => ({
     kind: "MALFORMED_RESPONSE",
@@ -1369,8 +1452,11 @@ function classifyParsedResponse(
     }
     if (bt !== n.blockTime) return contradiction("BLOCK_TIME_MISMATCH");
   }
+  // The response version is bound to the request policy the request carried (never inferred
+  // from the response): the decoder refuses a version above it.
   const d = decodeRaydiumCpmmTransactionSwaps(result, pool, {
     receiptTimestampMs: n.receivedAtMs,
+    maxSupportedTransactionVersion,
   });
   const decoder =
     d.status === "UNRESOLVED_EVIDENCE"
@@ -1403,6 +1489,7 @@ const ANALYSIS_KEYS: ReadonlySet<string> = new Set([
   "responseBytes",
   "maxResponseBytes",
   "secrets",
+  "maxSupportedTransactionVersion",
 ]);
 const ANALYSIS_SCOPE = "RESPONSE_VALIDATION_AND_DECODING_ONLY" as const;
 
@@ -1564,11 +1651,13 @@ export function analyzeCpmmTransactionResponse(input: unknown): CpmmTransactionR
   ) {
     return invalid("MAX_RESPONSE_BYTES_INVALID");
   }
+  const cap = r.maxSupportedTransactionVersion;
+  if (cap !== 0 && cap !== 1) return invalid("MAX_SUPPORTED_TRANSACTION_VERSION_INVALID");
   const copy = boundedBytesCopy(r.responseBytes, max);
   if (typeof copy === "string") return invalid(copy);
   // The same retention and classification as `resolve()` step 10, on a COMPLETE body.
   const outcome = retainResponseBody("COMPLETE", copy, copy.length, credentialNeedles(secrets));
-  const c = classifyRetainedResponse(outcome.body, outcome.parsed, n, id, pool);
+  const c = classifyRetainedResponse(outcome.body, outcome.parsed, n, id, pool, cap);
   const events = c.kind === "RESOLVED_SWAPS" ? [...(c.events ?? [])] : [];
   return deepFreeze({
     status: "ANALYZED" as const,
