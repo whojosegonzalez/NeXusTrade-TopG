@@ -12134,3 +12134,107 @@ The new code would be a small, separately reviewed supplemental tool, for exampl
 2. Implementation with synthetic-only tests (including a synthetic v1 response, a not-found response, a slot mismatch, a `-32015` under cap 1, source-binding tampering and a refused existing output directory), reviewed separately.
 3. A new operator packet (pinned commit, script hash, plan digests, inert default path), reviewed separately.
 4. Explicit operator approval of that exact command. None of these steps is authorized by this proposal.
+
+#### 8.38.27 Retrospective Cap-1 Transaction Tool: Offline Implementation
+
+**Status**: Independent review accepted the §8.38.25–§8.38.26 documentation at `7df99130d1dd9519a4e7772a67fd5a8b1088dade`. This section records the offline implementation of the §8.38.26 design, with the review's design corrections applied:
+
+- New tool: `backend/src/scripts/cpmm-retrospective-transaction.ts`.
+- New synthetic tests: `backend/src/scripts/cpmm-retrospective-transaction.test.ts`.
+
+The work did not include, and is not approval for, any operator script, operator packet, credential load, provider request, socket or live execution. No capture, analyzer, decoder, session, sanitizer or wallet was changed. **All five qualification flags remain `false`.**
+
+##### Design Corrections Applied
+
+1. **Credential-free verification uses option (b).**
+   - It replays the accepted pure decoder (`decodeRaydiumCpmmTransactionSwaps`, cap `1`) plus strict JSON-RPC checks on the envelope, id, signature and slot, and checks the request evidence. These follow the analyzer's order and its fixed codes.
+   - Recorded outcomes (from the live analyzer) and computed results (from the replay) are kept separate.
+   - The result reports `credentialScanRepeated: false`.
+   - Bytes that are redacted, withheld, incomplete or flagged by the analyzer's credential scan cannot establish exact replay. Each case gets its own status: `UNAVAILABLE_REDACTED`, `UNAVAILABLE_WITHHELD`, `UNAVAILABLE_INCOMPLETE` or `UNAVAILABLE_CREDENTIAL_SCAN_NOT_REPEATED`.
+   - The analyzer maps unrecognized decoder detail codes to `UNRECOGNIZED_DECODER_DETAIL`. That filtered value is the only accepted difference between the two classifications.
+2. **The accepted components are preserved.**
+   - Live analysis uses the existing credential-aware `analyzeCpmmTransactionResponse` with `maxSupportedTransactionVersion: 1`.
+   - No export that bypasses the scan was added. The analyzer, decoder, session and sanitizer are unchanged.
+3. **Owner, purpose and isolation:**
+   - The request uses owner `SECURITY` with the distinct purpose `CPMM_RETROSPECTIVE_GET_TRANSACTION` on lane `SOLANA_RPC`.
+   - The module instantiates no tracker, ledger, collector, connection owner, recorder or transport. A source test asserts the static imports and the absence of any `ingest` call.
+   - Decoded events are stored only as data, in a record classified `RETROSPECTIVE_SUPPLEMENTAL` with `freshFlow: false` and `ingested: false`.
+4. **Corrected outcome table.** A version claim is compared only when the decoder ran, which means the response was bound to the request id, the signature and the slot:
+
+   | Response                                                                    | Recorded kind                                                                                 | Version comparison                                                                     |
+   | --------------------------------------------------------------------------- | --------------------------------------------------------------------------------------------- | -------------------------------------------------------------------------------------- |
+   | Bound swap or no-target payload                                             | `RESOLVED_SWAPS` / `RESOLVED_NO_TARGET_SWAP`                                                  | `MATCHES_SOURCE_CLAIM` (version `1`) or `DIFFERS_FROM_SOURCE_CLAIM` (`"legacy"` / `0`) |
+   | Bound payload with `meta.err`                                               | `RECORDED_FAILED_TRANSACTION` (separate)                                                      | as above                                                                               |
+   | Malformed, unsupported or missing `version` field (e.g. `2`, `"1"`, absent) | `UNRESOLVED` (`UNSUPPORTED_TRANSACTION_VERSION`)                                              | `UNRESOLVED_VERSION_FIELD`                                                             |
+   | Bound version-1 payload refused by the decoder                              | `UNRESOLVED` with its fixed reason; `v1PayloadBound: true`                                    | `MATCHES_SOURCE_CLAIM`; `decoderDefectEstablished` stays `false`                       |
+   | JSON-RPC error, including `-32015`                                          | `RPC_ERROR` / `JSON_RPC_ERROR` with `rpcErrorCode`                                            | `NOT_COMPARED` (no contradiction is inferred from the code alone)                      |
+   | `result: null`; signature, slot or envelope failures                        | `TRANSACTION_NOT_FOUND`; `SIGNATURE_MISMATCH`, `METADATA_CONTRADICTION`, `MALFORMED_RESPONSE` | `NOT_COMPARED`                                                                         |
+
+5. **Bounds and failure precedence:**
+   - **Request budget:** at most one request (`maxHttpAttempts: 1`, one `SOLANA_RPC` attempt, all other lanes `0`). A preflight refusal permits zero requests.
+   - **Deadline:** one absolute `15,000 ms` acquisition deadline starts **before** the session is constructed. The `10,000 ms` request timeout is capped by the remaining time.
+   - **Cleanup:** after the session stops, the request has at most `5,000 ms` to settle. Independently of the session's own timers, a hard bound abandons any request at deadline + `5,000 ms` as `CLEANUP_UNSETTLED`.
+   - **Local overhead:** source verification, sealing and offline verification all happen outside the deadline.
+   - **Failure precedence:**
+     - Run failures are recorded in order, and the earliest is preserved: `OPERATOR_CANCELLED`, `CLOCK_FAILURE:<CLOCK_THREW|CLOCK_INVALID|CLOCK_REGRESSED>`, `CLEANUP_UNSETTLED`.
+     - Cancellation and signal listeners stay attached through the final decision boundary. Cancellation is checked during the request, again before sealing and again at the final decision.
+     - The clock is guarded on every reading; a throwing, invalid or regressing clock is recorded once, and later readings return the last good value.
+     - Any recorded failure prevents a success exit, even after sealing and verification succeed.
+
+##### Retained from the Proposal
+
+- **Fixed source:** the signature and the full source binding are pinned in `RETRO_SOURCE` and re-checked read-only before any configuration is loaded and in every verification:
+  - Capture 03's observation manifest `12f5fac0…` and acquisition manifest `57f6f232…`, through the accepted verifiers.
+  - Exchange `exchanges/000004.json` `b3fbf21e…`, with the exact cap-0 request (`58f03595…`) and the `-32015` body (`06009d74…`) naming version `1`.
+  - Notification sequence `2` (slot `473543189`, `receivedAtMs` `1795566034813`, frame `ab1139de…`).
+  - Ledger record `2` (`UNRESOLVED` / `TRANSACTION_UNAVAILABLE` / `RPC_ERROR` / `JSON_RPC_ERROR`).
+  - The pool, re-adapted from the sealed accounts and equal to the recorded adapted pool.
+- **Limits:** a `262,144`-byte response cap; no retries, redirects, pagination, fallback or follow-up.
+- **Separate, exclusive-create supplemental bundle** at `data/research/cpmm-retrospective-transactions/<run>/`:
+  - Files: `plan.json`, `source-binding.json`, `retrieval.json`, then `evidence-manifest.json` written last.
+  - Every file is rendered and scanned with the accepted sanitizer before the directory exists. Endpoint URLs and keys are never persisted.
+- **Exit codes:**
+
+  | Code | Meaning                                                       |
+  | ---- | ------------------------------------------------------------- |
+  | `0`  | A transaction payload was bound and the replay reproduced it  |
+  | `1`  | Invalid input, configuration or source binding (nothing sent) |
+  | `2`  | Exact replay was impossible (limited evidence)                |
+  | `3`  | No transaction payload, or a run failure                      |
+  | `4`  | Integrity, source-binding or replay mismatch                  |
+  | `5`  | Seal failure                                                  |
+  | `6`  | Cancelled                                                     |
+  | `7`  | Listener cleanup failure                                      |
+
+##### Offline Validation (External 60 s Limit per Run)
+
+- **Synthetic suite `cpmm-retrospective-transaction.test.ts`: 11/11 tests passed (about 2.6 s).** Every source capture is a synthetic directory with the schema-2 shape, and every response is a synthetic transaction. Acquisition runs only with an injected fetch, a virtual clock and timers, and a synthetic credential. The tests cover:
+  - Pinned constants and the import boundary.
+  - Inert `--help`, and a dry run that only binds the source.
+  - Thirteen source-binding refusals with zero requests.
+  - A bound synthetic v1 swap, sealed and reproduced.
+  - The full outcome table (16 cases).
+  - Limited evidence and oversized responses.
+  - Transport outcomes with at most one request.
+  - The absolute deadline, the timeout capped by remaining time, and the hard cleanup bound.
+  - Cancellation during the request, before sealing and after verification.
+  - Throwing, invalid and regressing clocks, with earliest-failure precedence.
+  - Verification tampering, kept apart into integrity, source binding, recorded and computed results.
+  - Exclusive-write failure.
+- **Targeted mutations: 16/17 caught, 1 equivalent.** Each run used a clean baseline: every suite exits `0`, with no unhandled rejections. The caught mutations include:
+  - preflight refusal ignored, and an unchecked exchange digest, ledger fact or adapted pool;
+  - a cap-0 request body, owner `FLOW`, two attempts allowed, and no expiry before the session;
+  - a weakened hard cleanup bound;
+  - a forced version match and a forced replay agreement;
+  - the credential-scan or redaction case replayed;
+  - recorded run failures ignored by `--verify`, and final-boundary cancellation ignored;
+  - a missing response accepted for an outcome that needs an exchange.
+
+  The survivor removes the per-dispatch timeout cap. That cap is redundant: the session's own request timeout and the deadline-bounded timers expire at the same deadline, with the same `DEADLINE_EXPIRED` outcome. The source file was restored byte-identical after each mutation.
+
+- **Real source binding (dry run, read-only):** `--out-dir data/research/cpmm-retrospective-transactions/retro-dry-check` bound the real `cpmm-observation-03` capture through the real bundle verifiers.
+  - Output included `Source binding: VERIFIED`; the plan digest `9c82630d62019300eadd211884924affaa9afdee9be962e4293c05979d66b9c1` is specific to that out-dir.
+  - It loaded no configuration and created no directory. `--help` exited `0`.
+- **Pin allowlist:** `paper-pilot-handoff.ts` now allows exactly the two new files. Its test asserts them in the exact list and refuses near-miss names: `-cli`, `.test-support`, `.fixtures`, the plural name, and the `candidate-scanner` location. Handoff suite: 13/13 passed.
+- **Static checks:** TypeScript, ESLint and Prettier are clean on the changed files.
+- **Before any execution:** a separately reviewed operator packet (pinned commit, script hash, plan digests for its run id, inert default path) and explicit operator approval. Neither is prepared or authorized here.

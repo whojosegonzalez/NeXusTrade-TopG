@@ -1231,6 +1231,8 @@ describe("Watched-evidence handoff (offline integration)", () => {
       "backend/src/scripts/cpmm-pool-observation.test.ts",
       "backend/src/scripts/cpmm-pool-activity-check.ts",
       "backend/src/scripts/cpmm-pool-activity-check.test.ts",
+      "backend/src/scripts/cpmm-retrospective-transaction.ts",
+      "backend/src/scripts/cpmm-retrospective-transaction.test.ts",
     ];
     // The wrapper and its sequence core are pinned (compared with the pinned commit, clean).
     expect(PIN_PATHS).toContain("scripts/paper-pilot-sequence.ps1");
@@ -1340,6 +1342,11 @@ describe("Watched-evidence handoff (offline integration)", () => {
       "backend/src/scripts/cpmm-pool-activity-check.test-support.ts",
       "backend/src/scripts/cpmm-pool-activity-check-cli.ts",
       "backend/src/scripts/cpmm-activity-check.ts",
+      "backend/src/scripts/cpmm-retrospective-transaction.test-support.ts",
+      "backend/src/scripts/cpmm-retrospective-transaction-cli.ts",
+      "backend/src/scripts/cpmm-retrospective-transaction.fixtures.ts",
+      "backend/src/scripts/cpmm-retrospective-transactions.ts",
+      "backend/src/candidate-scanner/cpmm-retrospective-transaction.ts",
       "backend/src/candidate-scanner",
       "backend/src/candidate-scanner/BoundedAmmV4CreationWatch.ts/extra.ts",
     ]) {

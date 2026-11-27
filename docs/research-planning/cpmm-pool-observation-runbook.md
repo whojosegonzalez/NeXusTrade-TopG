@@ -279,3 +279,29 @@ Independent review accepted `cpmm-observation-04` (`CYBERLEEK/WSOL`, `--profile 
   - Evidence: sealed as separate supplemental evidence under `data/research/cpmm-retrospective-transactions/`, bound read-only to capture 03's verified manifests, exchange, notification and ledger record.
   - Isolation: never counted as fresh flow, never ingested, never modifying either capture.
   - Not authorized: no implementation, operator command, credential load, request, socket or rerun.
+
+## 17. Retrospective Cap-1 Transaction Tool: Implemented Offline
+
+The §16 design is implemented, with the review's corrections. Full detail is in assessment §8.38.27.
+
+- **Files:** `backend/src/scripts/cpmm-retrospective-transaction.ts`, plus synthetic tests.
+- **Not done:** no operator script, credential load, request, socket or execution. Captures and wallet are unchanged, and all qualification flags remain `false`.
+- **Request:**
+  - At most **one** cap-1 `getTransaction`, for the fixed capture-03 signature `4XcLrDWB…` (owner `SECURITY`, purpose `CPMM_RETROSPECTIVE_GET_TRANSACTION`).
+  - Preflight binds capture 03 read-only (manifests, exchange, notification, ledger record, pool). A refusal sends nothing.
+  - One absolute `15 s` deadline starts before the session. The `10 s` request timeout is capped by the remaining time, and at most `5 s` of settled cleanup follows.
+  - Cancellation and clock failures prevent success through the final decision.
+- **Analysis:**
+  - Live analysis uses the accepted credential-aware analyzer.
+  - Credential-free `--verify` replays the pure decoder plus strict envelope, id, signature, slot and request checks. It does not repeat the credential scan, and it cannot replay redacted, withheld or incomplete bytes.
+- **Outcomes:**
+  - A bound version-1 payload refused by the decoder stays `UNRESOLVED` and does not establish a decoder defect.
+  - `TRANSACTION_FAILED` is separate.
+  - JSON-RPC errors, including `-32015`, stay `RPC_ERROR`.
+  - The source's version claim is compared only after identity and slot binding.
+- **Evidence:** separate, exclusive-create supplemental bundles under `data/research/cpmm-retrospective-transactions/`. They are never fresh flow and never ingested.
+- **Validation:**
+  - 11/11 synthetic tests; 16/17 targeted mutations caught, and the 17th is equivalent (a redundant timeout cap).
+  - The real dry run bound capture 03 (`VERIFIED`) and wrote nothing.
+  - The handoff pin allowlist was extended exactly (13/13).
+- **Before any execution:** a separate operator packet and explicit operator approval.

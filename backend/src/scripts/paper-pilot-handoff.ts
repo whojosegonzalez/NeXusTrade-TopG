@@ -155,6 +155,9 @@ export const ALLOWED_ADDITIONS_SINCE_REVIEWED_RUNNER = Object.freeze([
   // The bounded single-page CPMM activity checker and its tests (assessment section 8.38.20).
   "backend/src/scripts/cpmm-pool-activity-check.ts",
   "backend/src/scripts/cpmm-pool-activity-check.test.ts",
+  // The bounded retrospective cap-1 transaction retrieval and its tests (section 8.38.27).
+  "backend/src/scripts/cpmm-retrospective-transaction.ts",
+  "backend/src/scripts/cpmm-retrospective-transaction.test.ts",
 ]);
 
 export interface ReviewedTreeEntry {
