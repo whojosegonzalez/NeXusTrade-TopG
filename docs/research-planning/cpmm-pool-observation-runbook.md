@@ -246,7 +246,7 @@ This implements the §14 design. Full detail is in assessment §8.38.24. All wor
   - Every acquisition-bound schema verifies its dependency. Unknown schemas and inconsistent manifest/report/context/plan policies are refused. The policy comes from the manifest and is never inferred from a response.
 - **Historical verification:** credential-free verification of captures `01`–`03` is byte-identical before and after the change. Capture `03` still has five cap-0 requests matched and four retained `-32015` exchanges recorded as `RPC_ERROR` / `JSON_RPC_ERROR`. Its transaction analysis is still `UNAVAILABLE` without credentials, which is not full re-analysis.
 - **Before any new capture:**
-  - Refresh the stale `adapter`/`decoder` component pins (`2fd2f16`/`3bc17a9`) under the pin policy in a follow-up commit.
+  - ~~Refresh the stale `adapter`/`decoder` component pins.~~ Done in a follow-up commit after independent review accepted `0d3e6de06b4ef384dd5e893f34db7ec52459fc5b`: both now pin `0d3e6de` (verified as the last commit changing each file); the other seven pins were checked and are current. No operator packet has been prepared.
   - Recompute the plan digests: the CLI plan now includes `transactionRequest`.
   - Prepare a separately approved operator packet.
 
