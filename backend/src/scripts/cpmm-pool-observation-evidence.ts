@@ -2164,7 +2164,9 @@ export function verifyCpmmObservationEvidence(
     const known = CPMM_EVIDENCE_REQUIRED_FILES.includes(p) || EXCHANGE_FILE.test(p);
     if (!known) {
       problems.push(
-        path.isAbsolute(p) || p.split(/[\\/]/).includes("..")
+        // A manifest path is portable data, not a host path: absolute on either platform
+        // (drive, UNC or POSIX root) is not confined, whichever platform verifies it.
+        path.win32.isAbsolute(p) || path.posix.isAbsolute(p) || p.split(/[\\/]/).includes("..")
           ? "MANIFEST_PATH_NOT_CONFINED"
           : `MANIFEST_PATH_UNKNOWN:${safeName(p)}`,
       );

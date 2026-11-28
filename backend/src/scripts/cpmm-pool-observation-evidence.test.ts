@@ -1802,6 +1802,49 @@ describe("CPMM observation evidence: verification", () => {
     expect(problemsOf(path.join(TMP, "absent"))).toEqual(["OUTPUT_DIRECTORY_MISSING"]);
   });
 
+  it("V3b: manifest-entry confinement codes are identical on every platform", async () => {
+    // Manifest paths are portable data, so the verifier must classify them the same way on
+    // Windows and POSIX hosts; CI runs this on both.
+    const { dir } = await shared;
+    const notConfined = [
+      "C:/abs.json", // Windows drive, forward slash
+      "C:\\abs.json", // Windows drive, backslash
+      "d:/x/y.json",
+      "\\\\server\\share\\x.json", // UNC
+      "//server/share/x.json", // UNC, forward slashes
+      "\\abs.json", // Windows root-relative
+      "/abs.json", // POSIX absolute
+      "/etc/passwd",
+      "../outside.json", // traversal
+      "exchanges/../../x.json",
+      "a\\..\\..\\x.json",
+    ];
+    // Ordinary relative names (a drive-relative name included) stay merely unknown.
+    const unknown = ["unknown.json", "exchanges/notes.txt", "sub/dir/file.json", "C:abs.json"];
+    const push = (p: string) => (m: Record<string, unknown>) =>
+      (m.files as unknown[]).push({ path: p, bytes: 1, sha256: "0".repeat(64) });
+    for (const p of notConfined) {
+      const d = copyOf(dir);
+      reseal(d, CPMM_EVIDENCE_FILES.manifest, push(p));
+      const problems = problemsOf(d);
+      expect(problems, p).toContain("MANIFEST_PATH_NOT_CONFINED");
+      expect(
+        problems.filter((x) => x.startsWith("MANIFEST_PATH_UNKNOWN:")),
+        p,
+      ).toEqual([]);
+    }
+    for (const p of unknown) {
+      const d = copyOf(dir);
+      reseal(d, CPMM_EVIDENCE_FILES.manifest, push(p));
+      const problems = problemsOf(d);
+      expect(
+        problems.filter((x) => x.startsWith("MANIFEST_PATH_UNKNOWN:")),
+        p,
+      ).toHaveLength(1);
+      expect(problems, p).not.toContain("MANIFEST_PATH_NOT_CONFINED");
+    }
+  });
+
   it("V3: manifest schema, versions, confinement, uniqueness, order, required files and bounds", async () => {
     const { dir } = await shared;
     const cases: [(m: Record<string, unknown>) => void, string[]][] = [
