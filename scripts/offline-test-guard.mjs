@@ -15,24 +15,78 @@ import path from "node:path";
 import tls from "node:tls";
 import { fileURLToPath } from "node:url";
 
-const LOOPBACK_HOSTS = new Set(["localhost", "127.0.0.1", "::1", "[::1]"]);
+const IS_WINDOWS = process.platform === "win32";
+// Captured at load: realpath only stats a path (never reads content) and is not itself guarded.
+const realpathNative = fs.realpathSync.native;
 
+// path.relative compares case-insensitively on Windows, matching its file system.
 const isInside = (file, dir) => {
   const rel = path.relative(path.resolve(dir), path.resolve(file));
   return rel === "" || (!rel.startsWith("..") && !path.isAbsolute(rel));
 };
 
+/** Loopback only: localhost, 127.0.0.0/8, ::1, and IPv4-mapped 127.0.0.0/8 (brackets allowed). */
 export function isLoopbackHost(host) {
-  return typeof host === "string" && LOOPBACK_HOSTS.has(host.toLowerCase());
+  if (typeof host !== "string" || host === "") return false;
+  let h = host.toLowerCase();
+  if (h.startsWith("[") && h.endsWith("]")) h = h.slice(1, -1);
+  if (h === "localhost" || h === "::1" || h === "0:0:0:0:0:0:0:1") return true;
+  if (h.startsWith("::ffff:")) h = h.slice("::ffff:".length);
+  return net.isIPv4(h) && h.startsWith("127.");
 }
 
-/** A real credential file: `.env` or `.env.*` (not `.env.example`) outside the synthetic roots. */
+/**
+ * The path named by a supported fs path argument (string, Buffer/Uint8Array, file: URL), or null
+ * for anything that is not a path (file descriptors, FileHandles, other values).
+ */
+export function pathArgument(file) {
+  if (typeof file === "string") return file;
+  if (file instanceof Uint8Array) return Buffer.from(file).toString("utf8");
+  if (file instanceof URL) {
+    if (file.protocol !== "file:") return null;
+    try {
+      return fileURLToPath(file);
+    } catch {
+      return null;
+    }
+  }
+  return null;
+}
+
+/**
+ * The name a file system would open, compared case-insensitively on every platform (conservative
+ * on case-sensitive systems). Windows also ignores trailing dots and spaces and addresses the same
+ * file through a `:stream` suffix such as `::$DATA`.
+ */
+function openedName(resolved) {
+  let base = path.basename(resolved);
+  if (IS_WINDOWS) {
+    const colon = base.indexOf(":");
+    if (colon !== -1) base = base.slice(0, colon);
+    base = base.replace(/[. ]+$/, "");
+  }
+  return base.toLowerCase();
+}
+
+const isCredentialName = (name) => /^\.env(\..+)?$/.test(name) && name !== ".env.example";
+
+/**
+ * A real credential file: `.env` or `.env.*` (not `.env.example`), by any supported path form or
+ * Windows alias, outside the synthetic roots. Existing paths are also checked after resolving
+ * symlinks, so a link inside a synthetic root cannot alias a real credential file.
+ */
 export function isCredentialFile(file, syntheticRoots) {
-  if (typeof file !== "string" && !(file instanceof URL)) return false;
-  const resolved = path.resolve(file instanceof URL ? fileURLToPath(file) : file);
-  const base = path.basename(resolved);
-  if (!/^\.env(\..+)?$/.test(base) || base === ".env.example") return false;
-  return !syntheticRoots.some((root) => isInside(resolved, root));
+  const p = pathArgument(file);
+  if (p === null) return false;
+  const candidates = [path.resolve(p)];
+  try {
+    candidates.push(realpathNative(candidates[0]));
+  } catch {
+    // Missing or inaccessible: the lexical path alone decides.
+  }
+  return candidates.some(
+    (c) => isCredentialName(openedName(c)) && !syntheticRoots.some((root) => isInside(c, root)),
+  );
 }
 
 export function installOfflineGuard(options = {}) {
@@ -64,7 +118,7 @@ export function installOfflineGuard(options = {}) {
     } catch {
       host = "";
     }
-    if (isLoopbackHost(host) || isLoopbackHost(`[${host}]`)) return saved.fetch(input, init);
+    if (isLoopbackHost(host)) return saved.fetch(input, init);
     throw refuse("fetch", href, TypeError);
   };
 
@@ -85,13 +139,20 @@ export function installOfflineGuard(options = {}) {
   };
 
   tls.connect = (...args) => {
+    // tls.connect(options), tls.connect(port[, host][, options]) or tls.connect(path[, options]).
     const first = args[0];
-    const host =
+    if (first !== null && typeof first === "object" && typeof first.path === "string") {
+      return saved.tlsConnect(...args); // local IPC
+    }
+    if (typeof first === "string" && !/^\d+$/.test(first)) return saved.tlsConnect(...args);
+    const options =
       first !== null && typeof first === "object"
-        ? (first.host ?? first.servername ?? "localhost")
-        : typeof args[1] === "string"
-          ? args[1]
-          : "localhost";
+        ? first
+        : args.find((a, i) => i > 0 && a !== null && typeof a === "object");
+    const host =
+      typeof args[1] === "string" && (typeof first === "number" || /^\d+$/.test(String(first)))
+        ? args[1]
+        : (options?.host ?? "localhost");
     if (isLoopbackHost(host)) return saved.tlsConnect(...args);
     throw refuse("tls", String(host));
   };
@@ -99,10 +160,19 @@ export function installOfflineGuard(options = {}) {
   const guardPath =
     (name, original) =>
     (file, ...rest) => {
-      if (isCredentialFile(file, syntheticRoots)) throw refuse("credential-file", String(file));
+      if (isCredentialFile(file, syntheticRoots)) {
+        throw refuse("credential-file", String(pathArgument(file)));
+      }
       return original(file, ...rest);
     };
-  process.loadEnvFile = guardPath("loadEnvFile", saved.loadEnvFile.bind(process));
+  // process.loadEnvFile() and process.loadEnvFile(undefined) read the native default ./.env.
+  process.loadEnvFile = (file, ...rest) => {
+    const target = file === undefined ? path.resolve(process.cwd(), ".env") : file;
+    if (isCredentialFile(target, syntheticRoots)) {
+      throw refuse("credential-file", String(pathArgument(target)));
+    }
+    return saved.loadEnvFile.call(process, file, ...rest);
+  };
   fs.readFileSync = guardPath("readFileSync", saved.readFileSync);
   fs.readFile = guardPath("readFile", saved.readFile);
   fs.openSync = guardPath("openSync", saved.openSync);
