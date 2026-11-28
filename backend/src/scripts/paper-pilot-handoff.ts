@@ -211,6 +211,13 @@ export const REVIEWED_TEST_FIXTURE_MODIFICATIONS: Readonly<Record<string, Review
       type: "blob",
       oid: "4e6c897f9e0590a230ba3587309f58b39d25ba67",
     }),
+    // The bundler-capture tests without real repository .env reads (46b48c7): the tool's
+    // path-less default load reads a synthetic fixture. Test code only; the tool is unchanged.
+    "backend/src/candidate-scanner/SolanaTrackerBundlerCaptureTool.test.ts": Object.freeze({
+      mode: "100644",
+      type: "blob",
+      oid: "b051306fd707c8524faf93e707e699e807df6919",
+    }),
   });
 /** Every exact-version exception the pin checks: endpoint files, lockfile and test fixtures. */
 export const REVIEWED_TREE_MODIFICATIONS: Readonly<Record<string, ReviewedTreeEntry>> =

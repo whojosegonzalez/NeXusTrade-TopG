@@ -1366,7 +1366,7 @@ describe("Watched-evidence handoff (offline integration)", () => {
     const reviewedModFiles = Object.keys(REVIEWED_ENDPOINT_MODIFICATIONS);
     // The reviewed lockfile entry is present in every valid pinned tree (its own cases: H-14).
     const REVIEWED_LOCK_TREE_LINE = `100644 blob ${REVIEWED_LOCKFILE_MODIFICATIONS["pnpm-lock.yaml"]!.oid}\tpnpm-lock.yaml`;
-    // ... and so is the reviewed probe-test fixture entry (its own cases: H-15).
+    // ... and so are the reviewed test-fixture entries (their own cases: H-15, H-16).
     const REVIEWED_FIXTURE_TREE_LINES = Object.entries(REVIEWED_TEST_FIXTURE_MODIFICATIONS)
       .map(([f, e]) => `${e.mode} ${e.type} ${e.oid}\t${f}`)
       .join("\n");
@@ -1672,14 +1672,22 @@ describe("Watched-evidence handoff (offline integration)", () => {
     expect(committed.stdout.trim()).toBe(reviewedLock);
   });
 
-  it("H-15: only the reviewed probe-test fixture blob is accepted; the probe and other tests still refuse", () => {
-    const FIXTURE = "backend/src/candidate-scanner/RaydiumTransportObservationProbe.test.ts";
-    const REVIEWED_OID = "4e6c897f9e0590a230ba3587309f58b39d25ba67";
-    const RUNNER_OID = "3f44bab77f67f0a3c9221797f66753ee10dee6a8"; // the file at the reviewed runner
+  /**
+   * Shared exact-blob acceptance checks for one reviewed test-fixture entry: the reviewed blob
+   * passes; the runner's blob, altered content, missing, deleted, re-added, duplicated,
+   * wrong-mode and wrong-type entries refuse; the named neighbours stay protected.
+   */
+  function expectExactFixtureAcceptance(
+    FIXTURE: string,
+    REVIEWED_OID: string,
+    RUNNER_OID: string, // the file at the reviewed runner
+    neighbours: readonly string[],
+  ) {
     const REFUSED = `REVIEWED_RUNNER_DEPENDENCY_CHANGED:${FIXTURE}`;
-    // Exactly one exact-version entry; the runner baseline and the other entries are unchanged.
-    expect(REVIEWED_TEST_FIXTURE_MODIFICATIONS).toEqual({
-      [FIXTURE]: { mode: "100644", type: "blob", oid: REVIEWED_OID },
+    expect(REVIEWED_TEST_FIXTURE_MODIFICATIONS[FIXTURE]).toEqual({
+      mode: "100644",
+      type: "blob",
+      oid: REVIEWED_OID,
     });
     expect(Object.isFrozen(REVIEWED_TEST_FIXTURE_MODIFICATIONS)).toBe(true);
     expect(Object.isFrozen(REVIEWED_TEST_FIXTURE_MODIFICATIONS[FIXTURE])).toBe(true);
@@ -1690,7 +1698,7 @@ describe("Watched-evidence handoff (offline integration)", () => {
     expect(Object.keys(REVIEWED_TREE_MODIFICATIONS)).toEqual([
       ...Object.keys(REVIEWED_ENDPOINT_MODIFICATIONS),
       "pnpm-lock.yaml",
-      FIXTURE,
+      ...Object.keys(REVIEWED_TEST_FIXTURE_MODIFICATIONS),
     ]);
     expect(ALLOWED_ADDITIONS_SINCE_REVIEWED_RUNNER).not.toContain(FIXTURE);
 
@@ -1707,6 +1715,9 @@ describe("Watched-evidence handoff (offline integration)", () => {
         ...ALLOWED_ADDITIONS_SINCE_REVIEWED_RUNNER.map((f) => `A\t${f}`),
         ...Object.keys(REVIEWED_ENDPOINT_MODIFICATIONS).map((f) => `M\t${f}`),
         "M\tpnpm-lock.yaml",
+        ...Object.keys(REVIEWED_TEST_FIXTURE_MODIFICATIONS)
+          .filter((f) => f !== FIXTURE)
+          .map((f) => `M\t${f}`),
         ...extra,
       ].join("\n");
     const pinWith = (nameStatus: string, lsTree: GitAnswer) =>
@@ -1743,14 +1754,8 @@ describe("Watched-evidence handoff (offline integration)", () => {
     expect(pinWith(changes(`M\t${FIXTURE}`), tree(`${reviewed}\n${reviewed}`))).toEqual([
       "REVIEWED_RUNNER_COMPARISON_FAILED",
     ]);
-    // The probe itself, sibling tests and other candidate-scanner code still refuse when changed.
-    for (const other of [
-      "backend/src/candidate-scanner/RaydiumTransportObservationProbe.ts",
-      "backend/src/candidate-scanner/RaydiumTransportObservationProbe.test-support.ts",
-      "backend/src/candidate-scanner/ExactPoolHistoryEnumerator.test.ts",
-      "backend/src/candidate-scanner/RaydiumAmmV4TransactionSourceAdapter.ts",
-      "backend/vitest.measurement-analysis.config.ts",
-    ]) {
+    // The code under test, sibling tests and other backend files still refuse when changed.
+    for (const other of neighbours) {
       expect(pinWith(changes(`M\t${FIXTURE}`, `M\t${other}`), tree(reviewed)), other).toEqual([
         `REVIEWED_RUNNER_DEPENDENCY_CHANGED:${other}`,
       ]);
@@ -1769,6 +1774,40 @@ describe("Watched-evidence handoff (offline integration)", () => {
     const committed = git(["ls-tree", "HEAD", "--", FIXTURE]);
     expect(committed.status).toBe(0);
     expect(committed.stdout.trim()).toBe(reviewed);
+  }
+
+  it("H-15: only the reviewed probe-test fixture blob is accepted; the probe and other tests still refuse", () => {
+    expectExactFixtureAcceptance(
+      "backend/src/candidate-scanner/RaydiumTransportObservationProbe.test.ts",
+      "4e6c897f9e0590a230ba3587309f58b39d25ba67",
+      "3f44bab77f67f0a3c9221797f66753ee10dee6a8",
+      [
+        "backend/src/candidate-scanner/RaydiumTransportObservationProbe.ts",
+        "backend/src/candidate-scanner/RaydiumTransportObservationProbe.test-support.ts",
+        "backend/src/candidate-scanner/ExactPoolHistoryEnumerator.test.ts",
+        "backend/src/candidate-scanner/RaydiumAmmV4TransactionSourceAdapter.ts",
+        "backend/vitest.measurement-analysis.config.ts",
+      ],
+    );
+  });
+
+  it("H-16: only the reviewed bundler-capture test blob is accepted; the tool and env loader still refuse", () => {
+    expect(Object.keys(REVIEWED_TEST_FIXTURE_MODIFICATIONS)).toEqual([
+      "backend/src/candidate-scanner/RaydiumTransportObservationProbe.test.ts",
+      "backend/src/candidate-scanner/SolanaTrackerBundlerCaptureTool.test.ts",
+    ]);
+    expectExactFixtureAcceptance(
+      "backend/src/candidate-scanner/SolanaTrackerBundlerCaptureTool.test.ts",
+      "b051306fd707c8524faf93e707e699e807df6919",
+      "985b1a9b8f1d6f2cdc4cf537a838a9ad29000630",
+      [
+        "backend/src/candidate-scanner/SolanaTrackerBundlerCaptureTool.ts",
+        "backend/src/config/loadEnvFile.ts",
+        "backend/src/config/env.ts",
+        "backend/src/candidate-scanner/SolanaTrackerBundlerCaptureTool.test-support.ts",
+        "backend/vitest.measurement-analysis.config.ts",
+      ],
+    );
   });
 
   it("H-13: the handoff CLI routes explicit precheck or watch inputs, refuses conflicts, and exits with its decision's code", async () => {
