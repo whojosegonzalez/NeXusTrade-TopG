@@ -198,9 +198,27 @@ export const REVIEWED_LOCKFILE_MODIFICATIONS: Readonly<Record<string, ReviewedTr
       oid: "5fc0a766b6dbe93bb9f94bcc3538a1ffd21d021e",
     }),
   });
-/** Every exact-version exception the pin checks: the endpoint files and the lockfile. */
+/**
+ * Exact-version exception for the repaired transport-probe test fixtures (21be531): explicit
+ * synthetic RPC for the two tests that fell back to the public endpoint, a file-level guard that
+ * refuses unmocked fetch, and uniquely owned output directories. Test code only; the probe
+ * itself is unchanged. Only this exact blob, as an ordinary file with mode 100644, is accepted.
+ */
+export const REVIEWED_TEST_FIXTURE_MODIFICATIONS: Readonly<Record<string, ReviewedTreeEntry>> =
+  Object.freeze({
+    "backend/src/candidate-scanner/RaydiumTransportObservationProbe.test.ts": Object.freeze({
+      mode: "100644",
+      type: "blob",
+      oid: "4e6c897f9e0590a230ba3587309f58b39d25ba67",
+    }),
+  });
+/** Every exact-version exception the pin checks: endpoint files, lockfile and test fixtures. */
 export const REVIEWED_TREE_MODIFICATIONS: Readonly<Record<string, ReviewedTreeEntry>> =
-  Object.freeze({ ...REVIEWED_ENDPOINT_MODIFICATIONS, ...REVIEWED_LOCKFILE_MODIFICATIONS });
+  Object.freeze({
+    ...REVIEWED_ENDPOINT_MODIFICATIONS,
+    ...REVIEWED_LOCKFILE_MODIFICATIONS,
+    ...REVIEWED_TEST_FIXTURE_MODIFICATIONS,
+  });
 /** One wait at most, never longer than the window's lower bound. */
 export const MAX_WAIT_MS = PLANNING_START_WINDOW.minAgeSec * 1000;
 

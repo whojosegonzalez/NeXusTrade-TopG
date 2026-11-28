@@ -19,6 +19,7 @@ import {
   REVIEWED_RUNNER_COMMIT,
   REVIEWED_ENDPOINT_MODIFICATIONS,
   REVIEWED_LOCKFILE_MODIFICATIONS,
+  REVIEWED_TEST_FIXTURE_MODIFICATIONS,
   REVIEWED_TREE_MODIFICATIONS,
   checkPin,
   defaultGit,
@@ -1365,6 +1366,10 @@ describe("Watched-evidence handoff (offline integration)", () => {
     const reviewedModFiles = Object.keys(REVIEWED_ENDPOINT_MODIFICATIONS);
     // The reviewed lockfile entry is present in every valid pinned tree (its own cases: H-14).
     const REVIEWED_LOCK_TREE_LINE = `100644 blob ${REVIEWED_LOCKFILE_MODIFICATIONS["pnpm-lock.yaml"]!.oid}\tpnpm-lock.yaml`;
+    // ... and so is the reviewed probe-test fixture entry (its own cases: H-15).
+    const REVIEWED_FIXTURE_TREE_LINES = Object.entries(REVIEWED_TEST_FIXTURE_MODIFICATIONS)
+      .map(([f, e]) => `${e.mode} ${e.type} ${e.oid}\t${f}`)
+      .join("\n");
     expect(pinWith(reviewedModFiles.map((f) => `M\t${f}`).join("\n"))).toEqual([]);
 
     // Failure cases for reviewed endpoint modifications:
@@ -1375,7 +1380,9 @@ describe("Watched-evidence handoff (offline integration)", () => {
         stdout:
           "100644 blob 1111111111111111111111111111111111111111\tbackend/src/scripts/paper-single-candidate-diagnostic.ts\n" +
           "100644 blob e5cf0d3dfe1c71e1cebfea46c24ab0bd516120ab\tbackend/src/scripts/paper-single-candidate-diagnostic.test.ts\n" +
-          REVIEWED_LOCK_TREE_LINE,
+          REVIEWED_LOCK_TREE_LINE +
+          "\n" +
+          REVIEWED_FIXTURE_TREE_LINES,
       }),
     ).toEqual([
       "REVIEWED_RUNNER_DEPENDENCY_CHANGED:backend/src/scripts/paper-single-candidate-diagnostic.ts",
@@ -1388,7 +1395,9 @@ describe("Watched-evidence handoff (offline integration)", () => {
         stdout:
           "100755 blob 42435317b0817f5463fcac804847faefee35c69b\tbackend/src/scripts/paper-single-candidate-diagnostic.ts\n" +
           "100644 blob e5cf0d3dfe1c71e1cebfea46c24ab0bd516120ab\tbackend/src/scripts/paper-single-candidate-diagnostic.test.ts\n" +
-          REVIEWED_LOCK_TREE_LINE,
+          REVIEWED_LOCK_TREE_LINE +
+          "\n" +
+          REVIEWED_FIXTURE_TREE_LINES,
       }),
     ).toEqual([
       "REVIEWED_RUNNER_DEPENDENCY_CHANGED:backend/src/scripts/paper-single-candidate-diagnostic.ts",
@@ -1401,7 +1410,9 @@ describe("Watched-evidence handoff (offline integration)", () => {
         stdout:
           "040000 tree 42435317b0817f5463fcac804847faefee35c69b\tbackend/src/scripts/paper-single-candidate-diagnostic.ts\n" +
           "100644 blob e5cf0d3dfe1c71e1cebfea46c24ab0bd516120ab\tbackend/src/scripts/paper-single-candidate-diagnostic.test.ts\n" +
-          REVIEWED_LOCK_TREE_LINE,
+          REVIEWED_LOCK_TREE_LINE +
+          "\n" +
+          REVIEWED_FIXTURE_TREE_LINES,
       }),
     ).toEqual([
       "REVIEWED_RUNNER_DEPENDENCY_CHANGED:backend/src/scripts/paper-single-candidate-diagnostic.ts",
@@ -1413,7 +1424,9 @@ describe("Watched-evidence handoff (offline integration)", () => {
         status: 0,
         stdout:
           "100644 blob e5cf0d3dfe1c71e1cebfea46c24ab0bd516120ab\tbackend/src/scripts/paper-single-candidate-diagnostic.test.ts\n" +
-          REVIEWED_LOCK_TREE_LINE,
+          REVIEWED_LOCK_TREE_LINE +
+          "\n" +
+          REVIEWED_FIXTURE_TREE_LINES,
       }),
     ).toEqual([
       "REVIEWED_RUNNER_DEPENDENCY_CHANGED:backend/src/scripts/paper-single-candidate-diagnostic.ts",
@@ -1439,7 +1452,9 @@ describe("Watched-evidence handoff (offline integration)", () => {
     const validTreeStdout =
       "100644 blob 42435317b0817f5463fcac804847faefee35c69b\tbackend/src/scripts/paper-single-candidate-diagnostic.ts\n" +
       "100644 blob e5cf0d3dfe1c71e1cebfea46c24ab0bd516120ab\tbackend/src/scripts/paper-single-candidate-diagnostic.test.ts\n" +
-      REVIEWED_LOCK_TREE_LINE;
+      REVIEWED_LOCK_TREE_LINE +
+      "\n" +
+      REVIEWED_FIXTURE_TREE_LINES;
     expect(
       pinWith(reviewedModFiles.map((f) => `M\t${f}`).join("\n"), {
         status: 0,
@@ -1531,6 +1546,7 @@ describe("Watched-evidence handoff (offline integration)", () => {
     expect(REVIEWED_TREE_MODIFICATIONS).toEqual({
       ...REVIEWED_ENDPOINT_MODIFICATIONS,
       ...REVIEWED_LOCKFILE_MODIFICATIONS,
+      ...REVIEWED_TEST_FIXTURE_MODIFICATIONS,
     });
     expect(Object.keys(REVIEWED_ENDPOINT_MODIFICATIONS)).toEqual([
       "backend/src/scripts/paper-single-candidate-diagnostic.ts",
@@ -1545,15 +1561,23 @@ describe("Watched-evidence handoff (offline integration)", () => {
     const endpointLines = Object.entries(REVIEWED_ENDPOINT_MODIFICATIONS).map(
       ([f, e]) => `${e.mode} ${e.type} ${e.oid}\t${f}`,
     );
+    const fixtureLines = Object.entries(REVIEWED_TEST_FIXTURE_MODIFICATIONS).map(
+      ([f, e]) => `${e.mode} ${e.type} ${e.oid}\t${f}`,
+    );
     const tree = (lockLine?: string) => ({
       status: 0,
-      stdout: [...endpointLines, ...(lockLine === undefined ? [] : [lockLine])].join("\n"),
+      stdout: [
+        ...endpointLines,
+        ...fixtureLines,
+        ...(lockLine === undefined ? [] : [lockLine]),
+      ].join("\n"),
     });
     const reviewedLock = `100644 blob ${REVIEWED_OID}\t${LOCK}`;
     const changes = (...extra: string[]) =>
       [
         ...ALLOWED_ADDITIONS_SINCE_REVIEWED_RUNNER.map((f) => `A\t${f}`),
         ...Object.keys(REVIEWED_ENDPOINT_MODIFICATIONS).map((f) => `M\t${f}`),
+        ...Object.keys(REVIEWED_TEST_FIXTURE_MODIFICATIONS).map((f) => `M\t${f}`),
         ...extra,
       ].join("\n");
     const pinWith = (nameStatus: string, lsTree: GitAnswer) =>
@@ -1628,6 +1652,7 @@ describe("Watched-evidence handoff (offline integration)", () => {
         stdout: [
           `100644 blob ${"2".repeat(40)}\tbackend/src/scripts/paper-single-candidate-diagnostic.ts`,
           endpointLines[1],
+          ...fixtureLines,
           reviewedLock,
         ].join("\n"),
       }),
@@ -1645,6 +1670,105 @@ describe("Watched-evidence handoff (offline integration)", () => {
     const committed = git(["ls-tree", "HEAD", "--", LOCK]);
     expect(committed.status).toBe(0);
     expect(committed.stdout.trim()).toBe(reviewedLock);
+  });
+
+  it("H-15: only the reviewed probe-test fixture blob is accepted; the probe and other tests still refuse", () => {
+    const FIXTURE = "backend/src/candidate-scanner/RaydiumTransportObservationProbe.test.ts";
+    const REVIEWED_OID = "4e6c897f9e0590a230ba3587309f58b39d25ba67";
+    const RUNNER_OID = "3f44bab77f67f0a3c9221797f66753ee10dee6a8"; // the file at the reviewed runner
+    const REFUSED = `REVIEWED_RUNNER_DEPENDENCY_CHANGED:${FIXTURE}`;
+    // Exactly one exact-version entry; the runner baseline and the other entries are unchanged.
+    expect(REVIEWED_TEST_FIXTURE_MODIFICATIONS).toEqual({
+      [FIXTURE]: { mode: "100644", type: "blob", oid: REVIEWED_OID },
+    });
+    expect(Object.isFrozen(REVIEWED_TEST_FIXTURE_MODIFICATIONS)).toBe(true);
+    expect(Object.isFrozen(REVIEWED_TEST_FIXTURE_MODIFICATIONS[FIXTURE])).toBe(true);
+    expect(REVIEWED_RUNNER_COMMIT).toBe("6855efb0e4ab5023e2c556030c42613a0ee86f53");
+    expect(REVIEWED_LOCKFILE_MODIFICATIONS["pnpm-lock.yaml"]?.oid).toBe(
+      "5fc0a766b6dbe93bb9f94bcc3538a1ffd21d021e",
+    );
+    expect(Object.keys(REVIEWED_TREE_MODIFICATIONS)).toEqual([
+      ...Object.keys(REVIEWED_ENDPOINT_MODIFICATIONS),
+      "pnpm-lock.yaml",
+      FIXTURE,
+    ]);
+    expect(ALLOWED_ADDITIONS_SINCE_REVIEWED_RUNNER).not.toContain(FIXTURE);
+
+    const otherLines = Object.entries(REVIEWED_TREE_MODIFICATIONS)
+      .filter(([f]) => f !== FIXTURE)
+      .map(([f, e]) => `${e.mode} ${e.type} ${e.oid}\t${f}`);
+    const tree = (fixtureLine?: string) => ({
+      status: 0,
+      stdout: [...otherLines, ...(fixtureLine === undefined ? [] : [fixtureLine])].join("\n"),
+    });
+    const reviewed = `100644 blob ${REVIEWED_OID}\t${FIXTURE}`;
+    const changes = (...extra: string[]) =>
+      [
+        ...ALLOWED_ADDITIONS_SINCE_REVIEWED_RUNNER.map((f) => `A\t${f}`),
+        ...Object.keys(REVIEWED_ENDPOINT_MODIFICATIONS).map((f) => `M\t${f}`),
+        "M\tpnpm-lock.yaml",
+        ...extra,
+      ].join("\n");
+    const pinWith = (nameStatus: string, lsTree: GitAnswer) =>
+      checkPin(PINNED, fakeGit({ nameStatus: { status: 0, stdout: nameStatus }, lsTree }).git);
+
+    // The reviewed fixture passes.
+    expect(pinWith(changes(`M\t${FIXTURE}`), tree(reviewed))).toEqual([]);
+    // Altered content, including the runner's original blob, refuses.
+    for (const oid of [RUNNER_OID, "1".repeat(40), REVIEWED_OID.replace(/.$/, "0")]) {
+      expect(
+        pinWith(changes(`M\t${FIXTURE}`), tree(`100644 blob ${oid}\t${FIXTURE}`)),
+        oid,
+      ).toEqual([REFUSED]);
+    }
+    expect(pinWith(changes(), tree(`100644 blob ${RUNNER_OID}\t${FIXTURE}`))).toEqual([REFUSED]);
+    // Missing, deleted or re-added.
+    expect(pinWith(changes(`D\t${FIXTURE}`), tree())).toEqual([REFUSED]);
+    expect(pinWith(changes(`M\t${FIXTURE}`), tree())).toEqual([REFUSED]);
+    expect(pinWith(changes(`A\t${FIXTURE}`), tree(reviewed))).toEqual([REFUSED]);
+    // Incorrect mode or object type with the reviewed object id.
+    for (const [mode, type] of [
+      ["100755", "blob"],
+      ["120000", "blob"],
+      ["040000", "tree"],
+      ["160000", "commit"],
+      ["100644", "tree"],
+    ]) {
+      expect(
+        pinWith(changes(`M\t${FIXTURE}`), tree(`${mode} ${type} ${REVIEWED_OID}\t${FIXTURE}`)),
+        `${mode} ${type}`,
+      ).toEqual([REFUSED]);
+    }
+    // Duplicate entries fail the comparison.
+    expect(pinWith(changes(`M\t${FIXTURE}`), tree(`${reviewed}\n${reviewed}`))).toEqual([
+      "REVIEWED_RUNNER_COMPARISON_FAILED",
+    ]);
+    // The probe itself, sibling tests and other candidate-scanner code still refuse when changed.
+    for (const other of [
+      "backend/src/candidate-scanner/RaydiumTransportObservationProbe.ts",
+      "backend/src/candidate-scanner/RaydiumTransportObservationProbe.test-support.ts",
+      "backend/src/candidate-scanner/ExactPoolHistoryEnumerator.test.ts",
+      "backend/src/candidate-scanner/RaydiumAmmV4TransactionSourceAdapter.ts",
+      "backend/vitest.measurement-analysis.config.ts",
+    ]) {
+      expect(pinWith(changes(`M\t${FIXTURE}`, `M\t${other}`), tree(reviewed)), other).toEqual([
+        `REVIEWED_RUNNER_DEPENDENCY_CHANGED:${other}`,
+      ]);
+      expect(pinWith(changes(`M\t${FIXTURE}`, `A\t${other}`), tree(reviewed)), other).toEqual([
+        `REVIEWED_RUNNER_DEPENDENCY_CHANGED:${other}`,
+      ]);
+    }
+    // A dirty or differing fixture (inside the pinned backend path) is still refused by the pin.
+    expect(checkPin(PINNED, fakeGit({ dirty: ["backend"] }).git)).toContain("RELEVANT_FILES_DIRTY");
+    expect(checkPin(PINNED, fakeGit({ changed: ["backend"] }).git)).toContain(
+      "CODE_OR_CONFIGURATION_CHANGED",
+    );
+
+    // Read-only git on this repository: the committed fixture is exactly the reviewed blob.
+    const git = defaultGit(fileURLToPath(new URL("../../../", import.meta.url)));
+    const committed = git(["ls-tree", "HEAD", "--", FIXTURE]);
+    expect(committed.status).toBe(0);
+    expect(committed.stdout.trim()).toBe(reviewed);
   });
 
   it("H-13: the handoff CLI routes explicit precheck or watch inputs, refuses conflicts, and exits with its decision's code", async () => {
