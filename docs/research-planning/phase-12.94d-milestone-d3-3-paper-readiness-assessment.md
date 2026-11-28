@@ -12290,3 +12290,40 @@ The work did not include, and is not approval for, any operator script, operator
 - **Static checks:** TypeScript, ESLint and Prettier are clean.
 - **Mutations:** with a clean baseline confirmed first (exit `0`), **26/26** targeted mutations are caught, covering the earlier guards and every new terminal-decision, accounting and timing guard. The source file was restored byte-identical after each one. (The per-dispatch timeout cap is still an equivalent mutant, §8.38.27, and is not counted.)
 - **Real dry run:** a repeat read-only dry run bound `cpmm-observation-03` (`VERIFIED`) with an unchanged plan digest and wrote nothing. The wallet and all operator scripts are unchanged.
+
+#### 8.38.29 Retrospective Tool: Two Remaining Cases on `641ee35` Reproduced and Fixed
+
+**Status**: Independent review confirmed the three §8.38.28 fixes at `641ee35415a7bc48c0e95d0df9642268f8aa57f9` and identified two related cases. Each was first reproduced by a synthetic regression that failed on `641ee35`, then fixed in the retrospective tool only. Nothing else changed: accepted components, pin policy, captures, wallet and operator scripts are all unchanged. Still not done or authorized: an operator packet, a credential load, a provider request, a socket or a live execution. **All five qualification flags remain `false`.**
+
+1. **Final clock-read cancellation** (regression RR4).
+   - **Reproduced:** an injected clock armed by `signals.removeListener` aborts the external `AbortController` on its next read and returns a valid timestamp. The CLI returned exit `0` with `runFailures: []`, because cancellation was sampled before that final clock read.
+   - **Fixed:** the terminal decision now reads the guarded clock first, then samples cancellation from the internal controller and the external signal's actual state, before deciding success.
+   - **Results:**
+     - The case now returns `OPERATOR_CANCELLED` (exit `6`).
+     - An earlier clock failure keeps first place.
+     - Cleanup failures (`SIGNAL_REMOVE_FAILED:*`) are still reported alongside run failures.
+2. **Short overflow prefix** (regression RR5).
+   - **Reproduced:** the forgery takes a successful bundle with its original `2,207`-byte body and valid digests, and records it as an overflow:
+     - outcome `RESPONSE_LIMIT_EXCEEDED`, error `RESPONSE_TOO_LARGE`;
+     - `bodyState: PARTIAL_OVERFLOW`, `bodyComplete: false`;
+     - `analysis: null`, `observedBytes: 262,145`;
+     - manifest updated consistently.
+
+     It passed integrity with replay `REPRODUCED`.
+
+   - **Why it is impossible:** the accepted bounded reader (`readBoundedStream`) retains chunks until the cap is full and reports overflow only once more bytes than the cap were observed. A genuine `PARTIAL_OVERFLOW` therefore always retains exactly `maxResponseBytes`.
+   - **Fixed:** `PARTIAL_OVERFLOW` now requires `originalBytes === 262,144`. This is judged by original counts, never by a redacted stored length.
+   - **Results:**
+     - The forgery now fails integrity (exit `4`).
+     - The previous "no observed excess" forgery now starts from a genuine overflow, so its only contradiction is `observedBytes === 262,144`. It still fails.
+     - Controls still verify:
+       - a genuine bounded-reader overflow (`300,000` bytes → retained `262,144`, observed more);
+       - a credential-bearing overflow (`REDACTED` or `WITHHELD`, judged by original counts);
+       - a declared-size refusal (`NOT_READ`, nothing captured).
+
+**Validation (external 60 s limit per run):**
+
+- **Tests:** synthetic suite **16/16** (exit `0`, including RR4–RR5); handoff suite 13/13.
+- **Static checks:** TypeScript, ESLint and Prettier are clean.
+- **Mutations:** with an exit-`0` baseline confirmed first, **28/28** targeted mutations are caught. These include reading the clock after the cancellation sampling, removing that read, and accepting a short overflow prefix. The source file was restored byte-identical after each one. The per-dispatch timeout cap is an equivalent mutant (§8.38.27) and is not counted.
+- **Real dry run:** a repeat read-only dry run bound `cpmm-observation-03` (`VERIFIED`) with an unchanged plan digest and wrote nothing. The wallet and all operator-script hashes are unchanged.

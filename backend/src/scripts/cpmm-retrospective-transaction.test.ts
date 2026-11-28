@@ -538,6 +538,7 @@ interface FetchScript {
   delayMs?: number;
   throwError?: string;
   ignoreAbort?: boolean;
+  headers?: Record<string, string>;
 }
 const rpcResult = (result: unknown) => (id: number) =>
   JSON.stringify({ jsonrpc: "2.0", id, result });
@@ -579,7 +580,7 @@ function harness(
     const out = (f.body ?? rpcResult(txResult(1)))(id);
     return new Response(typeof out === "string" ? out : Buffer.from(out), {
       status: f.status ?? 200,
-      headers: { "content-type": "application/json" },
+      headers: { "content-type": "application/json", ...f.headers },
     });
   }) as unknown as typeof fetch;
   const timers: PaperRequestSessionTimers = {
@@ -1645,18 +1646,6 @@ describe("cpmm-retrospective-transaction review regressions (synthetic, offline)
         "redacted bytes identical to the original",
         (d) => Object.assign(d.response, { state: "REDACTED", payloadRedacted: true }),
       ],
-      [
-        "overflow without observed excess",
-        (d) => {
-          // Coherent overflow in every respect except the observed byte count.
-          d.response.bodyState = "PARTIAL_OVERFLOW";
-          d.response.observedBytes = d.response.originalBytes;
-          d.request.error = "RESPONSE_TOO_LARGE";
-          d.request.entry.bodyComplete = false;
-          d.recorded.analysis = null;
-          d.recorded.outcome = "RESPONSE_LIMIT_EXCEEDED";
-        },
-      ],
     ];
     for (const [label, mutate] of forged) {
       const x = harness();
@@ -1788,5 +1777,150 @@ describe("cpmm-retrospective-transaction review regressions (synthetic, offline)
     expect(ru.acquisition!.outcome).toBe("CLEANUP_UNSETTLED");
     expect(ru.verification!.integrity.ok).toBe(true);
     expect(readOut(hu, RETRO_FILES.retrieval).recorded.httpAttempts).toBe(1);
+  });
+});
+
+// ---------------------------------------------------------------------------------------------
+// Review regressions on 641ee35 (synthetic): final clock-read cancellation, short overflow prefix
+// ---------------------------------------------------------------------------------------------
+
+describe("cpmm-retrospective-transaction review regressions on 641ee35 (synthetic, offline)", () => {
+  it("RR4: a cancellation raised by the final clock read still prevents success", async () => {
+    // removeListener arms the clock; its next read aborts the external controller and returns a
+    // valid timestamp.
+    const h = harness();
+    const ext = new AbortController();
+    let armed = false;
+    const r = await h.live({
+      signal: ext.signal,
+      clock: () => {
+        if (armed) {
+          armed = false;
+          ext.abort();
+        }
+        return h.sched.now;
+      },
+      signals: {
+        on: () => undefined,
+        removeListener: () => {
+          armed = true;
+        },
+      },
+    });
+    expect(r.runFailures).toEqual(["OPERATOR_CANCELLED"]);
+    expect(r.exitCode).toBe(X.CANCELLED);
+    // An earlier failure keeps its place: a clock failure during the run, then this cancellation.
+    const he = harness({ fetch: { delayMs: 1_000 } });
+    const ae = new AbortController();
+    let armedE = false;
+    let broken = false;
+    he.sched.add(() => (broken = true), 300);
+    const re = await he.live({
+      signal: ae.signal,
+      clock: () => {
+        if (armedE) {
+          armedE = false;
+          ae.abort();
+        }
+        if (broken) throw new Error("clock broke");
+        return he.sched.now;
+      },
+      signals: {
+        on: () => undefined,
+        removeListener: () => {
+          armedE = true;
+        },
+      },
+    });
+    expect(re.runFailures![0]).toBe("CLOCK_FAILURE:CLOCK_THREW");
+    expect(re.exitCode).toBe(X.NO_TRANSACTION_PAYLOAD);
+    // Cleanup failures are still reported alongside, never instead of, run failures.
+    const hc = harness();
+    const ac = new AbortController();
+    let armedC = false;
+    const rc = await hc.live({
+      signal: ac.signal,
+      clock: () => {
+        if (armedC) {
+          armedC = false;
+          ac.abort();
+        }
+        return hc.sched.now;
+      },
+      signals: {
+        on: () => undefined,
+        removeListener: () => {
+          armedC = true;
+          throw new Error("cannot remove");
+        },
+      },
+    });
+    expect(rc.signalCleanupFailures).toEqual([
+      "SIGNAL_REMOVE_FAILED:SIGINT",
+      "SIGNAL_REMOVE_FAILED:SIGTERM",
+    ]);
+    expect(rc.runFailures).toEqual(["OPERATOR_CANCELLED"]);
+    expect(rc.exitCode).toBe(X.CANCELLED);
+  });
+
+  it("RR5: an overflow retains exactly maxResponseBytes; a short prefix cannot pose as one", async () => {
+    // Genuine bounded-reader overflow control.
+    const control = harness({ fetch: { body: () => " ".repeat(300_000) } });
+    const rc = await control.live();
+    const genuine = readOut(control, RETRO_FILES.retrieval);
+    expect(genuine.response).toMatchObject({
+      bodyState: "PARTIAL_OVERFLOW",
+      originalBytes: 262_144,
+    });
+    expect(genuine.response.observedBytes).toBeGreaterThan(262_144);
+    expect(genuine.request).toMatchObject({
+      error: "RESPONSE_TOO_LARGE",
+      entry: { bodyComplete: false },
+    });
+    expect(rc.verification!.integrity).toEqual({ ok: true, problems: [] });
+    // The short-prefix forgery: a successful bundle recorded as an overflow, body and digests kept.
+    const h = harness();
+    await h.live();
+    reseal(h, RETRO_FILES.retrieval, (d) => {
+      expect(d.response.originalBytes).toBeLessThan(262_144);
+      d.recorded.outcome = "RESPONSE_LIMIT_EXCEEDED";
+      d.recorded.analysis = null;
+      d.request.error = "RESPONSE_TOO_LARGE";
+      d.request.entry.bodyComplete = false;
+      d.response.bodyState = "PARTIAL_OVERFLOW";
+      d.response.observedBytes = 262_145;
+    });
+    const v = verifyOut(h);
+    expect(v.integrity.ok).toBe(false);
+    expect(v.integrity.problems).toContain("RESPONSE_ACCOUNTING_INVALID");
+    expect(retrospectiveVerifyExitCode(v)).toBe(X.INTEGRITY_FAILED);
+    // The genuine overflow with no observed excess (its only contradiction).
+    const ho = harness({ fetch: { body: () => " ".repeat(300_000) } });
+    await ho.live();
+    reseal(ho, RETRO_FILES.retrieval, (d) => {
+      d.response.observedBytes = 262_144;
+    });
+    expect(verifyOut(ho).integrity.problems).toContain("RESPONSE_ACCOUNTING_INVALID");
+    // A redacted or withheld overflow is judged by its original counts, not its stored length.
+    const leakyBig = () => `${RPC_URL}${" ".repeat(300_000)}`;
+    const hr = harness({ fetch: { body: leakyBig } });
+    const rr = await hr.live();
+    const redacted = readOut(hr, RETRO_FILES.retrieval).response;
+    expect(redacted).toMatchObject({ bodyState: "PARTIAL_OVERFLOW", originalBytes: 262_144 });
+    expect(redacted.state).toMatch(/^(REDACTED|WITHHELD)$/);
+    if (redacted.state === "REDACTED") expect(redacted.storedBytes).not.toBe(262_144);
+    expect(rr.verification!.integrity).toEqual({ ok: true, problems: [] });
+    expectNoSecrets(hr);
+    // A declared oversize is refused before reading: NOT_READ, nothing retained.
+    const hd = harness({
+      fetch: { body: () => " ".repeat(300_000), headers: { "content-length": "300000" } },
+    });
+    const rd = await hd.live();
+    expect(readOut(hd, RETRO_FILES.retrieval).response).toMatchObject({
+      bodyState: "NOT_READ",
+      state: "NOT_CAPTURED",
+      observedBytes: null,
+    });
+    expect(rd.verification!.integrity).toEqual({ ok: true, problems: [] });
   });
 });

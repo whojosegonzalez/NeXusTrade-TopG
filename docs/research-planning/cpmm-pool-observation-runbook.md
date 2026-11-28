@@ -312,3 +312,8 @@ The §16 design is implemented, with the review's corrections. Full detail is in
   - **Timing:** dispatch must be strictly before the deadline; start/dispatch/completion/end ordering and attempt/entry/response presence are checked.
   - **Validation:** 14/14 tests; 26/26 targeted mutations caught after a clean baseline.
   - **Not done:** no operator packet or execution.
+- **Two remaining cases on `641ee35` reproduced and fixed** (assessment §8.38.29):
+  - **Final clock read:** the terminal decision reads the guarded clock before sampling internal and external cancellation.
+  - **Overflow prefix:** `PARTIAL_OVERFLOW` must retain exactly 262,144 original bytes, as the bounded reader does.
+  - **Validation:** 16/16 tests; 28/28 targeted mutations caught after an exit-0 baseline.
+  - **Not done:** no operator packet or execution.

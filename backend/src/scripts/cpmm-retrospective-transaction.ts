@@ -1504,7 +1504,8 @@ const PLAN_OUT_DIR = new RegExp(
  * The sealed response against the accepted bounded reader (`PaperRequestSession`):
  * - COMPLETE: no session error, the entry's `bodyComplete`, an HTTP status, and the whole body
  *   within the cap (`observedBytes === originalBytes <= 262,144`).
- * - PARTIAL_OVERFLOW: `RESPONSE_TOO_LARGE`, not complete, a retained prefix within the cap, and more
+ * - PARTIAL_OVERFLOW: `RESPONSE_TOO_LARGE`, not complete, a retained prefix of exactly the cap
+ *   (`originalBytes === 262,144`; the reader fills to the cap before it reports overflow), and more
  *   bytes observed than the cap.
  * - NOT_READ: a session error, not complete, nothing observed and nothing captured.
  * Stored bytes must match their own digest and size; ORIGINAL bytes equal the original exactly,
@@ -1604,10 +1605,12 @@ function responseAccounting(
         ? { stored }
         : null;
     case "PARTIAL_OVERFLOW":
+      // The bounded reader retains exactly the cap on overflow (original counts, not the
+      // redacted stored length).
       return error === "RESPONSE_TOO_LARGE" &&
         http !== null &&
         state !== "NOT_CAPTURED" &&
-        (original as number) <= max &&
+        original === max &&
         isSafeCount(observed) &&
         observed > max
         ? { stored }
@@ -2342,11 +2345,12 @@ export async function runCpmmRetrospectiveTransactionCli(
   } finally {
     removeListeners();
   }
-  // Terminal decision, after listener cleanup: the internal controller, the external signal's
-  // actual state and a fresh guarded clock reading can each still refuse success. Earlier
-  // failures keep their place (the list only appends).
-  if (controller.signal.aborted || external?.aborted === true) failures.add("OPERATOR_CANCELLED");
+  // Terminal decision, after listener cleanup. The guarded clock is read first, so anything that
+  // read triggers (including a cancellation) is observed by the cancellation sampling that
+  // follows: the internal controller and the external signal's actual state. Either can still
+  // refuse success. Earlier failures keep their place (the list only appends).
   clock.now();
+  if (controller.signal.aborted || external?.aborted === true) failures.add("OPERATOR_CANCELLED");
   const finalFailures = failures.list;
   if (code !== X.SEAL_FAILED && code !== X.INTEGRITY_FAILED && finalFailures.length > 0) {
     code = finalFailures[0] === "OPERATOR_CANCELLED" ? X.CANCELLED : X.NO_TRANSACTION_PAYLOAD;
