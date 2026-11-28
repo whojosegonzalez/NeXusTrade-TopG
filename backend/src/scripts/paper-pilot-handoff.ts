@@ -183,6 +183,24 @@ export const REVIEWED_ENDPOINT_MODIFICATIONS: Readonly<Record<string, ReviewedTr
       oid: "e5cf0d3dfe1c71e1cebfea46c24ab0bd516120ab",
     }),
   });
+/**
+ * Exact-version exception for the reviewed lockfile: the minimal source-map-js 1.2.1 -> 1.2.2
+ * update (GHSA-68fv-2mgg-jv7q; affected >=1.0.0 <1.2.2, patched 1.2.2), reviewed at
+ * 2a1d8c9828cd5e42815291bb434163f888a773cb. Only this exact blob, as an ordinary file with mode
+ * 100644, is accepted; the lockfile stays inside RUNNER_DEPENDENCY_PATHS and PIN_PATHS, and any
+ * other content, mode, type or a missing file is refused.
+ */
+export const REVIEWED_LOCKFILE_MODIFICATIONS: Readonly<Record<string, ReviewedTreeEntry>> =
+  Object.freeze({
+    "pnpm-lock.yaml": Object.freeze({
+      mode: "100644",
+      type: "blob",
+      oid: "5fc0a766b6dbe93bb9f94bcc3538a1ffd21d021e",
+    }),
+  });
+/** Every exact-version exception the pin checks: the endpoint files and the lockfile. */
+export const REVIEWED_TREE_MODIFICATIONS: Readonly<Record<string, ReviewedTreeEntry>> =
+  Object.freeze({ ...REVIEWED_ENDPOINT_MODIFICATIONS, ...REVIEWED_LOCKFILE_MODIFICATIONS });
 /** One wait at most, never longer than the window's lower bound. */
 export const MAX_WAIT_MS = PLANNING_START_WINDOW.minAgeSec * 1000;
 
@@ -225,7 +243,7 @@ export function checkPin(pinnedCommit: string, git: GitRunner): string[] {
   } else {
     for (const line of changed.stdout.split(/\r?\n/).filter((l) => l.trim() !== "")) {
       const [kind, file] = line.split("\t");
-      if (file && file in REVIEWED_ENDPOINT_MODIFICATIONS) {
+      if (file && file in REVIEWED_TREE_MODIFICATIONS) {
         if (kind !== "M") {
           problems.push(`REVIEWED_RUNNER_DEPENDENCY_CHANGED:${file}`);
         }
@@ -235,8 +253,8 @@ export function checkPin(pinnedCommit: string, git: GitRunner): string[] {
     }
   }
 
-  // Verify candidate pinned commit's tree entries against reviewed endpoint modifications.
-  const reviewedPaths = Object.keys(REVIEWED_ENDPOINT_MODIFICATIONS);
+  // Verify candidate pinned commit's tree entries against every reviewed exact-version exception.
+  const reviewedPaths = Object.keys(REVIEWED_TREE_MODIFICATIONS);
   const treeResult = git(["ls-tree", pinnedCommit, "--", ...reviewedPaths]);
   if (treeResult.status !== 0) {
     problems.push("REVIEWED_RUNNER_COMPARISON_FAILED");
@@ -259,7 +277,7 @@ export function checkPin(pinnedCommit: string, git: GitRunner): string[] {
     if (comparisonFailed) {
       problems.push("REVIEWED_RUNNER_COMPARISON_FAILED");
     } else {
-      for (const [file, expected] of Object.entries(REVIEWED_ENDPOINT_MODIFICATIONS)) {
+      for (const [file, expected] of Object.entries(REVIEWED_TREE_MODIFICATIONS)) {
         const actual = found.get(file);
         if (
           !actual ||

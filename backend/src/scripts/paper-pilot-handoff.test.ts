@@ -18,6 +18,8 @@ import {
   RUNNER_DEPENDENCY_PATHS,
   REVIEWED_RUNNER_COMMIT,
   REVIEWED_ENDPOINT_MODIFICATIONS,
+  REVIEWED_LOCKFILE_MODIFICATIONS,
+  REVIEWED_TREE_MODIFICATIONS,
   checkPin,
   defaultGit,
   evaluatePilotHandoff,
@@ -123,7 +125,7 @@ function fakeGit(
       return (
         o.lsTree ?? {
           status: 0,
-          stdout: Object.entries(REVIEWED_ENDPOINT_MODIFICATIONS)
+          stdout: Object.entries(REVIEWED_TREE_MODIFICATIONS)
             .map(([file, e]) => `${e.mode} ${e.type} ${e.oid}\t${file}`)
             .join("\n"),
         }
@@ -1361,6 +1363,8 @@ describe("Watched-evidence handoff (offline integration)", () => {
 
     // Exact-version exceptions: reviewed endpoint modifications are accepted when matching.
     const reviewedModFiles = Object.keys(REVIEWED_ENDPOINT_MODIFICATIONS);
+    // The reviewed lockfile entry is present in every valid pinned tree (its own cases: H-14).
+    const REVIEWED_LOCK_TREE_LINE = `100644 blob ${REVIEWED_LOCKFILE_MODIFICATIONS["pnpm-lock.yaml"]!.oid}\tpnpm-lock.yaml`;
     expect(pinWith(reviewedModFiles.map((f) => `M\t${f}`).join("\n"))).toEqual([]);
 
     // Failure cases for reviewed endpoint modifications:
@@ -1370,7 +1374,8 @@ describe("Watched-evidence handoff (offline integration)", () => {
         status: 0,
         stdout:
           "100644 blob 1111111111111111111111111111111111111111\tbackend/src/scripts/paper-single-candidate-diagnostic.ts\n" +
-          "100644 blob e5cf0d3dfe1c71e1cebfea46c24ab0bd516120ab\tbackend/src/scripts/paper-single-candidate-diagnostic.test.ts",
+          "100644 blob e5cf0d3dfe1c71e1cebfea46c24ab0bd516120ab\tbackend/src/scripts/paper-single-candidate-diagnostic.test.ts\n" +
+          REVIEWED_LOCK_TREE_LINE,
       }),
     ).toEqual([
       "REVIEWED_RUNNER_DEPENDENCY_CHANGED:backend/src/scripts/paper-single-candidate-diagnostic.ts",
@@ -1382,7 +1387,8 @@ describe("Watched-evidence handoff (offline integration)", () => {
         status: 0,
         stdout:
           "100755 blob 42435317b0817f5463fcac804847faefee35c69b\tbackend/src/scripts/paper-single-candidate-diagnostic.ts\n" +
-          "100644 blob e5cf0d3dfe1c71e1cebfea46c24ab0bd516120ab\tbackend/src/scripts/paper-single-candidate-diagnostic.test.ts",
+          "100644 blob e5cf0d3dfe1c71e1cebfea46c24ab0bd516120ab\tbackend/src/scripts/paper-single-candidate-diagnostic.test.ts\n" +
+          REVIEWED_LOCK_TREE_LINE,
       }),
     ).toEqual([
       "REVIEWED_RUNNER_DEPENDENCY_CHANGED:backend/src/scripts/paper-single-candidate-diagnostic.ts",
@@ -1394,7 +1400,8 @@ describe("Watched-evidence handoff (offline integration)", () => {
         status: 0,
         stdout:
           "040000 tree 42435317b0817f5463fcac804847faefee35c69b\tbackend/src/scripts/paper-single-candidate-diagnostic.ts\n" +
-          "100644 blob e5cf0d3dfe1c71e1cebfea46c24ab0bd516120ab\tbackend/src/scripts/paper-single-candidate-diagnostic.test.ts",
+          "100644 blob e5cf0d3dfe1c71e1cebfea46c24ab0bd516120ab\tbackend/src/scripts/paper-single-candidate-diagnostic.test.ts\n" +
+          REVIEWED_LOCK_TREE_LINE,
       }),
     ).toEqual([
       "REVIEWED_RUNNER_DEPENDENCY_CHANGED:backend/src/scripts/paper-single-candidate-diagnostic.ts",
@@ -1405,7 +1412,8 @@ describe("Watched-evidence handoff (offline integration)", () => {
       pinWith("D\tbackend/src/scripts/paper-single-candidate-diagnostic.ts", {
         status: 0,
         stdout:
-          "100644 blob e5cf0d3dfe1c71e1cebfea46c24ab0bd516120ab\tbackend/src/scripts/paper-single-candidate-diagnostic.test.ts",
+          "100644 blob e5cf0d3dfe1c71e1cebfea46c24ab0bd516120ab\tbackend/src/scripts/paper-single-candidate-diagnostic.test.ts\n" +
+          REVIEWED_LOCK_TREE_LINE,
       }),
     ).toEqual([
       "REVIEWED_RUNNER_DEPENDENCY_CHANGED:backend/src/scripts/paper-single-candidate-diagnostic.ts",
@@ -1430,7 +1438,8 @@ describe("Watched-evidence handoff (offline integration)", () => {
     // Valid two-entry result: exactly one entry for each reviewed path with matching mode, type, and oid
     const validTreeStdout =
       "100644 blob 42435317b0817f5463fcac804847faefee35c69b\tbackend/src/scripts/paper-single-candidate-diagnostic.ts\n" +
-      "100644 blob e5cf0d3dfe1c71e1cebfea46c24ab0bd516120ab\tbackend/src/scripts/paper-single-candidate-diagnostic.test.ts";
+      "100644 blob e5cf0d3dfe1c71e1cebfea46c24ab0bd516120ab\tbackend/src/scripts/paper-single-candidate-diagnostic.test.ts\n" +
+      REVIEWED_LOCK_TREE_LINE;
     expect(
       pinWith(reviewedModFiles.map((f) => `M\t${f}`).join("\n"), {
         status: 0,
@@ -1479,8 +1488,8 @@ describe("Watched-evidence handoff (offline integration)", () => {
     ).toEqual(["REVIEWED_RUNNER_COMPARISON_FAILED"]);
 
     // Read-only git on this repository:
-    // Every addition since reviewed runner is allowed, and the endpoint modifications
-    // match REVIEWED_ENDPOINT_MODIFICATIONS, so checkPin succeeds with zero refusals.
+    // Every addition since reviewed runner is allowed, and the endpoint and lockfile modifications
+    // match REVIEWED_TREE_MODIFICATIONS, so checkPin succeeds with zero refusals.
     const git = defaultGit(fileURLToPath(new URL("../../../", import.meta.url)));
     const diff = git([
       "diff",
@@ -1496,16 +1505,148 @@ describe("Watched-evidence handoff (offline integration)", () => {
       expect(ALLOWED_ADDITIONS_SINCE_REVIEWED_RUNNER, line).toContain(line.split("\t")[1]);
     }
     expect(changes.filter((l) => !l.startsWith("A\t")).sort()).toEqual(
-      reviewedModFiles.sort().map((f) => `M\t${f}`),
+      Object.keys(REVIEWED_TREE_MODIFICATIONS)
+        .sort()
+        .map((f) => `M\t${f}`),
     );
     expect(
       checkPin(PINNED, fakeGit({ nameStatus: { status: 0, stdout: diff.stdout } }).git),
     ).toEqual([]);
     expect(REVIEWED_RUNNER_COMMIT).toBe("6855efb0e4ab5023e2c556030c42613a0ee86f53");
-    for (const f of reviewedModFiles) {
+    for (const f of Object.keys(REVIEWED_TREE_MODIFICATIONS)) {
       expect(ALLOWED_ADDITIONS_SINCE_REVIEWED_RUNNER).not.toContain(f);
     }
   });
+  it("H-14: only the reviewed pnpm-lock.yaml blob is accepted; every other lockfile or dependency change still refuses", () => {
+    const LOCK = "pnpm-lock.yaml";
+    const REVIEWED_OID = "5fc0a766b6dbe93bb9f94bcc3538a1ffd21d021e";
+    const PREVIOUS_OID = "f68b8256a947bb794954f93a973c4103e66fa694"; // lockfile at the reviewed runner
+    const REFUSED_LOCK = `REVIEWED_RUNNER_DEPENDENCY_CHANGED:${LOCK}`;
+    // The acceptance is exactly one exact-version entry; nothing else was widened.
+    expect(REVIEWED_LOCKFILE_MODIFICATIONS).toEqual({
+      [LOCK]: { mode: "100644", type: "blob", oid: REVIEWED_OID },
+    });
+    expect(Object.isFrozen(REVIEWED_LOCKFILE_MODIFICATIONS)).toBe(true);
+    expect(Object.isFrozen(REVIEWED_LOCKFILE_MODIFICATIONS[LOCK])).toBe(true);
+    expect(REVIEWED_TREE_MODIFICATIONS).toEqual({
+      ...REVIEWED_ENDPOINT_MODIFICATIONS,
+      ...REVIEWED_LOCKFILE_MODIFICATIONS,
+    });
+    expect(Object.keys(REVIEWED_ENDPOINT_MODIFICATIONS)).toEqual([
+      "backend/src/scripts/paper-single-candidate-diagnostic.ts",
+      "backend/src/scripts/paper-single-candidate-diagnostic.test.ts",
+    ]);
+    expect(REVIEWED_RUNNER_COMMIT).toBe("6855efb0e4ab5023e2c556030c42613a0ee86f53");
+    // The lockfile stays inside the protected dependency surface and is not an allowed addition.
+    expect(RUNNER_DEPENDENCY_PATHS).toContain(LOCK);
+    expect(PIN_PATHS).toContain(LOCK);
+    expect(ALLOWED_ADDITIONS_SINCE_REVIEWED_RUNNER).not.toContain(LOCK);
+
+    const endpointLines = Object.entries(REVIEWED_ENDPOINT_MODIFICATIONS).map(
+      ([f, e]) => `${e.mode} ${e.type} ${e.oid}\t${f}`,
+    );
+    const tree = (lockLine?: string) => ({
+      status: 0,
+      stdout: [...endpointLines, ...(lockLine === undefined ? [] : [lockLine])].join("\n"),
+    });
+    const reviewedLock = `100644 blob ${REVIEWED_OID}\t${LOCK}`;
+    const changes = (...extra: string[]) =>
+      [
+        ...ALLOWED_ADDITIONS_SINCE_REVIEWED_RUNNER.map((f) => `A\t${f}`),
+        ...Object.keys(REVIEWED_ENDPOINT_MODIFICATIONS).map((f) => `M\t${f}`),
+        ...extra,
+      ].join("\n");
+    const pinWith = (nameStatus: string, lsTree: GitAnswer) =>
+      checkPin(PINNED, fakeGit({ nameStatus: { status: 0, stdout: nameStatus }, lsTree }).git);
+
+    // The reviewed lockfile passes.
+    expect(pinWith(changes(`M\t${LOCK}`), tree(reviewedLock))).toEqual([]);
+
+    // Altered content: any other blob, including the previous (vulnerable) lockfile, refuses.
+    for (const oid of [PREVIOUS_OID, "1".repeat(40), REVIEWED_OID.replace(/.$/, "0")]) {
+      expect(pinWith(changes(`M\t${LOCK}`), tree(`100644 blob ${oid}\t${LOCK}`)), oid).toEqual([
+        REFUSED_LOCK,
+      ]);
+    }
+    // The previous lockfile, unchanged since the runner (absent from the diff), refuses too.
+    expect(pinWith(changes(), tree(`100644 blob ${PREVIOUS_OID}\t${LOCK}`))).toEqual([
+      REFUSED_LOCK,
+    ]);
+    // Missing file: deleted since the runner, or absent from the pinned tree.
+    expect(pinWith(changes(`D\t${LOCK}`), tree())).toEqual([REFUSED_LOCK]);
+    expect(pinWith(changes(`M\t${LOCK}`), tree())).toEqual([REFUSED_LOCK]);
+    // Re-added rather than modified.
+    expect(pinWith(changes(`A\t${LOCK}`), tree(reviewedLock))).toEqual([REFUSED_LOCK]);
+    // Incorrect mode or object type with the reviewed object id.
+    for (const [mode, type] of [
+      ["100755", "blob"],
+      ["120000", "blob"],
+      ["100664", "blob"],
+      ["040000", "tree"],
+      ["160000", "commit"],
+      ["100644", "tree"],
+    ]) {
+      expect(
+        pinWith(changes(`M\t${LOCK}`), tree(`${mode} ${type} ${REVIEWED_OID}\t${LOCK}`)),
+        `${mode} ${type}`,
+      ).toEqual([REFUSED_LOCK]);
+    }
+    // Duplicate or malformed lockfile tree entries fail the comparison.
+    expect(pinWith(changes(`M\t${LOCK}`), tree(`${reviewedLock}\n${reviewedLock}`))).toEqual([
+      "REVIEWED_RUNNER_COMPARISON_FAILED",
+    ]);
+    expect(pinWith(changes(`M\t${LOCK}`), tree(`100644 blob ${REVIEWED_OID} ${LOCK}`))).toEqual([
+      "REVIEWED_RUNNER_COMPARISON_FAILED",
+    ]);
+
+    // Unrelated dependency changes still refuse, even next to the reviewed lockfile.
+    for (const other of [
+      "package.json",
+      "pnpm-workspace.yaml",
+      ".npmrc",
+      ".node-version",
+      ".nvmrc",
+      "tsconfig.base.json",
+      "backend/package.json",
+      "shared/package.json",
+      "backend/pnpm-lock.yaml",
+      "shared/pnpm-lock.yaml",
+      "pnpm-lock.yml",
+      "backend/src/candidate-scanner/PaperRequestSession.ts",
+    ]) {
+      expect(pinWith(changes(`M\t${LOCK}`, `M\t${other}`), tree(reviewedLock)), other).toEqual([
+        `REVIEWED_RUNNER_DEPENDENCY_CHANGED:${other}`,
+      ]);
+      expect(pinWith(changes(`M\t${LOCK}`, `A\t${other}`), tree(reviewedLock)), other).toEqual([
+        `REVIEWED_RUNNER_DEPENDENCY_CHANGED:${other}`,
+      ]);
+    }
+    // The endpoint exceptions keep their own exact checks next to the reviewed lockfile.
+    expect(
+      pinWith(changes(`M\t${LOCK}`), {
+        status: 0,
+        stdout: [
+          `100644 blob ${"2".repeat(40)}\tbackend/src/scripts/paper-single-candidate-diagnostic.ts`,
+          endpointLines[1],
+          reviewedLock,
+        ].join("\n"),
+      }),
+    ).toEqual([
+      "REVIEWED_RUNNER_DEPENDENCY_CHANGED:backend/src/scripts/paper-single-candidate-diagnostic.ts",
+    ]);
+    // A lockfile that differs from the pinned commit or is dirty is still refused by the pin.
+    expect(checkPin(PINNED, fakeGit({ changed: [LOCK] }).git)).toContain(
+      "CODE_OR_CONFIGURATION_CHANGED",
+    );
+    expect(checkPin(PINNED, fakeGit({ dirty: [LOCK] }).git)).toContain("RELEVANT_FILES_DIRTY");
+
+    // Read-only git on this repository: the committed lockfile is exactly the reviewed blob.
+    const git = defaultGit(fileURLToPath(new URL("../../../", import.meta.url)));
+    const committed = git(["ls-tree", "HEAD", "--", LOCK]);
+    expect(committed.status).toBe(0);
+    expect(committed.stdout.trim()).toBe(reviewedLock);
+  });
+
   it("H-13: the handoff CLI routes explicit precheck or watch inputs, refuses conflicts, and exits with its decision's code", async () => {
     const root = watchRoot();
     const { env, validation } = await selectedWatch();

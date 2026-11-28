@@ -33,7 +33,7 @@ import {
 } from "./paper-single-candidate-diagnostic.js";
 import {
   ALLOWED_ADDITIONS_SINCE_REVIEWED_RUNNER,
-  REVIEWED_ENDPOINT_MODIFICATIONS,
+  REVIEWED_TREE_MODIFICATIONS,
   evaluateWatchedPilotHandoff,
   type GitRunner,
 } from "./paper-pilot-handoff.js";
@@ -280,14 +280,14 @@ const allowedGit: GitRunner = (args) => {
       status: 0,
       stdout: [
         ...ALLOWED_ADDITIONS_SINCE_REVIEWED_RUNNER.map((f) => `A\t${f}`),
-        ...Object.keys(REVIEWED_ENDPOINT_MODIFICATIONS).map((f) => `M\t${f}`),
+        ...Object.keys(REVIEWED_TREE_MODIFICATIONS).map((f) => `M\t${f}`),
       ].join("\n"),
     };
   }
   if (args[0] === "ls-tree") {
     return {
       status: 0,
-      stdout: Object.entries(REVIEWED_ENDPOINT_MODIFICATIONS)
+      stdout: Object.entries(REVIEWED_TREE_MODIFICATIONS)
         .map(([file, e]) => `${e.mode} ${e.type} ${e.oid}\t${file}`)
         .join("\n"),
     };
