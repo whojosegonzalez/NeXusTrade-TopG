@@ -12327,3 +12327,198 @@ The work did not include, and is not approval for, any operator script, operator
 - **Static checks:** TypeScript, ESLint and Prettier are clean.
 - **Mutations:** with an exit-`0` baseline confirmed first, **28/28** targeted mutations are caught. These include reading the clock after the cancellation sampling, removing that read, and accepting a short overflow prefix. The source file was restored byte-identical after each one. The per-dispatch timeout cap is an equivalent mutant (§8.38.27) and is not counted.
 - **Real dry run:** a repeat read-only dry run bound `cpmm-observation-03` (`VERIFIED`) with an unchanged plan digest and wrote nothing. The wallet and all operator-script hashes are unchanged.
+
+#### 8.38.30 Retrospective Retrieval `cpmm-retrospective-tx-01` Result (First Observed Version-1 Payload)
+
+**Status**: Independent review accepted `cpmm-retrospective-tx-01`. It ran once at pinned commit `facddd85e7f4b0c59ae6419e693b350dafac9201` (pushed to `origin/main`) through `.tmp/runbooks/cpmm-retrospective-tx-01-operator.ps1` (SHA-256 `414bb7cf9eb31aae02fb1063afe4f88cc3aa260353f9baa60de7983f7a3755e3`). The printed live plan digest matched the reviewed `b250360cdac220a8cf32370db8fecdd2b68574552c9af0888e41cd2c78299274`, and no wrapper tripwire fired. The **one-request approval is consumed**. The result is `RETROSPECTIVE_SUPPLEMENTAL` evidence only. All eleven non-certifications and all five qualification flags remain `false`.
+
+##### Verified Findings
+
+- **Bundle**: `data/research/cpmm-retrospective-transactions/cpmm-retrospective-tx-01`.
+  - Manifest `evidence-manifest.json` SHA-256 `5493be0be933cf26845e6c307f23e4bd9d0434e5d542e86b30478872b403e92f`, `recordedOutcome: RESPONSE_RECEIVED`.
+  - It lists `plan.json` (`76fd81e3…`, 6,107 bytes), `source-binding.json` (`bd0a3e49…`, 1,840 bytes) and `retrieval.json` (`0af2b747…`, 31,319 bytes).
+- **Request**: exactly **one** HTTP request (`httpAttempts: 1`, JSON-RPC id `1`).
+  - Cap-1 `getTransaction` (`encoding: json`, `commitment: confirmed`, `maxSupportedTransactionVersion: 1`), lane `SOLANA_RPC`, owner `SECURITY`, purpose `CPMM_RETROSPECTIVE_GET_TRANSACTION`.
+  - Dispatched `2026-11-28T04:10:52.205Z` and completed `04:10:52.342Z` (137 ms), well inside the 15,000 ms deadline.
+  - Zero WebSockets, retries, redirects, fallback or follow-up.
+- **Response**: HTTP `200`, `application/json`, body `COMPLETE`.
+  - **24,580 bytes** (original = observed = stored), state `ORIGINAL`: nothing redacted or withheld.
+  - SHA-256 `91c5c527d5594227cceaae7e37a410eae863aa8204c7a06e37642f63cfa08a69`, under the 262,144-byte cap.
+- **Transaction**: **version `1`**.
+  - First signature equals the expected `4XcLrDWBcAHkgmK8oF9PqeKitaJy1sNZG2xetTuL8EbazpGjexiCBo2BUGThoV2FgdG8h7AF58imedW2sjtBMimm` (2 signatures).
+  - Slot `473543189` equals the source notification's slot; `blockTime` `1795566034` (`2026-11-25T00:20:34Z`); `meta.err: null`.
+  - Static accounts only: 52 account keys, 5 top-level instructions, `loadedAddresses` empty.
+  - `transactionConfig` has all four keys: `priorityFee` 26,908; `computeUnitLimit` 434,600; `loadedAccountsDataSizeLimit` 67,108,864; `heapSize` 65,536.
+  - `versionComparison: MATCHES_SOURCE_CLAIM`, compared after identity and slot binding against the claim in capture 03's `-32015` message; `v1PayloadBound: true`.
+- **Decoded content**: one historical **SELL** (`SWAP_DECODED`, `RESOLVED_SWAPS`, `payloadBound: true`).
+  - Outer instruction `1`, swap index `2`.
+  - `4,400,618,230,899` candidate base units in (9 decimals, about 4,400.618 CYBERLEEK) for `83,488,739` lamports out (about 0.0835 WSOL).
+  - Event time from `ON_CHAIN_BLOCK_TIME`; the receipt time is capture 03's notification receipt (`2026-11-25T00:20:34.813Z`).
+  - Decoder diagnostics: 5 top-level and 19 inner instructions, 1 CPMM invocation, 1 target swap, 0 non-target swaps, 0 other CPMM instructions, and logs **`CORROBORATED`** (98 log lines).
+  - The sealed record stores the decoder status, payload binding and events, but not the log-corroboration field. `CORROBORATED` was confirmed by an offline pure-decoder replay of the sealed response bytes against capture 03's sealed pool context, with no credential loaded.
+- **Verification**:
+  - Live: integrity `OK`, source `VERIFIED`, replay `REPRODUCED`, exit `0`.
+  - A credential-free `--verify` re-run after acceptance gave the same result, exit `0`.
+  - The credential-aware scan is **not repeated offline**: verification replays the pure decoder and the strict envelope, id, signature, slot and request checks only.
+- **Unchanged**:
+  - The capture `03` and `04` manifests are unchanged before and after the run (`12f5fac0…`, `57f6f232…`, `916c26ae…`, `dddaf814…`).
+  - Capture 03's recorded outcome is **not** revised: exchange `000004.json` remains `RPC_ERROR` / `JSON_RPC_ERROR`, and its ledger record `2` remains `UNRESOLVED` / `TRANSACTION_UNAVAILABLE`.
+  - The wallet is unchanged (`7f2c2353…`), and the endpoint variable was restored.
+- **Significance and limits**:
+  - This is the first observed genuine version-1 mainnet payload. The decoder's v1 path (static accounts, `transactionConfig`, SIMD-0385 limits) decoded it exactly, so v1 validation now rests on **one** real transaction in addition to the synthetic fixtures. Broader v1 coverage is not established.
+  - It is historical retrieval of one fixed signature. It is never fresh flow, never ingested, and never an activity rate, completeness, quiet-window or admission input.
+  - `decoderDefectEstablished` stays `false`: capture 03's `-32015` was caused by the cap-0 request policy, not by the decoder.
+
+#### 8.38.31 Design-Only Proposal: CPMM-Bound Witnessed History and On-Chain Cutoff Evidence (Roadmap Step 7, First Slice)
+
+**Status**: **Design only, for independent review.** It includes no implementation, operator command, credential load, request, socket or rerun. Accepting this design would not authorize execution: that needs a separately reviewed implementation, a reviewed request profile, an operator packet and explicit operator approval. All qualification flags remain `false`. CPMM remains excluded from admission, and `DexScreenerSingleCandidateMarketParser.ts` still rejects `"CPMM"`.
+
+The repository does not number a "Step 7". This proposal takes it to be the next CPMM prerequisite after the Step 6 observation work, as listed in §8.38.17 items 13 J and 14 J: "anchored, witnessed history through the shared session" and "a proven on-chain cutoff", which a later CPMM reconciliation evaluator consumes.
+
+##### 1. What Exists and What It Contributes
+
+| Existing part                               | Reused unchanged                                                                                                                                                                                                                                                                                                                                                                                    | Why it cannot simply be used for CPMM                                                                                                                                                                                                                                                                                                                                                                                                                             |
+| ------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `ExactPoolHistoryEnumerator.ts`             | Its **contract semantics**: the frozen head target, `before` cursors, the anchor counting as witnessed only when it appears in returned records, per-page newest-first ordering, the cross-page `before` boundary, non-progressing-page refusal, page/record caps, and `isProductionCompletenessEstablished: false`. `isValidSolanaSignature` is reused directly (the CPMM ledger already does).    | The class binds to `TrackedRaydiumPoolContext` through `validateTrackedPoolContext` (AMM v4 vaults and orientations), accounts requests through `GlobalResourceBudgetManager` rather than the shared `PaperRequestSession`, and takes **normalized** records from an injected fetcher, so no raw request or response bytes exist to seal and verify. Building a `TrackedRaydiumPoolContext` from CPMM data would spoof an AMM v4 context, which is **forbidden**. |
+| `ExactPoolWindowReconciliationEvaluator.ts` | The `SourceCutoffEvidence` shape and its validation rules (provenance/method correspondence, mandatory payload and request context for `ON_CHAIN_BLOCK_TIME`, field names, `blockTime × 1000` equality, synthetic isolation). It also exports `DEFAULT_PROVIDER_INDEX_ASSUMPTIONS` and `DEFAULT_UNRESOLVED_UNCERTAINTIES`, which are reused verbatim.                                               | The evaluator takes `TrackedRaydiumPoolContext`, the AMM resolution bridge and tracker semantics. Its cutoff is a caller-supplied parsed object: the `getBlockTime` slot comes from caller context, not from a sealed request body bound to a sealed `getSlot` response.                                                                                                                                                                                          |
+| `ExactPoolTransactionResolutionBridge.ts`   | Nothing in this slice.                                                                                                                                                                                                                                                                                                                                                                              | It is bound to `RaydiumAmmV4TransactionSourceAdapter`. CPMM resolution already lives in `CpmmResolutionAccountingLedger` + `RaydiumCpmmTransactionSourceAdapter`.                                                                                                                                                                                                                                                                                                 |
+| `CpmmResolutionAccountingLedger.ts`         | **Unchanged consumer**: `summarize(window)` takes a `CpmmAccountingCutoff { slot, blockTimeMs, provenance }` that the owner asserts (the ledger itself "provides no `SourceCutoffEvidence` proof"), refuses `WINDOW_BEYOND_CUTOFF`, counts `afterCutoff`, and keeps notification completeness, quiet window and qualification `false`.                                                              | It needs a _proven_ cutoff and an independent signature list to reconcile against. This slice produces exactly those.                                                                                                                                                                                                                                                                                                                                             |
+| `PaperRequestSession.ts`                    | Unchanged: `SOLANA_RPC` lane, owners `FLOW` / `SECURITY` / `SPOT`, ≥ 2,500 ms dispatch-to-dispatch pacing, per-lane attempt and byte caps, exact-cap bounded reader, `onExchangeComplete` exchange evidence, `nextJsonRpcId`.                                                                                                                                                                       | None.                                                                                                                                                                                                                                                                                                                                                                                                                                                             |
+| `scripts/cpmm-pool-activity-check.ts`       | `analyzePoolActivityResponse(body, requestId)`: the reviewed strict page rules (fatal UTF-8, JSON-RPC 2.0 envelope and id, at most **20** records, required fields plus optional `transactionIndex`, canonical signatures, safe slots, nullable bounded `blockTime`, confirmed/finalized status, no duplicates, newest-first, bounded `err` structures). Imported unchanged; importing it is inert. | It accepts only one page with no `before` or `minContextSlot`. Pagination, cutoff and anchor binding must be layered on top. Fixing the page size at its reviewed 20 lets the analyzer apply unchanged.                                                                                                                                                                                                                                                           |
+| `evidence-credential-sanitizer.ts`          | Unchanged (`deriveEvidenceSecrets`, `sanitizeEvidenceBytes`).                                                                                                                                                                                                                                                                                                                                       | None.                                                                                                                                                                                                                                                                                                                                                                                                                                                             |
+| `CpmmPoolAccountAcquisition.ts`             | The `minContextSlot` request pattern and the acquisition-bound pool binding (`ACQUIRED_REPRODUCED`).                                                                                                                                                                                                                                                                                                | `getMultipleAccounts` returns `context.slot`, so a regression is _detectable_ there (`CONTEXT_SLOT_REGRESSED`). `getSignaturesForAddress` and `getBlockTime` return no context, so `minContextSlot` is only a request-side, provider-honoured condition there (§5).                                                                                                                                                                                               |
+
+**Genuine CPMM-specific gaps**:
+
+- **Binding target**: a pool-state address and candidate mint (`CpmmAdapterBinding`) plus an acquisition-verified `RaydiumCpmmPoolStateSuccess`, not AMM vault orientation.
+- **Byte-level evidence**: every history page and cutoff response must be a session exchange whose sanitized bytes can be sealed and re-verified offline.
+- **Cutoff provenance**: a sealed `getSlot` → `getBlockTime(slot)` pair, bound through request bodies.
+- **Anchor provenance** that a CPMM owner can supply: a bootstrap head page in the same session, or a CPMM ledger record with a verified slot.
+- **Window rules** matching the ledger's on-chain `[windowStartMs, windowEndMs)` windows.
+- **Strict analyzers** for `getSlot` and `getBlockTime`. The AMM probe's are embedded in `RaydiumTransportObservationProbe.ts` and AMM-coupled.
+
+##### 2. First Implementation Slice (Isolated and Unwired)
+
+- **Files**:
+  - `backend/src/candidate-scanner/CpmmWitnessedHistory.ts` and `CpmmWitnessedHistory.test.ts`.
+  - Exact handoff pin allowlist additions for both, with a near-miss test.
+  - No other file changes: no change to any accepted component (enumerator, evaluator, bridge, ledger, collector, connection owner, adapter, decoder, session, sanitizer, activity check), and no CLI, operator script, profile, budget, configuration, dependency, capture or wallet change.
+- **Two layers in one module**:
+  1. **Pure evidence analysis**, `analyzeCpmmWitnessedHistory(input)`. Input: the binding, the anchor claim, the plan limits and the ordered list of `PaperRequestExchangeEvidence` from one session. Output: a frozen `CpmmWitnessedHistoryEvidence`. It has no clock, transport or timers, so it runs identically live and in offline verification.
+  2. **Bounded driver**, `runCpmmWitnessedHistory(o)`. It dispatches through an **injected** `PaperRequestSession` (no default fetch), collects exchanges through `onExchangeComplete`, stops on the first terminal condition and returns the pure analysis of what it collected. It uses the retrospective tool's deadline, settled-cleanup, cancellation and guarded-clock patterns unchanged in spirit (§4).
+- **Outputs**:
+  - `CpmmWitnessedHistoryEvidence`: `outcome`, `anchor`, `frozenTargetSignature`, `records` (each tagged `AFTER_CUTOFF`, `BETWEEN_ANCHOR_AND_CUTOFF` or `ANCHOR`), `cutoff`, `requestCount`, `pagesQueried` and `exchanges` (references and digests).
+  - `providerAssumptions`: `DEFAULT_PROVIDER_INDEX_ASSUMPTIONS` plus the CPMM additions in §5.
+  - `unresolvedUncertainties`: `DEFAULT_UNRESOLVED_UNCERTAINTIES`.
+  - The literal flags `isCryptographicCompletenessEstablished`, `isProductionCompletenessEstablished`, `notificationCompletenessEstablished`, `quietWindowEstablished` and `qualificationEligible`, all `false`.
+  - `toCpmmAccountingCutoff(e)`, producing the ledger's existing input shape.
+  - `toSourceCutoffEvidence(e)`, producing the evaluator's existing shape: `getBlockTime`, `responseField: "result"`, `ON_CHAIN_BLOCK_TIME`, the payload and `requestContext.slot`.
+  - `evaluateCpmmHistoryWindow(e, window)`, which checks window coverage only (§3, B7–B9) and reconciles nothing.
+- **Not in this slice**: sealing into observation evidence (slice 2), the CPMM reconciliation evaluator and ledger cross-check (slice 3), budget or profile changes, any live use.
+
+##### 3. Binding Rules (each checked from sealed bytes, live and offline)
+
+- **B1 Request reconstruction**: every request body equals the plan-derived body exactly, including method, params, `address = poolAddress`, `limit: 20`, `commitment: "confirmed"`, `minContextSlot = S_c`, the `before` value and the JSON-RPC id. Every response id matches its request.
+- **B2 Cutoff pair**:
+  - `getSlot({commitment: "confirmed"})` returns a safe non-negative integer `S_c`.
+  - The `getBlockTime` request's single param equals `S_c` exactly.
+  - Its result is an integer number of seconds `T_c` within the decoder's `MAX_BLOCK_TIME_SEC`, and `cutoffMs = T_c × 1000`.
+  - A `null` result means `MISSING_SOURCE_CUTOFF`; an RPC error means `CUTOFF_UNAVAILABLE`.
+- **B3 Order of evidence**: the cutoff pair is dispatched **before** the first history page, and every page carries `minContextSlot: S_c`. History is therefore requested no earlier than the cutoff, from a node that claims to have reached `S_c` (provider-relative; §5).
+- **B4 Page rules**:
+  - Each page passes `analyzePoolActivityResponse` unchanged.
+  - Page `k+1` carries `before` = page `k`'s oldest signature exactly.
+  - Page `k+1`'s newest slot is ≤ page `k`'s oldest slot.
+  - No signature repeats across pages, and a page whose oldest record does not advance is `NON_PROGRESSING_PAGE`.
+- **B5 Cutoff partition**: records with `slot > S_c` are retained as `AFTER_CUTOFF`; they are never errors and never in any window. Records with `slot ≤ S_c` and newer than the anchor are `BETWEEN_ANCHOR_AND_CUTOFF`.
+- **B6 Anchor identity**:
+  - The anchor claim is `{ signature, slot, blockTimeSec | null, source }`, where `source` is `BOOTSTRAP_PAGE` (the head record of a bootstrap page sealed earlier in the same session) or `LEDGER_RECORD` (a CPMM ledger record with a verified slot).
+  - It counts as witnessed only when that signature **appears** in a returned page with the claimed slot and, if one was claimed, the same `blockTime`. Anything else is `ANCHOR_IDENTITY_MISMATCH`.
+  - No `until` parameter is used, because it would exclude the anchor from the page and lose positive witnessing.
+- **B7 Window coverage** (on-chain milliseconds, matching the ledger's window):
+  - The anchor's `blockTime × 1000` must be **strictly** less than `windowStartMs`, so every record sharing the anchor's slot falls before the window, whatever its intra-slot order.
+  - `windowEndMs ≤ cutoffMs`, so the exclusive window end leaves every in-window record strictly before the cutoff block time.
+  - Otherwise the result is `WINDOW_NOT_COVERED`.
+- **B8 Timestamps**: a `BETWEEN_ANCHOR_AND_CUTOFF` record with `blockTime: null` makes every window it could fall in `AMBIGUOUS_TIMESTAMP`. Among records ordered newest-first by slot, a later record with a larger `blockTime` is `TIME_ORDER_CONTRADICTION`. Both block.
+- **B9 Freshness inputs**: each exchange's host dispatch and completion times are recorded. The ≤ 15,000 ms decision-age rule (the evaluator's existing default) is applied by the later reconciliation, not here.
+- **B10 Pool binding**: the address equals the acquisition-verified CPMM pool-state address; the candidate mint and pool context come from an `ACQUIRED_REPRODUCED` acquisition. An AMM-shaped context is refused.
+- **B11 Redaction**: a page or cutoff response that is `REDACTED`, `WITHHELD` or incomplete cannot establish history or a cutoff (`EVIDENCE_LIMITED`). It never yields `ANCHOR_WITNESSED` or a bound cutoff.
+
+##### 4. Bounded Request and Pagination Behaviour (Proposed Defaults, Injected, Not Approved)
+
+- **Sequence**: `getSlot` (1 request) → `getBlockTime(S_c)` (1 request) → newest-first `getSignaturesForAddress` pages until a terminal condition. An optional bootstrap head page (1 request, no anchor) is a separate earlier call that supplies a `BOOTSTRAP_PAGE` anchor.
+- **Proposed caps**:
+  - `limit: 20` per page and at most **3 pages** (60 records).
+  - At most **5** HTTP requests per call, plus 1 for an optional bootstrap.
+  - One absolute deadline of **30,000 ms**, with each request timeout `min(10,000 ms, remaining)` and at most **5,000 ms** of settled cleanup after the deadline.
+  - `SOLANA_RPC` pacing ≥ 2,500 ms between dispatches, so 5 requests take at least 10 s.
+  - Response caps: 65,536 bytes per page (the activity check's reviewed cap) and 4,096 bytes for `getSlot` and `getBlockTime`.
+- **Owner and purposes**: owner `FLOW`; purposes `CPMM_HISTORY_CUTOFF_SLOT`, `CPMM_HISTORY_CUTOFF_BLOCK_TIME` and `CPMM_HISTORY_PAGE`.
+- **Never**: retries, redirects, fallback, `until`, other lanes, WebSockets or automatic follow-up.
+- **Stop rules**:
+  - `ANCHOR_WITNESSED` stops immediately.
+  - A short page without the anchor is `ANCHOR_NOT_FOUND` (the provider's history ended). Reaching the page cap is `MAX_PAGES_EXHAUSTED`.
+  - Any malformed page, RPC or HTTP error, overflow, deadline, cancellation, clock failure or unsettled cleanup is terminal, with no further request.
+  - A preflight refusal sends nothing.
+- **Budget**: the accepted extended observation profile allocates its 30 HTTP attempts to 2 acquisition requests and 28 retrievals. This slice changes no profile. Any later live use needs its own reviewed allocation.
+
+##### 5. Provider and Indexer Assumptions (Explicit, Never Established)
+
+The evidence is **provider-relative**. In addition to `DEFAULT_PROVIDER_INDEX_ASSUMPTIONS` and `DEFAULT_UNRESOLVED_UNCERTAINTIES`, it records these assumptions:
+
+- `getSignaturesForAddress` on the pool-state account returns every transaction that lists that account, failed ones included. Whether the provider also indexes accounts loaded through address lookup tables (v0) is a provider property, not established here. v1 transactions are static-only (§8.38.30), so they list the account directly.
+- `minContextSlot` is honoured by the serving node, but neither `getSignaturesForAddress` nor `getBlockTime` returns a context slot, so this is not verifiable from the response. One endpoint URL may route requests to different backend nodes, so `getSlot`, `getBlockTime` and the pages may each be served by a different node. `minContextSlot` is the only cross-request binding.
+- `logsSubscribe` `mentions` and the address-signature index may differ in coverage. The later reconciliation treats any difference as blocking, never as a correction.
+- Index lag or omission of intermediate transactions is undetectable through ordinary pagination (§8.10.2 item 3, "Quiet & Zero-Transaction Windows and Source Cutoff Evidence"). A witnessed anchor proves only that the anchor appeared.
+
+##### 6. How It Supports Reconciliation (Slice 3, Not This Slice)
+
+- **Window signature set**: `W` = the `BETWEEN_ANCHOR_AND_CUTOFF` records whose `blockTime × 1000` lies in `[windowStartMs, windowEndMs)`.
+- **Every signature in `W`** must have a CPMM ledger first record of the same epoch with a matching verified slot and `blockTime` ("resolution evidence mandatory for every in-window signature").
+  - A history record with no ledger record is `HISTORY_ONLY`. It blocks until it is resolved through the ledger and adapter under a separately reviewed allocation.
+  - A ledger record placed in the window but absent from `W` is `NOTIFIED_NOT_IN_HISTORY`. It always blocks, as provider-index evidence contradicting the stream.
+- **History `err` records** must equal the resolved `meta.err`. They stay policy-pending until a reviewed CPMM failed-transaction policy and validator exist.
+- **Ledger signals**: the ledger's `gaps`, `lateInWindow`, `positionUnknown`, cross-epoch blocking and metadata conflicts all block, unchanged.
+- **The result**: at best a **provider-relative reconciled** window. It is never cryptographic completeness, never production completeness and never qualification.
+
+##### 7. Failure States
+
+The enumeration outcomes reuse the AMM names where the meaning is the same:
+
+- **Enumeration**: `ANCHOR_WITNESSED`, `ANCHOR_NOT_FOUND`, `MAX_PAGES_EXHAUSTED`, `MAX_RECORDS_EXCEEDED`, `NON_PROGRESSING_PAGE`, `MALFORMED_PAGE(reason)`, `ORDERING_VIOLATION`, `BOUNDARY_VIOLATION`, `DUPLICATE_ACROSS_PAGES`.
+- **Cutoff**: `CUTOFF_BOUND`, `MISSING_SOURCE_CUTOFF` (null block time or no pair), `CUTOFF_UNAVAILABLE` (RPC or HTTP error), `INVALID_SOURCE_CUTOFF` (pair not bound by B2 or B3).
+- **Transport and lifecycle**: `RPC_ERROR(code)`, `CONTEXT_SLOT_NOT_REACHED` (JSON-RPC `-32016`), `HTTP_ERROR`, `RESPONSE_LIMIT_EXCEEDED`, `TRANSPORT_ERROR`, `DEADLINE_EXPIRED`, `OPERATOR_CANCELLED`, `CLOCK_FAILURE`, `CLEANUP_UNSETTLED`.
+- **Binding**: `ANCHOR_IDENTITY_MISMATCH`, `WINDOW_NOT_COVERED`, `AMBIGUOUS_TIMESTAMP`, `TIME_ORDER_CONTRADICTION`, `EVIDENCE_LIMITED`, `POOL_BINDING_REFUSED`.
+
+Only `ANCHOR_WITNESSED` together with `CUTOFF_BOUND` and no binding failure yields usable history evidence. Every other combination fails closed, and none triggers a retry.
+
+##### 8. Synthetic Tests (Planned; Injected Session, Fetch, Clock and Timers; Virtual Scheduler)
+
+- **H01 Happy path**: cutoff pair, then 2 pages with the anchor on page 2. Expect `ANCHOR_WITNESSED` and `CUTOFF_BOUND`, exactly 4 HTTP requests with exact bodies (`before` cursors, `minContextSlot = S_c`), and spacing ≥ 2,500 ms.
+- **H02**: anchor on page 1 (3 requests). **H03**: short page without the anchor gives `ANCHOR_NOT_FOUND` and no further request. **H04**: page cap gives `MAX_PAGES_EXHAUSTED` and no 4th page. **H05**: record cap.
+- **H06**: newest-first violation, cross-page boundary violation, duplicate across pages and non-progressing page.
+- **H07 Malformed records**: rejected through the unchanged activity analyzer (bad signature, negative slot, `processed` status, extra field, too many records).
+- **H08**: `-32016` gives `CONTEXT_SLOT_NOT_REACHED`; another RPC error and an HTTP error are each terminal.
+- **H09 Cutoff**: a null `getBlockTime` gives `MISSING_SOURCE_CUTOFF`. A forged `getBlockTime` slot ≠ `getSlot` result fails offline analysis. A page dispatched before the cutoff pair, or without `minContextSlot`, is `INVALID_SOURCE_CUTOFF`.
+- **H10**: anchor slot or `blockTime` mismatch gives `ANCHOR_IDENTITY_MISMATCH`.
+- **H11 Window coverage**: an anchor `blockTime` equal to `windowStartMs`, and a cutoff earlier than `windowEndMs`, each give `WINDOW_NOT_COVERED`. The exact boundaries are accepted.
+- **H12**: a null `blockTime` between the anchor and the cutoff gives `AMBIGUOUS_TIMESTAMP`; a non-monotonic `blockTime` gives `TIME_ORDER_CONTRADICTION`.
+- **H13**: records above `S_c` are `AFTER_CUTOFF`, retained and never in a window.
+- **H14 Lifecycle**: deadline mid-pagination, cancellation before and after dispatch, a throwing or regressing clock, and a hung fetch giving `CLEANUP_UNSETTLED`. Each is followed by zero further requests and leaves no timers or listeners behind.
+- **H15**: a genuine bounded-reader overflow (`RESPONSE_LIMIT_EXCEEDED`) and a declared `content-length` refusal.
+- **H16**: a credential in a response is sanitized; a redacted or withheld page gives `EVIDENCE_LIMITED`, never `ANCHOR_WITNESSED`.
+- **H17 Conversions**: `toCpmmAccountingCutoff` is accepted by the unchanged ledger's `summarize` for a covered window, and refused there with `WINDOW_BEYOND_CUTOFF` for an uncovered one. `toSourceCutoffEvidence` satisfies the evaluator's documented `getBlockTime` rules (payload, `requestContext.slot`, `result × 1000`).
+- **H18**: the non-certification flags are literal `false`, and `DEFAULT_PROVIDER_INDEX_ASSUMPTIONS` is included verbatim.
+- **H19 No AMM context**: a static import check finds no `RaydiumAmmV4*` import, and a `TrackedRaydiumPoolContext`-shaped binding is refused.
+- **H20**: importing is inert, and the driver requires an injected session (no default fetch).
+- **H21 Real-bytes regression**: `cpmm-activity-check-02`'s sealed page, replayed read-only, passes the page rules. It cannot test `before` or `minContextSlot` binding because it carried neither.
+
+Validation would follow the established practice: each run under an external 60 s limit, targeted mutations from an exit-`0` baseline, and TypeScript, ESLint and Prettier checks.
+
+##### 9. Policies and Requirements That Stay Explicit and Outside This Slice
+
+- **Freshness**: decision age ≤ 15,000 ms from cutoff retrieval, applied by the later reconciliation.
+- **Policies still unreviewed**: the `RESOLVED_NO_TARGET_SWAP` policy, the CPMM failed-transaction policy and validator, failure-status validation, and quiet- and active-window policies for CPMM.
+- **Evidence still absent**: CPMM LP and security evidence (Stage 4).
+- **Admission**: CPMM stays excluded, the market parser still rejects `"CPMM"`, and all qualification flags remain `false`.
+- **Later slices**: sealing the history and cutoff exchanges as observation evidence (slice 2, with schema and pin review), the CPMM reconciliation evaluator (slice 3), and any profile or budget allocation and operator use. Each needs its own review and approval.

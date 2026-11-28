@@ -317,3 +317,22 @@ The §16 design is implemented, with the review's corrections. Full detail is in
   - **Overflow prefix:** `PARTIAL_OVERFLOW` must retain exactly 262,144 original bytes, as the bounded reader does.
   - **Validation:** 16/16 tests; 28/28 targeted mutations caught after an exit-0 baseline.
   - **Not done:** no operator packet or execution.
+
+## 18. Retrospective Retrieval `cpmm-retrospective-tx-01` & Witnessed-History Proposal
+
+Independent review accepted `cpmm-retrospective-tx-01`. It ran once at commit `facddd85e7f4b0c59ae6419e693b350dafac9201` via `.tmp/runbooks/cpmm-retrospective-tx-01-operator.ps1` (SHA-256 `414bb7cf9eb31aae02fb1063afe4f88cc3aa260353f9baa60de7983f7a3755e3`). Full detail is in assessment §8.38.30.
+
+- **Evidence:** manifest SHA-256 `5493be0be933cf26845e6c307f23e4bd9d0434e5d542e86b30478872b403e92f` under `data/research/cpmm-retrospective-transactions/cpmm-retrospective-tx-01`.
+- **Request:** exactly **one** HTTP request: a cap-1 `getTransaction` (owner `SECURITY`), completed in 137 ms.
+- **Response:** complete **24,580 bytes**, stored unredacted. It is a **version-1** transaction with the expected signature `4XcLrDWB…` at slot `473543189` (`meta.err: null`, static accounts only, all four `transactionConfig` keys present).
+- **Result:** one historical **SELL** (`4,400,618,230,899` base units in, `83,488,739` lamports out), decoder logs `CORROBORATED`. This is the first observed genuine v1 payload, and the v1 path decoded it exactly. Broader v1 coverage is still not established.
+- **Verification:** integrity `OK`, source `VERIFIED`, replay `REPRODUCED`, offline `--verify` exit `0`. The credential-aware scan is not repeated offline.
+- **Unchanged:** no fresh flow and no ingestion. The one-request approval is **consumed**. Captures `03` and `04` and their recorded outcomes are unchanged (capture 03's `000004.json` is still `RPC_ERROR` / `JSON_RPC_ERROR`). The wallet is unchanged, and all qualification flags remain `false`.
+- **Proposal, design only (assessment §8.38.31):** CPMM-bound witnessed history and on-chain cutoff evidence, as an isolated, unwired first slice (`CpmmWitnessedHistory.ts`).
+  - Cutoff: a sealed `getSlot` → `getBlockTime(slot)` pair.
+  - History: then at most 3 newest-first `getSignaturesForAddress` pages (`limit: 20`, `minContextSlot` = cutoff slot, `before` cursors) until a bound anchor appears.
+  - Bounds: at most 5 requests, one 30 s deadline, no retries or `until`.
+  - Reuse: the AMM enumerator's contract semantics, the evaluator's cutoff rules and assumptions, and the activity check's page analyzer, all unchanged. No AMM v4 context is spoofed.
+  - Use: it supplies the CPMM ledger's existing cutoff input and a signature set for a later reconciliation evaluator.
+  - Limits: the evidence stays provider-relative, never cryptographic completeness.
+  - Not authorized: no implementation, operator command, credential load, request, socket or rerun.
