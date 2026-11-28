@@ -30,6 +30,7 @@ export function verificationPlan(mode = "all") {
         "backend/vitest.h3.config.ts",
         "backend/vitest.h4.config.ts",
         "scripts/vitest.handoff-watch.config.ts",
+        "scripts/vitest.cpmm-scripts.config.ts",
       ]),
     );
     plan.push(
@@ -63,6 +64,7 @@ export function verificationPlan(mode = "all") {
         "scripts/architecture-check.test.mjs",
         "scripts/verify-isolated.test.mjs",
         "scripts/verify-pilot-manifest.test.mjs",
+        "scripts/offline-test-guard.test.mjs",
       ]),
     );
     for (const config of [
@@ -72,6 +74,8 @@ export function verificationPlan(mode = "all") {
       "backend/vitest.h4.config.ts",
       // Explicit offline selection: the runner-pin handoff and AMM v4 watch suites.
       "scripts/vitest.handoff-watch.config.ts",
+      // Explicit offline selection under the offline guard: the CPMM script suites.
+      "scripts/vitest.cpmm-scripts.config.ts",
     ])
       plan.push(node(["node_modules/vitest/vitest.mjs", "run", "--config", config]));
   }
