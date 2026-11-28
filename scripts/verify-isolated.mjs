@@ -29,6 +29,7 @@ export function verificationPlan(mode = "all") {
         "backend/vitest.h2.config.ts",
         "backend/vitest.h3.config.ts",
         "backend/vitest.h4.config.ts",
+        "scripts/vitest.handoff-watch.config.ts",
       ]),
     );
     plan.push(
@@ -64,15 +65,15 @@ export function verificationPlan(mode = "all") {
         "scripts/verify-pilot-manifest.test.mjs",
       ]),
     );
-    for (const config of ["measurement-analysis", "h2", "h3", "h4"])
-      plan.push(
-        node([
-          "node_modules/vitest/vitest.mjs",
-          "run",
-          "--config",
-          `backend/vitest.${config}.config.ts`,
-        ]),
-      );
+    for (const config of [
+      "backend/vitest.measurement-analysis.config.ts",
+      "backend/vitest.h2.config.ts",
+      "backend/vitest.h3.config.ts",
+      "backend/vitest.h4.config.ts",
+      // Explicit offline selection: the runner-pin handoff and AMM v4 watch suites.
+      "scripts/vitest.handoff-watch.config.ts",
+    ])
+      plan.push(node(["node_modules/vitest/vitest.mjs", "run", "--config", config]));
   }
   return plan;
 }
