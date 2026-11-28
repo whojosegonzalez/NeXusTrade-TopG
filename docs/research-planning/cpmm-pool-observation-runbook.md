@@ -347,4 +347,4 @@ The implementation contract for the isolated history/cutoff slice is in [`cpmm-w
 - the bootstrap as a separate one-request operation;
 - portable synthetic fixtures.
 
-Nothing is implemented, run or authorized by it.
+It was revised after review (contract §11): the bootstrap and enumeration limits are accepted as offline implementation limits only, the null-time rule is simplified, and exactly-once sequence accounting, refusal of overlapping operations, bounded waiting and the final decision boundary are added. Nothing is implemented, run or authorized by it.

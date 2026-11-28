@@ -12533,7 +12533,17 @@ Validation would follow the established practice: each run under an external 60 
   - One block time per slot.
   - Times are monotone in slot and consistent with the cutoff.
   - Coverage requires the anchor's time **strictly** before the window start and the window end at or before the cutoff time, so intra-slot order is never needed.
-  - A null block time is placed only by bracketing; otherwise the window is `AMBIGUOUS_TIMESTAMP`.
+  - Any null block time on a record between the anchor and the cutoff makes the window `AMBIGUOUS_TIMESTAMP` (neighbour inference deferred; revised by review).
 - **Bootstrap**: in this slice, as a separately invoked operation (1 request, its own 10 s deadline). It sits outside the enumeration's 5-request and 30 s bounds, with a hard ceiling of 6 requests per collector instance and no automatic chaining.
 - **Fixtures**: every CI input is synthetic and committed. A historical sealed page may serve only as an optional, skipped-when-absent local regression.
 - **Scope**: one isolated module plus tests and fixtures; exact runner-pin additions in a separate commit. No reconciliation wiring, qualification promotion, profile change or live execution.
+
+**Review revision** (contract §11): accepted the bootstrap (1 request, 10 s), the enumeration (at most 5 requests, 30 s) and at most 6 requests per instance, as **offline implementation limits, not a live approval**; owner `FLOW` and the four purpose labels; the simplified null-time rule. The revision adds:
+
+- exactly-once accounting of every owned `seq` across dispatch records, claimed exchanges and the final session ledger;
+- refusal of overlapping operations, with the bootstrap before the enumeration;
+- bounded waiting behind unrelated session work, with a sticky refusal so a queued owned request can never dispatch later;
+- cleanup of owned work only;
+- a final decision boundary: guarded clock read, actual cancellation check, then an immutable result with no further `await`.
+
+The `minContextSlot` and `-32016` behaviour is recorded as specification evidence from Agave `27e36edc8ae4a2af48a75fdfdda74b5e369b15c3`, without any claim about the provider's version. Implementation remains pending review of the revised contract.

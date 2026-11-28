@@ -1,6 +1,6 @@
 # CPMM Witnessed History and On-Chain Cutoff: Step 7 Slice 1 Implementation Contract
 
-**Status**: Contract for review, before any implementation. It turns the design-only proposal in assessment §8.38.31 into an implementation-ready contract and resolves its open points against the APIs at `ca35ebf6b4c9744b5ee339979b529785e769def8`. It authorizes no implementation, request, operator command, credential load or live run. All qualification flags remain `false`; CPMM stays excluded from admission.
+**Status**: Contract for review, before any implementation. Revised after review (§11 records the accepted decisions). It turns the design-only proposal in assessment §8.38.31 into an implementation-ready contract and resolves its open points against the APIs at `ca35ebf6b4c9744b5ee339979b529785e769def8`. It authorizes no implementation, request, operator command, credential load or live run. All qualification flags remain `false`; CPMM stays excluded from admission.
 
 ## 0. Scope
 
@@ -20,11 +20,17 @@ The session has one constructor-time observer, `onExchangeComplete`, and per-req
 2. **Ownership by sequence.** Before each dispatch the collector creates a slot: `{ kind, url, requestBody, jsonRpcId, maxResponseBytes }`. The dispatch passes `onDispatched(entry)`, which the session calls once, synchronously, when the request is counted; the collector stores a copy of that ledger entry. `onExchangeComplete` claims evidence **only** when `evidence.entry.seq === slot.dispatched.seq`. Then every dispatch field must equal the stored entry: `seq`, `lane`, `owner`, `purpose`, `requestedIdentity`, `jsonRpcId`, `dispatchedAtMs`. The evidence must also have `method === "POST"`, `url` and `requestBody` equal to the slot's, `maxResponseBytes` equal to the slot's, and a `body` that is `null` or a `Buffer` no longer than that cap. Purpose labels are compared but are never sufficient on their own; evidence from other owners, including same-purpose requests with another `seq`, is ignored.
 3. **Timing.** The session invokes the observer in `dispatch`'s `finally`, before `dispatch()` returns, so the claimed copy exists when the collector's await resumes.
 4. **Failure states** (terminal, never retried): `EVIDENCE_DUPLICATED` (a second claim for the same `seq`); `EVIDENCE_ENTRY_MISMATCH:<field>`; `EVIDENCE_BODY_MISMATCH`; `EVIDENCE_MISSING` (dispatched, but no claimed evidence when `dispatch()` returned).
-5. **Ledger cross-check.** The collector records `session.getLedgerLength()` before its first dispatch and, at the end, requires every `session.getLedgerSince(start)` entry whose `seq` it recorded through `onDispatched` to equal its claimed copy (`LEDGER_EVIDENCE_MISMATCH` otherwise). Entries from other owners in that range are ignored.
+5. **Exactly-once sequence accounting.** Every owned `seq` must appear **exactly once** in each of three records:
+   - the collector's dispatch records (from `onDispatched`; a second `onDispatched` for one slot, or two slots sharing a `seq`, gives `DISPATCH_RECORD_DUPLICATED`);
+   - its claimed exchanges (`EVIDENCE_MISSING` / `EVIDENCE_DUPLICATED` above);
+   - the final session ledger: the collector records `session.getLedgerLength()` before its first dispatch, and in the decision boundary (§2.4) reads `session.getLedgerSince(start)` once. An owned `seq` absent there gives `LEDGER_ENTRY_MISSING`, present more than once gives `LEDGER_ENTRY_DUPLICATED`, and present once but different from the claimed copy gives `LEDGER_EVIDENCE_MISMATCH`.
+
+   All three sets must be equal. Entries in the range that belong to other owners (sequence numbers the collector never recorded) are permitted and ignored.
+
 6. **Copies.** Each claimed exchange is copied exactly once (frozen entry, `Buffer.from(body)`). No URL, header or body is logged or written in this slice.
 7. **Clock.** Times come from `session.now()` through a guard that refuses non-safe-integer and regressing reads (`CLOCK_FAILURE`), as in the acquisition.
 
-**Request identity fields** (all lane `SOLANA_RPC`, owner `FLOW`, ids from `session.nextJsonRpcId()`):
+**Request identity fields** (accepted by review: all lane `SOLANA_RPC`, owner `FLOW`, ids from `session.nextJsonRpcId()`):
 
 | Request           | `purpose`                        | `requestedIdentity` |
 | ----------------- | -------------------------------- | ------------------- |
@@ -37,10 +43,10 @@ The session has one constructor-time observer, `onExchangeComplete`, and per-req
 
 One collector instance serves one pool binding on one session. It offers two operations, each callable at most once, and **never chains them automatically** (`ALREADY_STARTED` otherwise).
 
-**`bootstrap(options)`: optional, in this slice.**
+**`bootstrap(options)`: optional, in this slice** (accepted by review). Its limits are offline implementation limits, not a live approval.
 
 - Exactly **one** `getSignaturesForAddress` head page (`limit: 20`, `commitment: "confirmed"`, no `before`, no `minContextSlot`).
-- **Its own ceiling and deadline**: 1 request; one absolute deadline of at most 10,000 ms from the operation's start; request timeout `min(10,000 ms, remaining)`; at most 5,000 ms of settled cleanup after the deadline.
+- **Its own ceiling and deadline**: 1 request; one absolute acquisition deadline of at most 10,000 ms from the operation's start; request timeout `min(10,000 ms, remaining)`; at most 5,000 ms of settled cleanup after the deadline.
 - Output: a `BOOTSTRAP_PAGE` anchor claim from the page's newest record, carrying that exchange's `seq`; or `BOOTSTRAP_EMPTY` (no records: no anchor, so no window can be covered); or a failure.
 - It is **not** counted in the enumeration's five requests. Per collector instance the hard ceiling is **6** requests (1 + 5).
 - Why separate: an anchor's block time must be strictly before the window start (rule R6), so the bootstrap precedes the observed window, typically by at least the window length. Putting it inside the enumeration's 30,000 ms deadline would make that impossible.
@@ -50,13 +56,44 @@ One collector instance serves one pool binding on one session. It offers two ope
 - Sequence: `getSlot` → `getBlockTime(S_c)` → at most **3** `getSignaturesForAddress` pages; at most **5** requests.
 - One absolute deadline of at most 30,000 ms from the operation's start; request timeout `min(10,000 ms, remaining)`; at most 5,000 ms of settled cleanup after the deadline.
 - The session's ≥ 2,500 ms `SOLANA_RPC` pacing applies, so 5 requests need at least 10 s.
-- A `BOOTSTRAP_PAGE` anchor requires the bootstrap exchange to have completed before `enumerate` starts (`ANCHOR_SOURCE_NOT_SETTLED` otherwise).
+- A `BOOTSTRAP_PAGE` anchor requires the bootstrap exchange to have completed before `enumerate` starts (`ANCHOR_SOURCE_NOT_SETTLED` otherwise). Like the bootstrap's, these limits are offline implementation limits, not a live approval.
 - **Stop rules**:
   - Stop at `ANCHOR_WITNESSED`.
   - A short page without the anchor is `ANCHOR_NOT_FOUND`; reaching the page cap is `MAX_PAGES_EXHAUSTED`.
   - Any failure is terminal, with zero further requests, and a refusal before the first dispatch sends nothing.
 
 **Neither operation** extends or changes the session's lifetime, ceilings or pacing. A session stop, a refusal or a 429 ends the operation (`SESSION_STOPPED` / `SESSION_REFUSED`). No retry, redirect, fallback, `until`, other lane, WebSocket or follow-up.
+
+### 2.1 No overlap; order
+
+- At most one operation is in progress per collector at any time. Calling either operation while the other is in progress (including during its bounded cleanup) is refused immediately, sends nothing and changes nothing (`OPERATION_IN_PROGRESS`).
+- Each operation runs at most once (`ALREADY_STARTED`).
+- If the bootstrap is used, it must precede the enumeration: calling `bootstrap` after `enumerate` has started is refused (`BOOTSTRAP_AFTER_ENUMERATION`).
+
+### 2.2 Bounded waiting behind unrelated session work
+
+The session serializes and paces its `SOLANA_RPC` lane, so an owned request can wait behind other owners' requests. As in `CpmmPoolAccountAcquisition`, the collector bounds **its own** wait, not the session's queue:
+
+- Each dispatch is raced against the operation's deadline and cancellation. When either fires, the collector stops waiting at once.
+- A **sticky refusal** is set at the same moment and returned from the dispatch's `refusal` callback, which the session checks before and after every pacing wait and immediately before dispatch. A queued owned request can therefore never be dispatched later: the session declines it, and the collector records `DEADLINE_EXPIRED` / `OPERATOR_CANCELLED` with zero further requests.
+- `waitSignals` and `linkSignals` carry the operation's own `AbortController`, so a pacing wait is cut short and an in-flight owned request is aborted.
+
+### 2.3 Cleanup affects only owned work
+
+- Cleanup aborts only the collector's own controller, clears only its own timers and removes only its own listeners (caller signal, session `onStop` handling).
+- It **never** calls `session.stop()`, never changes session limits, and never touches other owners' requests, queue positions or evidence.
+- After the deadline, at most 5,000 ms of settled cleanup is allowed for an owned in-flight request. If it is still unsettled then, the result is `CLEANUP_UNSETTLED`.
+
+### 2.4 Final decision boundary
+
+After cleanup has settled, or its bound has expired, the operation decides once and synchronously, with no further `await`:
+
+1. one guarded clock read (`CLOCK_FAILURE` if it throws, is not a safe integer, or regresses);
+2. sampling of the **actual** cancellation state: the collector's own controller and the caller's `AbortSignal.aborted` as they are now, not a cached flag;
+3. the ledger read for exactly-once accounting (§1, item 5);
+4. construction of the frozen, immutable result.
+
+A cancellation or clock failure observed at this boundary prevents a success outcome. Earlier failures keep their place, because the failure list only appends. Nothing that happens after the result is built can change it.
 
 ## 3. Exact request bodies
 
@@ -68,13 +105,20 @@ The key order is fixed. The analyzer rebuilds each body and compares the exact s
 - Page 1: `{"jsonrpc":"2.0","id":<id>,"method":"getSignaturesForAddress","params":["<pool>",{"limit":20,"commitment":"confirmed","minContextSlot":<S_c>}]}`
 - Page k > 1: as page 1 with `"before":"<oldest signature of page k-1>"` appended after `minContextSlot`.
 
-**Implementation precondition**: confirm against a pinned Agave source that `getSignaturesForAddress` accepts `minContextSlot` and reports an unreached minimum context slot as JSON-RPC `-32016`, and that `getBlockTime` takes only the slot. This is a public specification read; until it is done, `-32016` is mapped only through the generic `RPC_ERROR(code)`.
+**Specification evidence** (confirmed by review against Agave commit `27e36edc8ae4a2af48a75fdfdda74b5e369b15c3`):
+
+- `rpc/src/rpc.rs`: `getSignaturesForAddress` forwards `minContextSlot` from its config, and `getBlockTime` takes a slot.
+- `rpc-client-api/src/custom_error.rs`: `MinContextSlotNotReached` maps to JSON-RPC `-32016`.
+
+Sources: <https://github.com/anza-xyz/agave/blob/27e36edc8ae4a2af48a75fdfdda74b5e369b15c3/rpc/src/rpc.rs> and <https://github.com/anza-xyz/agave/blob/27e36edc8ae4a2af48a75fdfdda74b5e369b15c3/rpc-client-api/src/custom_error.rs>.
+
+This is evidence about the reference implementation at that commit only. It makes **no** claim about which Agave version, or which implementation, the provider (Helius) runs. `CONTEXT_SLOT_NOT_REACHED` is therefore mapped from `-32016`, while the provider's behaviour stays a recorded assumption (§5).
 
 ## 4. Response analysis
 
 - **Transport**: claimed evidence must have HTTP 200 and `bodyState: COMPLETE`. `PARTIAL_OVERFLOW` gives `RESPONSE_LIMIT_EXCEEDED`, `NOT_READ` gives `TRANSPORT_ERROR`, and any other status gives `HTTP_ERROR`.
 - **Response caps**: 65,536 bytes per page (the activity check's reviewed cap) and 4,096 bytes for `getSlot` and `getBlockTime`.
-- **Pages**: parsed by the activity check's `analyzePoolActivityResponse(body, requestId)`, **unchanged**: at most 20 records, canonical signatures, safe slots, nullable bounded `blockTime`, confirmed/finalized status, no duplicates, newest-first, bounded `err`. `RPC_ERROR` `-32016` gives `CONTEXT_SLOT_NOT_REACHED` (once the precondition in §3 is met).
+- **Pages**: parsed by the activity check's `analyzePoolActivityResponse(body, requestId)`, **unchanged**: at most 20 records, canonical signatures, safe slots, nullable bounded `blockTime`, confirmed/finalized status, no duplicates, newest-first, bounded `err`. `RPC_ERROR` `-32016` gives `CONTEXT_SLOT_NOT_REACHED` (§3 specification evidence).
 - **`getSlot`**: fatal UTF-8; JSON-RPC 2.0; matching id; exactly `{jsonrpc, id, result}`; `result` a safe integer ≥ 0. An error envelope gives `CUTOFF_UNAVAILABLE` with its code.
 - **`getBlockTime`**: as above, with `result` a safe integer in `[1, MAX_BLOCK_TIME_SEC]` (the decoder's exported bound), or `null`, which gives `MISSING_SOURCE_CUTOFF`.
 - **Continuity** (enumeration pages):
@@ -120,10 +164,7 @@ Notation: `t(r) = r.blockTime × 1000` when `r.blockTime` is non-null. Windows a
   - By R2, every `ANCHOR_SLOT` record has `t = t(anchor) < W.start`, and every record at slot `S_c` has `t = T_c × 1000 ≥ W.end`. Both lie outside W whatever their intra-slot order, so same-slot ordering is never needed.
   - The end rule is the same as the ledger's `WINDOW_BEYOND_CUTOFF` check.
 - **R7 Membership.** A `BETWEEN` record with non-null `t` is in W if and only if `W.start ≤ t < W.end`.
-- **R8 Null block time.** For a `BETWEEN` record with `blockTime: null` at slot `s`:
-  - Let `L` be the largest `t` among non-null records with slot < `s` (the anchor included), and `U` the smallest `t` among non-null records with slot > `s`, with `T_c × 1000` as the bound when `s ≤ S_c`. A non-null record at the same slot pins `t` exactly (R2).
-  - The record is outside W if `U < W.start` or `L ≥ W.end`.
-  - Otherwise W is `AMBIGUOUS_TIMESTAMP`, which blocks; the record is never guessed into or out of W.
+- **R8 Null block time** (simplified by review for this slice). If **any** `BETWEEN` record has `blockTime: null`, every window evaluated against this evidence is `AMBIGUOUS_TIMESTAMP`, which blocks. The record is never placed into or out of a window. Inference from neighbouring records' times, or from a non-null record at the same slot, is **deferred** to a later slice. Null times on `AFTER_CUTOFF`, `ANCHOR_SLOT` and `OLDER_THAN_ANCHOR` records do not affect windows: the anchor's own time must still be non-null (R4).
 - **R9 Window result.** `COVERED` with the exact list of member signatures, or one of `WINDOW_NOT_COVERED`, `AMBIGUOUS_TIMESTAMP`, `TIME_ORDER_CONTRADICTION` or `EVIDENCE_NOT_USABLE` (the operation did not end with `ANCHOR_WITNESSED` and `CUTOFF_BOUND`). It reconciles nothing and qualifies nothing.
 
 ## 7. Outcomes
@@ -131,9 +172,9 @@ Notation: `t(r) = r.blockTime × 1000` when `r.blockTime` is non-null. Windows a
 - **Operation**: `ANCHOR_WITNESSED`, `ANCHOR_NOT_FOUND`, `MAX_PAGES_EXHAUSTED`, `MAX_RECORDS_EXCEEDED`, `NON_PROGRESSING_PAGE`, `ORDERING_VIOLATION`, `BOUNDARY_VIOLATION`, `DUPLICATE_ACROSS_PAGES`, `MALFORMED_PAGE(reason)`, `BOOTSTRAP_EMPTY`.
 - **Cutoff**: `CUTOFF_BOUND`, `MISSING_SOURCE_CUTOFF`, `CUTOFF_UNAVAILABLE(code)`, `INVALID_SOURCE_CUTOFF`, `CUTOFF_BEFORE_ACQUISITION`.
 - **Transport and lifecycle**: `RPC_ERROR(code)`, `CONTEXT_SLOT_NOT_REACHED`, `HTTP_ERROR`, `RESPONSE_LIMIT_EXCEEDED`, `TRANSPORT_ERROR`, `DEADLINE_EXPIRED`, `OPERATOR_CANCELLED`, `CLOCK_FAILURE`, `CLEANUP_UNSETTLED`, `SESSION_STOPPED`, `SESSION_REFUSED`.
-- **Evidence**: `EVIDENCE_MISSING`, `EVIDENCE_DUPLICATED`, `EVIDENCE_ENTRY_MISMATCH:<field>`, `EVIDENCE_BODY_MISMATCH`, `LEDGER_EVIDENCE_MISMATCH`.
+- **Evidence**: `EVIDENCE_MISSING`, `EVIDENCE_DUPLICATED`, `EVIDENCE_ENTRY_MISMATCH:<field>`, `EVIDENCE_BODY_MISMATCH`, `DISPATCH_RECORD_DUPLICATED`, `LEDGER_ENTRY_MISSING`, `LEDGER_ENTRY_DUPLICATED`, `LEDGER_EVIDENCE_MISMATCH`.
 - **Binding and anchor**: `POOL_BINDING_REFUSED`, `ANCHOR_IDENTITY_MISMATCH`, `ANCHOR_TIME_UNKNOWN`, `ANCHOR_NOT_BEFORE_CUTOFF`, `ANCHOR_SOURCE_NOT_SETTLED`.
-- **Usage**: `ALREADY_STARTED`, `OPTIONS_INVALID`.
+- **Usage**: `ALREADY_STARTED`, `OPERATION_IN_PROGRESS`, `BOOTSTRAP_AFTER_ENUMERATION`, `OPTIONS_INVALID`.
 
 Only `ANCHOR_WITNESSED` with `CUTOFF_BOUND` and no evidence or binding failure yields usable evidence. Everything else fails closed with no retry.
 
@@ -171,18 +212,20 @@ Only `ANCHOR_WITNESSED` with `CUTOFF_BOUND` and no evidence or binding failure y
 - **C01**: a same-purpose exchange from another owner, with a different `seq`, is ignored.
 - **C02**: a forged exchange with a matching `seq` but a different `purpose`, `jsonRpcId`, URL or body gives the corresponding mismatch failure.
 - **C03**: a duplicate claim gives `EVIDENCE_DUPLICATED`.
-- **C04**: dispatched without evidence gives `EVIDENCE_MISSING`.
-- **C05**: the ledger cross-check passes, and an altered ledger copy gives `LEDGER_EVIDENCE_MISMATCH`.
+- **C04**: dispatched without evidence gives `EVIDENCE_MISSING`; a second `onDispatched` for one slot gives `DISPATCH_RECORD_DUPLICATED`.
+- **C05**: exactly-once accounting across dispatch records, claimed exchanges and the final ledger. A missing owned ledger entry gives `LEDGER_ENTRY_MISSING`, a duplicated one `LEDGER_ENTRY_DUPLICATED`, and an altered copy `LEDGER_EVIDENCE_MISMATCH`. Interleaved unrelated session entries are accepted.
 - **C06**: wiring through `createExchangeObserverFanOut` next to other observers works, and the collector never returns or throws.
 
 **Operations and limits**
 
 - **C07**: bootstrap sends exactly one request with the exact body; an empty page gives `BOOTSTRAP_EMPTY`.
-- **C08**: bootstrap and enumerate are never chained, a second call is `ALREADY_STARTED`, and the instance never exceeds 6 requests.
+- **C08**: bootstrap and enumerate are never chained, a second call is `ALREADY_STARTED`, and the instance never exceeds 6 requests. Calling either operation while the other runs, its cleanup included, gives `OPERATION_IN_PROGRESS` and sends nothing; `bootstrap` after `enumerate` has started gives `BOOTSTRAP_AFTER_ENUMERATION`.
 - **C09**: `enumerate` with a `BOOTSTRAP_PAGE` anchor before the bootstrap settles gives `ANCHOR_SOURCE_NOT_SETTLED` and sends nothing.
 - **C10**: the happy path has exact bodies (cutoff first, `minContextSlot`, `before` cursors), at most 5 requests and ≥ 2,500 ms spacing.
 - **C11**: the stop rules: anchor on page 1, a short page, and the page cap.
-- **C12**: deadlines for each operation separately (the bootstrap's 10 s and the enumeration's 30 s), cancellation, a throwing or regressing clock, a hung fetch (`CLEANUP_UNSETTLED`), a session stop and a 429. Each is followed by zero further requests and no leftover timers or listeners.
+- **C12**: deadlines for each operation separately (the bootstrap's 10 s and the enumeration's 30 s), cancellation, a throwing or regressing clock, a hung fetch (`CLEANUP_UNSETTLED`), a session stop and a 429. Each is followed by zero further requests and no leftover owned timers or listeners.
+- **C12a** (bounded waiting): an owned request queued behind a slow unrelated request on the same session times out or is cancelled while still queued. The collector returns within its bound, the session later **declines** the queued request through the sticky refusal (never dispatched; the owned dispatch count is unchanged), and the unrelated request completes untouched. `session.stop()` is never called by the collector.
+- **C12b** (decision boundary): a clock that aborts the caller's signal during the final guarded read, and a cancellation arriving after cleanup but before the result, each prevent success, and an earlier failure keeps first place. The result object is frozen, and later signal or clock activity cannot change it.
 
 **Parsing and cutoff**
 
@@ -197,7 +240,7 @@ Only `ANCHOR_WITNESSED` with `CUTOFF_BOUND` and no evidence or binding failure y
 - **C18**: classification by slot: `ANCHOR_SLOT` records listed before or after the anchor are both outside every window, and slot-`S_c` records are outside W.
 - **C19**: coverage boundaries: `t(anchor) = W.start` is not covered and `t(anchor) = W.start − 1000` is; `W.end = T_c × 1000` is covered and `W.end = T_c × 1000 + 1` is not.
 - **C20**: membership at `W.start` (in) and at `W.end` (out).
-- **C21**: null block times: bracketed outside W, bracketed straddling W (`AMBIGUOUS_TIMESTAMP`), and pinned by a same-slot record.
+- **C21**: any `BETWEEN` record with a null block time makes every window `AMBIGUOUS_TIMESTAMP`, even one it clearly could not fall into, and even with a non-null record at the same slot (no inference in this slice). Null times on `AFTER_CUTOFF`, `ANCHOR_SLOT` and `OLDER_THAN_ANCHOR` records leave covered windows unaffected.
 
 **Binding, conversions and flags**
 
@@ -221,8 +264,17 @@ Validation follows established practice: targeted mutations from an exit-0 basel
 
 The pin accepts **additions** by exact path only; there is no exact-blob mechanism for added files today. The pin commit therefore names exactly these three paths, refuses near-miss names, and preserves `REVIEWED_RUNNER_COMMIT` and every accepted blob entry. No other file changes.
 
-## 11. Decisions requested from review
+## 11. Review decisions (accepted)
 
-1. Accept the bootstrap inside this slice as a separately invoked, separately bounded operation (1 request, 10 s), outside the enumeration's 5-request and 30 s bounds, with a hard ceiling of 6 per instance. The alternative is to defer it, which leaves only `LEDGER_RECORD` anchors and therefore no quiet-window coverage.
-2. Accept rule R8's bracketing (the conservative alternative: any null block time between the anchor and the cutoff blocks every window).
-3. Accept owner `FLOW` and the four purpose labels above.
+1. **Bootstrap**: accepted as a separately invoked operation, with 1 request, a 10,000 ms acquisition deadline and bounded cleanup. The enumeration remains at most 5 requests within 30,000 ms, with at most 6 requests per collector instance. These are **offline implementation limits, not a live approval**.
+2. **Owner and purposes**: owner `FLOW` and the four purpose labels in §1 are accepted.
+3. **R8**: simplified for this slice. Any `BETWEEN` record with a null block time makes the window `AMBIGUOUS_TIMESTAMP`, and neighbour or same-slot inference is deferred.
+4. **Exactly-once accounting**: each owned `seq` appears exactly once in the dispatch records, the claimed exchanges and the final session ledger. Missing entries and duplicates fail, and unrelated session entries remain permissible (§1, item 5).
+5. **No overlap and order**: overlapping operations are refused, and the bootstrap must precede the enumeration if it is used (§2.1).
+6. **Bounded waiting**: waiting behind unrelated session work is bounded by the operation's deadline. Deadline or cancellation sets a sticky refusal, so a queued owned request can never dispatch later, and cleanup affects only owned work (§2.2, §2.3).
+7. **Decision boundary**: after cleanup, one guarded clock read, then the actual cancellation state, then the immutable result with no further `await` (§2.4).
+8. **Specification evidence**: Agave `27e36edc8ae4a2af48a75fdfdda74b5e369b15c3`, recorded without any claim about the provider's version (§3).
+
+## 12. Status
+
+Implementation of `CpmmWitnessedHistory.ts` remains pending review of this revised contract. Nothing here authorizes a request, a credential load or live execution, and all qualification flags remain `false`.
