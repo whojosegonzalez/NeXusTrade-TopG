@@ -218,6 +218,27 @@ function createSyntheticBuyPayload(
   };
 }
 
+/**
+ * Explicit synthetic HTTP for tests whose subject is not transaction retrieval: records every
+ * JSON-RPC request and answers it with `result: null` (transaction not found), echoing the id.
+ */
+function syntheticNotFoundRpc() {
+  const requests: { method: string; params: readonly unknown[] }[] = [];
+  const fetchTransport: typeof fetch = async (_input, init) => {
+    const body = JSON.parse(String(init?.body ?? "{}")) as {
+      id?: unknown;
+      method?: unknown;
+      params?: unknown[];
+    };
+    requests.push({ method: String(body.method), params: body.params ?? [] });
+    return new Response(JSON.stringify({ jsonrpc: "2.0", id: body.id ?? null, result: null }), {
+      status: 200,
+      headers: { "Content-Type": "application/json" },
+    });
+  };
+  return { requests, fetchTransport };
+}
+
 describe("RaydiumTransportObservationProbe", () => {
   const baseCapturesDir = path.resolve(
     resolveProjectRoot(),
@@ -226,18 +247,38 @@ describe("RaydiumTransportObservationProbe", () => {
     "captures",
     "transport-probe",
   );
-  const testOutputDir = path.join(baseCapturesDir, "unit-test-probe");
+  // Each test owns a fresh, uniquely named output directory inside the documented captures
+  // directory (the probe refuses any other location). Nothing else there is created or removed,
+  // and a probe left over from another test can never write into this test's directory.
+  let testOutputDir = "";
+  let testDirSequence = 0;
+
+  // Network guard: this suite never reaches a real endpoint. A probe without an injected
+  // fetchTransport falls back to globalThis.fetch and the public RPC URL, so that fallback is
+  // refused immediately and recorded, and the test then fails explicitly.
+  const realFetch = globalThis.fetch;
+  let unmockedNetworkCalls: string[] = [];
 
   beforeEach(() => {
-    if (fsSync.existsSync(testOutputDir)) {
-      fsSync.rmSync(testOutputDir, { recursive: true, force: true });
-    }
+    testDirSequence += 1;
+    testOutputDir = path.join(
+      baseCapturesDir,
+      `unit-test-probe-${process.pid}-${testDirSequence}-${crypto.randomBytes(6).toString("hex")}`,
+    );
+    expect(fsSync.existsSync(testOutputDir)).toBe(false);
+    unmockedNetworkCalls = [];
+    globalThis.fetch = (async (input: string | URL | Request) => {
+      unmockedNetworkCalls.push(
+        typeof input === "string" ? input : input instanceof URL ? input.href : input.url,
+      );
+      throw new TypeError("UNMOCKED_NETWORK_ACCESS_REFUSED");
+    }) as typeof fetch;
   });
 
   afterEach(() => {
-    if (fsSync.existsSync(testOutputDir)) {
-      fsSync.rmSync(testOutputDir, { recursive: true, force: true });
-    }
+    globalThis.fetch = realFetch;
+    fsSync.rmSync(testOutputDir, { recursive: true, force: true });
+    expect(unmockedNetworkCalls).toEqual([]);
   });
 
   // ==========================================================================
@@ -713,6 +754,7 @@ describe("RaydiumTransportObservationProbe", () => {
         },
       };
 
+      const rpc = syntheticNotFoundRpc();
       const probePromise = executeTransportObservationProbe({
         isLive: true,
         outDir: testOutputDir,
@@ -720,6 +762,7 @@ describe("RaydiumTransportObservationProbe", () => {
         streamingDurationMs: 10,
         transport: mockTransport,
         historyPageFetcher: mockHistoryFetcher,
+        fetchTransport: rpc.fetchTransport,
         clock,
         sleepFn,
       });
@@ -759,6 +802,10 @@ describe("RaydiumTransportObservationProbe", () => {
         expect(historyAnchor.slot).toBe(280_000_100);
         expect(historyAnchor.blockTime).toBe(1_700_000_000);
       }
+      // The witnessed anchor's retrieval was answered by the synthetic RPC, never the network.
+      expect(rpc.requests).toEqual([
+        { method: "getTransaction", params: [SIG_ANCHOR, expect.anything()] },
+      ]);
     });
 
     it("known valid swap-decoding positive control: acknowledges subscription, fetches transaction, decodes swap, and records audited diagnostics", async () => {
@@ -824,6 +871,7 @@ describe("RaydiumTransportObservationProbe", () => {
       };
 
       let historyCalls = 0;
+      const rpc = syntheticNotFoundRpc();
 
       const mockHistoryFetcher: HistoryPageFetcher = {
         fetchPage: async (): Promise<readonly HistorySignatureRecord[]> => {
@@ -854,6 +902,7 @@ describe("RaydiumTransportObservationProbe", () => {
         maxTransactionRetrievals: 5,
         transport: mockTransport,
         historyPageFetcher: mockHistoryFetcher,
+        fetchTransport: rpc.fetchTransport,
         clock,
         sleepFn,
       });
@@ -882,6 +931,10 @@ describe("RaydiumTransportObservationProbe", () => {
         expect(succ.metadata.counts.historyQueriesAttempted).toBe(1);
         expect(succ.summary.budgetAccounting.maxHttpAttemptsLimit).toBe(MAX_TOTAL_HTTP_ATTEMPTS);
       }
+      // The witnessed anchor's retrieval was answered by the synthetic RPC, never the network.
+      expect(rpc.requests).toEqual([
+        { method: "getTransaction", params: [SIG_ANCHOR, expect.anything()] },
+      ]);
     });
   });
 
