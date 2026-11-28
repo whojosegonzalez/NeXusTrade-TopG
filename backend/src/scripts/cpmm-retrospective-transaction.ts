@@ -1500,6 +1500,125 @@ const PLAN_OUT_DIR = new RegExp(
   `^${RETRO_ROOT_SEGMENTS.join("/")}/[A-Za-z0-9][A-Za-z0-9._-]{0,63}$`,
 );
 
+/**
+ * The sealed response against the accepted bounded reader (`PaperRequestSession`):
+ * - COMPLETE: no session error, the entry's `bodyComplete`, an HTTP status, and the whole body
+ *   within the cap (`observedBytes === originalBytes <= 262,144`).
+ * - PARTIAL_OVERFLOW: `RESPONSE_TOO_LARGE`, not complete, a retained prefix within the cap, and more
+ *   bytes observed than the cap.
+ * - NOT_READ: a session error, not complete, nothing observed and nothing captured.
+ * Stored bytes must match their own digest and size; ORIGINAL bytes equal the original exactly,
+ * REDACTED bytes differ from it, WITHHELD bytes are absent. Returns the stored bytes, or null when
+ * any of this is incoherent.
+ */
+function responseAccounting(
+  resp: unknown,
+  error: unknown,
+  entry: unknown,
+): { readonly stored: Buffer | null } | null {
+  const max = RETRO_LIMITS.maxResponseBytes;
+  const state = get(resp, "state");
+  const bodyState = get(resp, "bodyState");
+  const observed = get(resp, "observedBytes");
+  const original = get(resp, "originalBytes");
+  const http = get(resp, "httpStatus");
+  if (!isRecord(resp) || entry === null || !isRecord(entry)) return null;
+  if (get(resp, "maxResponseBytes") !== max) return null;
+  if (!(http === null || (isSafeCount(http) && http >= 100 && http <= 599))) return null;
+  if (get(entry, "bodyComplete") !== (bodyState === "COMPLETE")) return null;
+  if (!(error === null || (typeof error === "string" && FIXED_CODE.test(error)))) return null;
+  const noStored =
+    resp.payload === null &&
+    resp.storedEncoding === null &&
+    resp.storedBytes === null &&
+    resp.storedSha256 === null;
+  const originalDigestOk =
+    typeof resp.originalSha256 === "string" && HEX64.test(resp.originalSha256);
+  let stored: Buffer | null = null;
+  switch (state) {
+    case "NOT_CAPTURED":
+      if (
+        !noStored ||
+        original !== null ||
+        resp.originalSha256 !== null ||
+        resp.payloadRedacted !== false ||
+        resp.withheldReason !== null
+      ) {
+        return null;
+      }
+      break;
+    case "WITHHELD":
+      if (
+        !noStored ||
+        !isSafeCount(original) ||
+        !originalDigestOk ||
+        resp.payloadRedacted !== true ||
+        typeof resp.withheldReason !== "string"
+      ) {
+        return null;
+      }
+      break;
+    case "ORIGINAL":
+    case "REDACTED": {
+      const payload = resp.payload;
+      const enc = resp.storedEncoding;
+      stored =
+        typeof payload !== "string"
+          ? null
+          : enc === "utf8"
+            ? Buffer.from(payload, "utf8")
+            : enc === "base64"
+              ? Buffer.from(payload, "base64")
+              : null;
+      if (
+        stored === null ||
+        (enc === "base64" && stored.toString("base64") !== payload) ||
+        resp.storedBytes !== stored.length ||
+        resp.storedSha256 !== sha256(stored) ||
+        resp.payloadRedacted !== (state === "REDACTED") ||
+        resp.withheldReason !== null ||
+        !isSafeCount(original) ||
+        !originalDigestOk
+      ) {
+        return null;
+      }
+      if (
+        state === "ORIGINAL"
+          ? stored.length !== original || resp.originalSha256 !== resp.storedSha256
+          : resp.originalSha256 === resp.storedSha256
+      ) {
+        return null;
+      }
+      break;
+    }
+    default:
+      return null;
+  }
+  switch (bodyState) {
+    case "COMPLETE":
+      return error === null &&
+        http !== null &&
+        state !== "NOT_CAPTURED" &&
+        (original as number) <= max &&
+        observed === original
+        ? { stored }
+        : null;
+    case "PARTIAL_OVERFLOW":
+      return error === "RESPONSE_TOO_LARGE" &&
+        http !== null &&
+        state !== "NOT_CAPTURED" &&
+        (original as number) <= max &&
+        isSafeCount(observed) &&
+        observed > max
+        ? { stored }
+        : null;
+    case "NOT_READ":
+      return error !== null && state === "NOT_CAPTURED" && observed === null ? { stored } : null;
+    default:
+      return null;
+  }
+}
+
 export function verifyRetrospectiveEvidence(
   dir: string,
   options: {
@@ -1682,6 +1801,36 @@ export function verifyRetrospectiveEvidence(
       problems.push("TIMING_INVALID");
     }
     if (problems.length > 0) return fail();
+    // Attempts, entry and response presence, and the start/dispatch/completion/end ordering.
+    const deadline = get(t, "deadlineAtMs") as number;
+    const ended = get(t, "endedAtMs") as number;
+    const dispatched = get(req, "dispatchedAtMs");
+    const completed = get(req, "completedAtMs");
+    if (entry === null) {
+      // No exchange: never dispatched (zero attempts, no id), or dispatched and never settled.
+      const unsettledDispatch = outcome === "CLEANUP_UNSETTLED" && attempts === 1 && id !== null;
+      if (!unsettledDispatch && !(attempts === 0 && id === null)) {
+        problems.push("ATTEMPTS_INCONSISTENT");
+      }
+      if (dispatched !== null || completed !== null) problems.push("TIMING_ORDER_INVALID");
+    } else {
+      if (attempts !== 1 || id === null || r.response === null) {
+        problems.push(
+          attempts !== 1 || id === null ? "ATTEMPTS_INCONSISTENT" : "RESPONSE_ACCOUNTING_INVALID",
+        );
+      }
+      if (!isSafeCount(dispatched) || !isSafeCount(completed)) {
+        problems.push("TIMING_ORDER_INVALID");
+      } else {
+        // The session refuses any dispatch at or after the deadline.
+        if (dispatched >= deadline) problems.push("DISPATCH_AT_OR_AFTER_DEADLINE");
+        if (!((started as number) <= dispatched && dispatched <= completed && completed <= ended)) {
+          problems.push("TIMING_ORDER_INVALID");
+        }
+      }
+    }
+    if (ended > deadline + RETRO_LIMITS.cleanupGraceMs) problems.push("TIMING_ORDER_INVALID");
+    if (problems.length > 0) return fail();
 
     // The source capture, bound again read-only.
     const bound = bindRetrospectiveSource(options.projectRoot, spec, options.sourceDeps);
@@ -1704,35 +1853,12 @@ export function verifyRetrospectiveEvidence(
       const bodyState = get(resp, "bodyState");
       const httpStatus = get(resp, "httpStatus");
       const error = get(req, "error");
-      if (get(resp, "maxResponseBytes") !== RETRO_LIMITS.maxResponseBytes || entry === null) {
+      const accounting = responseAccounting(resp, error, entry);
+      if (accounting === null) {
         problems.push("RESPONSE_ACCOUNTING_INVALID");
+        return fail();
       }
-      let stored: Buffer | null = null;
-      if (state === "ORIGINAL" || state === "REDACTED") {
-        const payload = get(resp, "payload");
-        const enc = get(resp, "storedEncoding");
-        stored =
-          typeof payload !== "string"
-            ? null
-            : enc === "utf8"
-              ? Buffer.from(payload, "utf8")
-              : enc === "base64"
-                ? Buffer.from(payload, "base64")
-                : null;
-        if (
-          stored === null ||
-          get(resp, "storedSha256") !== sha256(stored) ||
-          get(resp, "payloadRedacted") !== (state === "REDACTED") ||
-          (state === "ORIGINAL" &&
-            (get(resp, "originalSha256") !== sha256(stored) ||
-              get(resp, "originalBytes") !== stored.length))
-        ) {
-          problems.push("RESPONSE_ACCOUNTING_INVALID");
-        }
-      } else if (state !== "WITHHELD" && state !== "NOT_CAPTURED") {
-        problems.push("RESPONSE_ACCOUNTING_INVALID");
-      }
-      if (problems.length > 0) return fail();
+      const stored = accounting.stored;
       const completedAt = get(req, "completedAtMs");
       const late =
         error === null &&
@@ -2213,12 +2339,14 @@ export async function runCpmmRetrospectiveTransactionCli(
         `[LIVE] Offline verification: ${verification.integrity.ok ? "OK" : `FAILED (${verification.integrity.problems.join(", ")})`}; source ${verification.sourceBinding?.status ?? "NOT_EVALUATED"}; replay ${verification.computed?.replayStatus ?? "UNKNOWN"}`,
       );
     }
-    // Final decision boundary: cancellation and clock failures still prevent success here.
-    if (controller.signal.aborted) failures.add("OPERATOR_CANCELLED");
-    clock.now();
   } finally {
     removeListeners();
   }
+  // Terminal decision, after listener cleanup: the internal controller, the external signal's
+  // actual state and a fresh guarded clock reading can each still refuse success. Earlier
+  // failures keep their place (the list only appends).
+  if (controller.signal.aborted || external?.aborted === true) failures.add("OPERATOR_CANCELLED");
+  clock.now();
   const finalFailures = failures.list;
   if (code !== X.SEAL_FAILED && code !== X.INTEGRITY_FAILED && finalFailures.length > 0) {
     code = finalFailures[0] === "OPERATOR_CANCELLED" ? X.CANCELLED : X.NO_TRANSACTION_PAYLOAD;

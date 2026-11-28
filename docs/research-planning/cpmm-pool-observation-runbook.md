@@ -305,3 +305,10 @@ The §16 design is implemented, with the review's corrections. Full detail is in
   - The real dry run bound capture 03 (`VERIFIED`) and wrote nothing.
   - The handoff pin allowlist was extended exactly (13/13).
 - **Before any execution:** a separate operator packet and explicit operator approval.
+
+- **Review blockers on `989190d` reproduced and fixed** (assessment §8.38.28):
+  - **Listener cleanup:** the terminal decision now runs after listener cleanup and re-checks cancellation (including the external signal) and the guarded clock.
+  - **Response accounting:** the sealed response is checked against the bounded reader: body state, original/observed/stored bytes, and the 262,144-byte cap.
+  - **Timing:** dispatch must be strictly before the deadline; start/dispatch/completion/end ordering and attempt/entry/response presence are checked.
+  - **Validation:** 14/14 tests; 26/26 targeted mutations caught after a clean baseline.
+  - **Not done:** no operator packet or execution.

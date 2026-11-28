@@ -1192,8 +1192,16 @@ describe("cpmm-retrospective-transaction (synthetic, offline)", () => {
     const h2 = harness();
     await h2.live();
     reseal(h2, RETRO_FILES.retrieval, (d) => {
-      d.response.state = "REDACTED";
-      d.response.payloadRedacted = true;
+      // A coherent redaction: the stored text differs from the original, digests updated.
+      const redacted = (d.response.payload as string).replace(SIG, "[REDACTED]");
+      const b = Buffer.from(redacted, "utf8");
+      Object.assign(d.response, {
+        state: "REDACTED",
+        payloadRedacted: true,
+        payload: redacted,
+        storedBytes: b.length,
+        storedSha256: sha(b),
+      });
     });
     const v = verifyOut(h2);
     expect(v.integrity.ok).toBe(true);
@@ -1457,8 +1465,14 @@ describe("cpmm-retrospective-transaction (synthetic, offline)", () => {
         "response dropped from an exchange outcome",
         (x) =>
           reseal(x, RETRO_FILES.retrieval, (d) => {
+            // Coherent in every other respect: zero attempts, no id, body or times.
             d.response = null;
             d.request.entry = null;
+            d.request.jsonRpcId = null;
+            d.request.body = null;
+            d.request.dispatchedAtMs = null;
+            d.request.completedAtMs = null;
+            d.recorded.httpAttempts = 0;
             d.recorded.analysis = null;
             d.recorded.outcome = "HTTP_ERROR";
           }),
@@ -1509,5 +1523,270 @@ describe("cpmm-retrospective-transaction (synthetic, offline)", () => {
     expect(existsSync(path.join(h.outDir, RETRO_FILES.manifest))).toBe(false);
     expect(h.calls).toHaveLength(1);
     expectNoSecrets(h);
+  });
+});
+
+// ---------------------------------------------------------------------------------------------
+// Review regressions on 989190d (synthetic): listener cleanup, response accounting, timing
+// ---------------------------------------------------------------------------------------------
+
+describe("cpmm-retrospective-transaction review regressions (synthetic, offline)", () => {
+  it("RR1: listener cleanup that cancels or breaks the clock still prevents success", async () => {
+    // removeListener aborts the external AbortController.
+    const ha = harness();
+    const ext = new AbortController();
+    const ra = await ha.live({
+      signal: ext.signal,
+      signals: { on: () => undefined, removeListener: () => ext.abort() },
+    });
+    expect(ra.runFailures).toEqual(["OPERATOR_CANCELLED"]);
+    expect(ra.exitCode).toBe(X.CANCELLED);
+    // removeListener makes the injected clock return NaN.
+    const hn = harness();
+    let broken = false;
+    const rn = await hn.live({
+      clock: () => (broken ? Number.NaN : hn.sched.now),
+      signals: {
+        on: () => undefined,
+        removeListener: () => {
+          broken = true;
+        },
+      },
+    });
+    expect(rn.runFailures).toEqual(["CLOCK_FAILURE:CLOCK_INVALID"]);
+    expect(rn.exitCode).toBe(X.NO_TRANSACTION_PAYLOAD);
+    // Earlier failures are preserved: cancelled during the request, then the clock breaks in cleanup.
+    const he = harness({ fetch: { delayMs: 1_000 } });
+    const ae = new AbortController();
+    he.sched.add(() => ae.abort(), 100);
+    let later = false;
+    const re = await he.live({
+      signal: ae.signal,
+      clock: () => (later ? Number.NaN : he.sched.now),
+      signals: {
+        on: () => undefined,
+        removeListener: () => {
+          later = true;
+        },
+      },
+    });
+    expect(re.runFailures).toEqual(["OPERATOR_CANCELLED", "CLOCK_FAILURE:CLOCK_INVALID"]);
+    expect(re.exitCode).toBe(X.CANCELLED);
+    // Legitimate cleanup: listeners attached once and removed once; a failed removal is reported.
+    const hl = harness();
+    const added: string[] = [];
+    const removed: string[] = [];
+    const rl = await hl.live({
+      signals: { on: (s) => added.push(s), removeListener: (s) => removed.push(s) },
+    });
+    expect(added).toEqual(["SIGINT", "SIGTERM"]);
+    expect(removed).toEqual(["SIGINT", "SIGTERM"]);
+    expect(rl.exitCode).toBe(X.OK);
+    const hf = harness();
+    const rf = await hf.live({
+      signals: {
+        on: () => undefined,
+        removeListener: () => {
+          throw new Error("cannot remove");
+        },
+      },
+    });
+    expect(rf.signalCleanupFailures).toEqual([
+      "SIGNAL_REMOVE_FAILED:SIGINT",
+      "SIGNAL_REMOVE_FAILED:SIGTERM",
+    ]);
+    expect(rf.runFailures).toEqual([]);
+    expect(rf.exitCode).toBe(X.CLEANUP_FAILED);
+  });
+
+  it("RR2: response byte counts and body state must match the accepted bounded reader", async () => {
+    // Unused JSON padding: a complete response beyond the 262,144-byte cap.
+    const hp = harness();
+    await hp.live();
+    reseal(hp, RETRO_FILES.retrieval, (d) => {
+      const body = d.response.payload as string;
+      const padded = body + " ".repeat(264_370 - Buffer.byteLength(body));
+      const b = Buffer.from(padded, "utf8");
+      expect(b.length).toBe(264_370);
+      Object.assign(d.response, {
+        payload: padded,
+        storedBytes: b.length,
+        storedSha256: sha(b),
+        originalBytes: b.length,
+        originalSha256: sha(b),
+        observedBytes: b.length,
+      });
+    });
+    const vp = verifyOut(hp);
+    expect(vp.integrity.ok).toBe(false);
+    expect(vp.integrity.problems).toContain("RESPONSE_ACCOUNTING_INVALID");
+    expect(retrospectiveVerifyExitCode(vp)).toBe(X.INTEGRITY_FAILED);
+    // The original body, but zero observed bytes.
+    const ho = harness();
+    await ho.live();
+    reseal(ho, RETRO_FILES.retrieval, (d) => {
+      expect(d.response.originalBytes).toBeGreaterThan(0);
+      d.response.observedBytes = 0;
+    });
+    const vo = verifyOut(ho);
+    expect(vo.integrity.problems).toContain("RESPONSE_ACCOUNTING_INVALID");
+    expect(retrospectiveVerifyExitCode(vo)).toBe(X.INTEGRITY_FAILED);
+    // Further incoherent states.
+    const forged: [string, (d: Loose) => void][] = [
+      ["complete body marked incomplete", (d) => (d.request.entry.bodyComplete = false)],
+      ["unknown body state", (d) => (d.response.bodyState = "TRUNCATED")],
+      ["overflow without an oversize error", (d) => (d.response.bodyState = "PARTIAL_OVERFLOW")],
+      ["not-read with stored bytes", (d) => (d.response.bodyState = "NOT_READ")],
+      ["complete body with a session error", (d) => (d.request.error = "NETWORK_ERROR")],
+      ["response limit changed", (d) => (d.response.maxResponseBytes = 300_000)],
+      ["original bytes differ from stored", (d) => (d.response.originalBytes += 1)],
+      ["redaction flag on original bytes", (d) => (d.response.payloadRedacted = true)],
+      [
+        "redacted bytes identical to the original",
+        (d) => Object.assign(d.response, { state: "REDACTED", payloadRedacted: true }),
+      ],
+      [
+        "overflow without observed excess",
+        (d) => {
+          // Coherent overflow in every respect except the observed byte count.
+          d.response.bodyState = "PARTIAL_OVERFLOW";
+          d.response.observedBytes = d.response.originalBytes;
+          d.request.error = "RESPONSE_TOO_LARGE";
+          d.request.entry.bodyComplete = false;
+          d.recorded.analysis = null;
+          d.recorded.outcome = "RESPONSE_LIMIT_EXCEEDED";
+        },
+      ],
+    ];
+    for (const [label, mutate] of forged) {
+      const x = harness();
+      await x.live();
+      reseal(x, RETRO_FILES.retrieval, mutate);
+      const v = verifyOut(x);
+      expect(v.integrity.ok, label).toBe(false);
+      expect(retrospectiveVerifyExitCode(v), label).toBe(X.INTEGRITY_FAILED);
+    }
+    // Legitimate accounting still verifies: empty, oversized prefix, not read, redacted or withheld.
+    const leaky = (id: number) => {
+      const t = txResult(1);
+      t.meta.logMessages.push(`Program log: ${RPC_URL}`);
+      return JSON.stringify({ jsonrpc: "2.0", id, result: t });
+    };
+    const legit: [string, FetchScript][] = [
+      ["empty body", { body: () => "" }],
+      ["oversized prefix", { body: () => " ".repeat(300_000) }],
+      ["not read (429)", { status: 429, body: () => "slow" }],
+      ["not read (timeout)", { delayMs: 12_000 }],
+      ["credential in body", { body: leaky }],
+    ];
+    for (const [label, script] of legit) {
+      const x = harness({ fetch: script });
+      const r = await x.live();
+      expect(r.verification!.integrity, label).toEqual({ ok: true, problems: [] });
+    }
+  });
+
+  it("RR3: dispatch strictly before the deadline, coherent ordering, and attempts matching the evidence", async () => {
+    // Dispatch and completion at the deadline, ended at the deadline.
+    const hd = harness();
+    await hd.live();
+    reseal(hd, RETRO_FILES.retrieval, (d) => {
+      d.request.dispatchedAtMs = d.timing.deadlineAtMs;
+      d.request.completedAtMs = d.timing.deadlineAtMs;
+      d.timing.endedAtMs = d.timing.deadlineAtMs;
+    });
+    const vd = verifyOut(hd);
+    expect(vd.integrity.ok).toBe(false);
+    expect(vd.integrity.problems).toContain("DISPATCH_AT_OR_AFTER_DEADLINE");
+    expect(retrospectiveVerifyExitCode(vd)).toBe(X.INTEGRITY_FAILED);
+    const forged: [string, (d: Loose) => void, string][] = [
+      [
+        "dispatch before start",
+        (d) => (d.request.dispatchedAtMs = d.timing.startedAtMs - 1),
+        "TIMING_ORDER_INVALID",
+      ],
+      [
+        "completion before dispatch",
+        (d) => (d.request.completedAtMs = d.request.dispatchedAtMs - 1),
+        "TIMING_ORDER_INVALID",
+      ],
+      [
+        "end before completion",
+        (d) => (d.timing.endedAtMs = d.request.completedAtMs - 1),
+        "TIMING_ORDER_INVALID",
+      ],
+      [
+        "end beyond the cleanup bound",
+        (d) => (d.timing.endedAtMs = d.timing.deadlineAtMs + 5_001),
+        "TIMING_ORDER_INVALID",
+      ],
+      ["missing completion", (d) => (d.request.completedAtMs = null), "TIMING_ORDER_INVALID"],
+      [
+        "exchange with zero attempts",
+        (d) => (d.recorded.httpAttempts = 0),
+        "ATTEMPTS_INCONSISTENT",
+      ],
+      [
+        "no exchange but one attempt",
+        (d) => {
+          d.response = null;
+          d.request.entry = null;
+          d.request.dispatchedAtMs = null;
+          d.request.completedAtMs = null;
+          d.recorded.analysis = null;
+          d.recorded.outcome = "NOT_DISPATCHED";
+        },
+        "ATTEMPTS_INCONSISTENT",
+      ],
+      ["entry without response", (d) => (d.response = null), "RESPONSE_ACCOUNTING_INVALID"],
+    ];
+    for (const [label, mutate, problem] of forged) {
+      const x = harness();
+      await x.live();
+      reseal(x, RETRO_FILES.retrieval, mutate);
+      const v = verifyOut(x);
+      expect(v.integrity.ok, label).toBe(false);
+      expect(v.integrity.problems, label).toContain(problem);
+    }
+    // Legitimate records still verify: timeout, cancellation, pre-dispatch refusal, unsettled.
+    const timeout = harness({ fetch: { delayMs: 12_000 } });
+    expect((await timeout.live()).verification!.integrity.ok).toBe(true);
+    const cancel = harness({ fetch: { delayMs: 1_000 } });
+    const ac = new AbortController();
+    cancel.sched.add(() => ac.abort(), 200);
+    expect((await cancel.live({ signal: ac.signal })).verification!.integrity.ok).toBe(true);
+    const pre = harness();
+    let reads = 0;
+    const rp = await pre.live({ clock: () => (reads++ === 0 ? START_MS : START_MS + 15_000) });
+    expect(pre.calls).toHaveLength(0);
+    expect(rp.verification!.integrity.ok).toBe(true);
+    expect(readOut(pre, RETRO_FILES.retrieval).request).toMatchObject({
+      jsonRpcId: null,
+      body: null,
+      dispatchedAtMs: null,
+      entry: null,
+    });
+    const cancelledFirst = harness();
+    const ab = new AbortController();
+    ab.abort();
+    const rc = await cancelledFirst.live({ signal: ab.signal });
+    expect(cancelledFirst.calls).toHaveLength(0);
+    expect(rc.verification!.integrity.ok).toBe(true);
+    expect(rc.exitCode).toBe(X.CANCELLED);
+    const hu = harness({ fetch: { delayMs: 60_000, ignoreAbort: true } });
+    const lossy: PaperRequestSessionTimers = {
+      setTimeout: (fn, ms) => (ms === 10_000 || ms === 15_000 ? -1 : hu.sched.add(fn, ms)),
+      clearTimeout: (handle) => hu.sched.clear(handle),
+    };
+    const ru = await hu.drive(
+      runCpmmRetrospectiveTransactionCli(
+        ["--out-dir", OUT_REL, "--live"],
+        hu.deps({ timers: lossy }),
+      ),
+      40_000,
+    );
+    expect(ru.acquisition!.outcome).toBe("CLEANUP_UNSETTLED");
+    expect(ru.verification!.integrity.ok).toBe(true);
+    expect(readOut(hu, RETRO_FILES.retrieval).recorded.httpAttempts).toBe(1);
   });
 });

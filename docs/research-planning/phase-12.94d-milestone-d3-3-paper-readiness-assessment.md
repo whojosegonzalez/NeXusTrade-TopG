@@ -12238,3 +12238,55 @@ The work did not include, and is not approval for, any operator script, operator
 - **Pin allowlist:** `paper-pilot-handoff.ts` now allows exactly the two new files. Its test asserts them in the exact list and refuses near-miss names: `-cli`, `.test-support`, `.fixtures`, the plural name, and the `candidate-scanner` location. Handoff suite: 13/13 passed.
 - **Static checks:** TypeScript, ESLint and Prettier are clean on the changed files.
 - **Before any execution:** a separately reviewed operator packet (pinned commit, script hash, plan digests for its run id, inert default path) and explicit operator approval. Neither is prepared or authorized here.
+
+#### 8.38.28 Retrospective Tool: Review Blockers on `989190d` Reproduced and Fixed
+
+**Status**: Independent review found three blockers in `989190d774e574f89718c842cbcd482179168840`. Each was first reproduced by a synthetic regression that failed against that commit, then fixed in the retrospective tool only. No accepted component, pin policy, capture, wallet or operator script changed. Still not done or authorized: an operator packet, a credential load, a provider request, a socket or a live execution. **All five qualification flags remain `false`.**
+
+1. **Final listener cleanup** (regression RR1).
+   - **Reproduced:**
+     - An injected `signals.removeListener` that aborts the external `AbortController` returned exit `0` with `runFailures: []`.
+     - So did one that makes the injected clock return `NaN`.
+   - **Fixed:** the terminal decision now happens after listener cleanup. Cancellation is re-checked from both the internal controller and the external signal's actual state (`external.aborted`), and the guarded clock is read once more before any success can be returned.
+   - **Results:**
+     - The two cases now return `OPERATOR_CANCELLED` (exit `6`) and `CLOCK_FAILURE:CLOCK_INVALID` (exit `3`).
+     - An earlier cancellation stays first, ahead of a later clock failure.
+     - Normal cleanup still adds and removes both listeners once each. A failed removal is still reported as `SIGNAL_REMOVE_FAILED:*` (exit `7`), not as a run failure.
+   - The pre-cleanup cancellation check became redundant and was removed.
+2. **Response accounting** (regression RR2).
+   - **Reproduced:**
+     - A successful bundle padded with unused JSON whitespace to a complete `264,370`-byte response, against `maxResponseBytes: 262,144`, with consistent digests and manifest.
+     - Separately, the original body with `observedBytes: 0`.
+
+     Both verified with integrity `OK`, replay `REPRODUCED` and exit `0`.
+
+   - **Fixed:** the sealed response is now checked against the accepted bounded reader:
+
+     | `bodyState`        | Must hold                                                                                            |
+     | ------------------ | ---------------------------------------------------------------------------------------------------- |
+     | `COMPLETE`         | No session error, entry `bodyComplete`, an HTTP status, `observedBytes === originalBytes <= 262,144` |
+     | `PARTIAL_OVERFLOW` | `RESPONSE_TOO_LARGE`, not complete, retained prefix `<= 262,144`, `observedBytes > 262,144`          |
+     | `NOT_READ`         | A session error, not complete, nothing observed or captured                                          |
+
+     Every stored payload must match its own size and digest. `ORIGINAL` must equal the original exactly, `REDACTED` must differ from it, and `WITHHELD` must have no stored bytes.
+
+   - **Results:**
+     - Both forgeries, and ten further incoherent states, now fail integrity (exit `4`).
+     - Legitimate empty, oversized-prefix, not-read (`429`, timeout) and credential-bearing responses still verify.
+
+3. **Timing** (regression RR3).
+   - **Reproduced:** dispatch and completion set to `timing.deadlineAtMs`, with `endedAtMs` equal to the deadline. This verified successfully.
+   - **Fixed:** the verifier now enforces:
+     - **Dispatch boundary:** dispatch is strictly before the deadline (`DISPATCH_AT_OR_AFTER_DEADLINE`).
+     - **Ordering:** `startedAtMs <= dispatchedAtMs <= completedAtMs <= endedAtMs`, and `endedAtMs <= deadline + 5,000 ms`.
+     - **Attempts and evidence presence:** an exchange entry requires exactly one attempt, an id and a response. Without an entry, there must be zero attempts, no id and no times. The one exception is `CLEANUP_UNSETTLED`, which records one dispatched attempt.
+   - **Results:**
+     - The forgery and seven further ordering or attempt forgeries now fail integrity.
+     - Legitimate records still verify: timeout, in-flight cancellation, pre-dispatch deadline refusal, cancellation before dispatch, and `CLEANUP_UNSETTLED`.
+
+**Validation (external 60 s limit per run):**
+
+- **Tests:** synthetic suite **14/14**, exit `0`. That is the 11 earlier tests, with three forgeries made coherent so that each still targets one rule, plus RR1–RR3. Handoff suite 13/13.
+- **Static checks:** TypeScript, ESLint and Prettier are clean.
+- **Mutations:** with a clean baseline confirmed first (exit `0`), **26/26** targeted mutations are caught, covering the earlier guards and every new terminal-decision, accounting and timing guard. The source file was restored byte-identical after each one. (The per-dispatch timeout cap is still an equivalent mutant, §8.38.27, and is not counted.)
+- **Real dry run:** a repeat read-only dry run bound `cpmm-observation-03` (`VERIFIED`) with an unchanged plan digest and wrote nothing. The wallet and all operator scripts are unchanged.
