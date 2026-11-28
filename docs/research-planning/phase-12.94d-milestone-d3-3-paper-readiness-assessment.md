@@ -12522,3 +12522,18 @@ Validation would follow the established practice: each run under an external 60 
 - **Evidence still absent**: CPMM LP and security evidence (Stage 4).
 - **Admission**: CPMM stays excluded, the market parser still rejects `"CPMM"`, and all qualification flags remain `false`.
 - **Later slices**: sealing the history and cutoff exchanges as observation evidence (slice 2, with schema and pin review), the CPMM reconciliation evaluator (slice 3), and any profile or budget allocation and operator use. Each needs its own review and approval.
+
+#### 8.38.32 Step 7 Slice 1 Implementation Contract: Witnessed History and On-Chain Cutoff (For Review)
+
+**Status**: **Contract only, for independent review before implementation.** The full contract is in [`cpmm-witnessed-history-step7-contract.md`](cpmm-witnessed-history-step7-contract.md). It resolves the open points of §8.38.31 against the APIs at `ca35ebf`. It authorizes no implementation, request, operator command, credential load or live run, and all qualification flags remain `false`.
+
+- **Session integration**: no change to `PaperRequestSession`. The collector's `onExchangeComplete` is wired at construction, directly or through the accepted `createExchangeObserverFanOut`. It claims an exchange only when the `seq` captured in its own `onDispatched` matches and every dispatch field, the URL, the body and the byte cap agree; purpose labels alone are never sufficient.
+- **Provenance**: the cutoff slot and time, their order before the pages, the history records and a bootstrap anchor are verified here from claimed exchange bytes, as what the provider said. The pool binding, the acquisition context slot and a ledger anchor (non-null `verifiedSlot` only) are supplied assertions verified upstream. Window bounds are owner input. Honouring of `minContextSlot` is a recorded provider assumption.
+- **Timestamp rules**:
+  - One block time per slot.
+  - Times are monotone in slot and consistent with the cutoff.
+  - Coverage requires the anchor's time **strictly** before the window start and the window end at or before the cutoff time, so intra-slot order is never needed.
+  - A null block time is placed only by bracketing; otherwise the window is `AMBIGUOUS_TIMESTAMP`.
+- **Bootstrap**: in this slice, as a separately invoked operation (1 request, its own 10 s deadline). It sits outside the enumeration's 5-request and 30 s bounds, with a hard ceiling of 6 requests per collector instance and no automatic chaining.
+- **Fixtures**: every CI input is synthetic and committed. A historical sealed page may serve only as an optional, skipped-when-absent local regression.
+- **Scope**: one isolated module plus tests and fixtures; exact runner-pin additions in a separate commit. No reconciliation wiring, qualification promotion, profile change or live execution.

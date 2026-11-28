@@ -336,3 +336,15 @@ Independent review accepted `cpmm-retrospective-tx-01`. It ran once at commit `f
   - Use: it supplies the CPMM ledger's existing cutoff input and a signature set for a later reconciliation evaluator.
   - Limits: the evidence stays provider-relative, never cryptographic completeness.
   - Not authorized: no implementation, operator command, credential load, request, socket or rerun.
+
+## 19. Step 7 Slice 1 Contract: Witnessed History and Cutoff (For Review)
+
+The implementation contract for the isolated history/cutoff slice is in [`cpmm-witnessed-history-step7-contract.md`](cpmm-witnessed-history-step7-contract.md) (assessment §8.38.32). It covers:
+
+- sequence-based exchange ownership without changing `PaperRequestSession`;
+- verified versus supplied facts;
+- exact same-slot, null-time and window-boundary rules;
+- the bootstrap as a separate one-request operation;
+- portable synthetic fixtures.
+
+Nothing is implemented, run or authorized by it.
