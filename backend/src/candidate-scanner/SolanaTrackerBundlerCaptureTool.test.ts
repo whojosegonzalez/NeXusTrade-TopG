@@ -1,4 +1,4 @@
-import { describe, expect, it } from "vitest";
+import { afterAll, describe, expect, it, vi } from "vitest";
 import fsSync from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -16,6 +16,44 @@ import {
 } from "./SolanaTrackerBundlerCaptureTool.js";
 import { GlobalResourceBudgetManager } from "../research/prospective/GlobalResourceBudgetManager.js";
 import { loadLocalEnvFile, resetEnvFileLoadedForTesting } from "../config/loadEnvFile.js";
+import type * as LoadEnvFileModule from "../config/loadEnvFile.js";
+
+/**
+ * The tool's live path calls loadLocalEnvFile() with no path, which would read the repository's
+ * real .env. In these tests that default load reads a synthetic fixture instead (written under the
+ * OS temporary directory); explicit-path loads keep the real implementation, so the synthetic
+ * fixture tests below still exercise it. No repository .env is ever read.
+ */
+const syntheticDefaultEnv = vi.hoisted(() => ({ path: "", loads: 0 }));
+vi.mock("../config/loadEnvFile.js", async (importOriginal) => {
+  const actual = await importOriginal<typeof LoadEnvFileModule>();
+  const fs = await import("node:fs");
+  const osModule = await import("node:os");
+  const pathModule = await import("node:path");
+  return {
+    ...actual,
+    loadLocalEnvFile: (env: NodeJS.ProcessEnv = process.env, customEnvPath?: string): void => {
+      if (customEnvPath !== undefined) return actual.loadLocalEnvFile(env, customEnvPath);
+      if (syntheticDefaultEnv.path === "") {
+        const dir = fs.mkdtempSync(pathModule.join(osModule.tmpdir(), "solana-tracker-dotenv-"));
+        syntheticDefaultEnv.path = pathModule.join(dir, ".env");
+        fs.writeFileSync(
+          syntheticDefaultEnv.path,
+          "SOLANA_TRACKER_API_KEY=synthetic-default-dotenv-key-5151\n",
+          "utf8",
+        );
+      }
+      syntheticDefaultEnv.loads += 1;
+      return actual.loadLocalEnvFile(env, syntheticDefaultEnv.path);
+    },
+  };
+});
+
+afterAll(() => {
+  if (syntheticDefaultEnv.path !== "") {
+    fsSync.rmSync(path.dirname(syntheticDefaultEnv.path), { recursive: true, force: true });
+  }
+});
 
 const CANONICAL_MINT = "4k3Dyjzvzp8eMZWUXbBCjEvwSkkk59S5iCNLY3QrkX6R";
 const CANONICAL_WALLET_1 = "4k3Dyjzvzp8eMZWUXbBCjEvwSkkk59S5iCNLY3QrkX6R";
@@ -1248,6 +1286,7 @@ describe("SolanaTrackerBundlerCaptureTool", () => {
       it("prioritizes explicit config.apiKey over both process.env and .env", async () => {
         const originalEnv = process.env.SOLANA_TRACKER_API_KEY;
         process.env.SOLANA_TRACKER_API_KEY = "env-key-should-be-ignored";
+        const defaultEnvLoadsBefore = syntheticDefaultEnv.loads;
 
         let capturedHeader: string | undefined;
         const transport: HttpTransport = async (_url, options) => {
@@ -1271,6 +1310,8 @@ describe("SolanaTrackerBundlerCaptureTool", () => {
 
           expect(result.success).toBe(true);
           expect(capturedHeader).toBe("explicit-override-key-9999");
+          // The live path consulted the (synthetic) default .env, and the explicit key still won.
+          expect(syntheticDefaultEnv.loads).toBeGreaterThan(defaultEnvLoadsBefore);
         } finally {
           if (originalEnv !== undefined) {
             process.env.SOLANA_TRACKER_API_KEY = originalEnv;
